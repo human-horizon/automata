@@ -1,0 +1,55 @@
+Automata (cue-test)        + <                                                                                        │Knowledge [× auto] [× dual]              
+  hangtest ■ ⋮ ○ idle        │The default interactive shell is now zsh.                                               │── Status                                
+                             │To update your account to use zsh, please run `chsh -s /bin/zsh`.                       │  (no status)                            
+                             │For more details, please visit https://support.apple.com/kb/HT208050.                   │── Plans                                 
+                             │                                                                                        │  (no plans)                             
+                             │                                                                                        │── Jobs                                  
+                             │                                                                                        │  (no running jobs)                      
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │ Main                                                                           × Clear │                                         

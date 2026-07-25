@@ -1,0 +1,55 @@
+ Automata                                     <│Model scope: deepseek-v4-flash, kimi-2.7, qwen3.5-9b-4bit, gpt-5.5, deepseek/│                                  
+ +📁  +💬  +>_                                 │deepseek-v4-flash (Ctrl+P to cycle)                                          │                                    
+   💬 X ■ ⋮                                    │                                                                             │                                   
+                                               │ pi v0.79.3                                                                  │                                  
+                                               │ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o  │                                  
+                                               │ more                                                                        │                                  
+                                               │ Press ctrl+o to show full startup help and loaded resources.                │                                  
+                                               │                                                                             │                                  
+                                               │ Pi can explain its own features and look up its docs. Ask it how to use or  │                                  
+                                               │ extend Pi.                                                                  │                                  
+                                               │                                                                             │                                  
+                                               │[Skills]                                                                     │                                  
+                                               │  ai_computer-use, appflowy, caveman, clear-session, clickhouse,             │                                  
+                                               │coding-style, comfyui, consultation, cue-tty, dev-vps, dual, golang,         │                                  
+                                               │google-drive, handoff, hermes-agent, knowledge-qwik, model-balance,          │                                  
+                                               │my-mistakes, pi-extension, playwright, pnpm, python, spec-first, testing,    │                                  
+                                               │ui-vision-interaction, visual-tests, web-search, weft                        │                                  
+                                               │                                                                             │                                  
+                                               │[Prompts]                                                                    │                                  
+                                               │  /@DevOps, /@АртДиректорИДизайнер, /@Архитектор, /@БагФиксер,               │                                  
+                                               │/@ГеймДизайнер, /@ИдейныйВдохновитель, /@Исследователь, /@Критик,            │                                  
+                                               │/@Минималист, /@Оптимизатор, /@Переводчик, /@Перфекционист, /@Планировщик,   │                                  
+                                               │/@Разработчик, /@Специалист, /@СюжетныйМастер, /@Тестер,                     │                                  
+                                               │/@ТехническийПисатель, /@Управляющая, /#CodingStyle, /#ЛаконичныйУльтра      │                                  
+                                               │                                                                             │                                  
+                                               │[Extensions]                                                                 │                                  
+                                               │  ai-knowledge, dual, familiar, firm, job, model-balance,                    │                                  
+                                               │prompt-model-switcher, session                                               │                                  
+                                               │                                                                             │                                  
+                                               │[Themes]                                                                     │                                  
+                                               │  gruvbox                                                                    │                                  
+                                               │                                                                             │                                  
+                                               │[Skill conflicts]                                                            │                                  
+                                               │  auto (user) ~/.pi-just/agent/skills/ai_computer-use/SKILL.md               │                                  
+                                               │    name contains invalid characters (must be lowercase a-z, 0-9, hyphens    │                                  
+                                               │only)                                                                        │                                  
+                                               │  ~/.pi-just/agent/skills/testing_tauri/SKILL.md                             │                                  
+                                               │    description is required                                                  │                                  
+                                               │  ~/.pi-just/agent/skills/testing_tauri/SKILL.md                             │                                  
+                                               │    name contains invalid characters (must be lowercase a-z, 0-9, hyphens    │                                  
+                                               │only)                                                                        │                                  
+                                               │                                                                             │                                  
+                                               │                                                                             │                                  
+                                               │─────────────────────────────────────────────────────────────────────────────│                                  
+                                               │                                                                             │                                  
+                                               │─────────────────────────────────────────────────────────────────────────────│                                  
+                                               │~/Space/Projects/HumanHorizon/automata/e2e                                   │                                  
+                                               │0.0%/256k (auto)                                (kimi-coding) kimi-2.7 • high│                                  
+                                               │                                                                             │                                  
+                                               │                                                                             │                                  
+                                               │                                                                             │                                  
+                                               │                                                                             │                                  
+                                               │                                                                             │                                  
+                                               │                                                                             │                                  
+                                               │                                                                             │                                  

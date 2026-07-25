@@ -1,0 +1,55 @@
+Automata (cue-test-cwd)    + <                                                                                        │Knowledge [× auto] [× dual]              
+  cwdtest ■ ⋮ ○ idle         │                                                                                        │── Status                                
+                             │                                                                                        │  (no status)                            
+                             │                                                                                        │── Plans                                 
+                             │                                                                                        │  (no plans)                             
+                             │                                                                                        │── Jobs                                  
+                             │                                                                                        │  (no running jobs)                      
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │ Main                                                                           × Clear │                                         
