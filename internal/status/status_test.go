@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/HumanHorizon/automata/internal/paths"
 )
 
 func TestEmoji(t *testing.T) {
@@ -19,11 +21,16 @@ func TestEmoji(t *testing.T) {
 		"run":      ">",
 		"idle":     "",
 		"stop":     "X",
-		// "active" is intentionally NOT a recognized substatus — it must
-		// not produce a glyph. The session should display as idle.
-		"active": "•",
+		// "active" and "status" are known actions without a dedicated
+		// glyph — they must produce "" so the Tree falls back to "○ idle"
+		// and the right panel can still render the canonical word through
+		// actionIcon.
+		"active": "",
+		"status": "",
 		"":       "",
-		"weird":  "•",
+		// Anything we don't recognise still surfaces as a generic dot so
+		// a typo in status.json doesn't render as idle.
+		"weird": "•",
 	}
 	for action, want := range cases {
 		if got := Emoji(action); got != want {
@@ -56,19 +63,67 @@ func TestWord(t *testing.T) {
 	}
 }
 
-func TestSlugify(t *testing.T) {
-	cases := map[string]string{
-		"":       "",
-		"hello":  "hello",
-		"Hello":  "hello",
-		"my-pro": "my-pro",
-		"AI Dev": "ai-dev",
-		"a__b!c": "a-b-c",
+func TestReadUsesCanonicalSessionPaths(t *testing.T) {
+	dataHome := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("HOME", home)
+
+	tests := []struct {
+		name    string
+		profile string
+		session string
+		action  string
+	}{
+		{
+			name:    "default profile",
+			profile: "",
+			session: "default-session",
+			action:  "read",
+		},
+		{
+			name:    "unicode profile slug",
+			profile: "Проект Ω",
+			session: "unicode-session",
+			action:  "write",
+		},
 	}
-	for in, want := range cases {
-		if got := slugify(in); got != want {
-			t.Errorf("slugify(%q) = %q, want %q", in, got, want)
-		}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := paths.SessionDir(test.profile, test.session)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("MkdirAll canonical session dir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "status.json"),
+				[]byte(`{"action":"`+test.action+`"}`), 0o644); err != nil {
+				t.Fatalf("WriteFile canonical status: %v", err)
+			}
+
+			if test.profile == "" {
+				legacyDir := filepath.Join(dataHome, "sessions", test.session)
+				if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+					t.Fatalf("MkdirAll legacy session dir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(legacyDir, "status.json"),
+					[]byte(`{"action":"legacy"}`), 0o644); err != nil {
+					t.Fatalf("WriteFile legacy status: %v", err)
+				}
+			}
+
+			if got := Read(test.profile, test.session); got != test.action {
+				t.Fatalf("Read = %q, want %q", got, test.action)
+			}
+			reader := NewCachedReader(test.profile)
+			if got := reader.Read(test.session); got != test.action {
+				t.Fatalf("CachedReader.Read = %q, want %q", got, test.action)
+			}
+		})
+	}
+
+	homeStatus := filepath.Join(home, ".ai", "automata", "profiles", "default", "sessions", "default-session", "status.json")
+	if _, err := os.Stat(homeStatus); !os.IsNotExist(err) {
+		t.Fatalf("test must not write status under HOME, stat err: %v", err)
 	}
 }
 

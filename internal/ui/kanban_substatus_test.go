@@ -14,11 +14,11 @@ func TestCardRendersSubstatus(t *testing.T) {
 	c.width = 28
 	c.parent = &KanbanPanel{sessionNames: map[string]string{}}
 	task := kanban.Task{
-		Title:     "Substatus test",
-		Status:    "progress",
+		Title:      "Substatus test",
+		Status:     "progress",
 		AssignedTo: "s1",
-		Substatus: "analyze",
-		Path:      "/tmp/x.md",
+		Substatus:  "analyze",
+		Path:       "/tmp/x.md",
 	}
 
 	lines := c.renderCard(task, false)
@@ -36,9 +36,9 @@ func TestCardOmitsSubstatusWhenEmpty(t *testing.T) {
 	c.width = 28
 	c.parent = &KanbanPanel{sessionNames: map[string]string{}}
 	task := kanban.Task{
-		Title:    "No substatus",
-		Status:   "todo",
-		Path:     "/tmp/x.md",
+		Title:     "No substatus",
+		Status:    "todo",
+		Path:      "/tmp/x.md",
 		Substatus: "",
 	}
 

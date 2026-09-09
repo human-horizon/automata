@@ -30,13 +30,20 @@ func (t *Tree) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if t.modalActive {
 		switch msg.Type {
 		case tea.KeyEnter:
-			if t.confirmMode {
+			if t.helpMode {
+				t.closeModal()
+			} else if t.confirmMode {
 				if t.confirmYes != nil {
 					t.confirmYes()
 				}
 				t.closeModal()
 			} else if t.inputMode {
 				t.confirmInput()
+			}
+			return nil
+		case tea.KeyF1:
+			if t.helpMode {
+				t.closeModal()
 			}
 			return nil
 		case tea.KeyEsc:
@@ -116,32 +123,46 @@ func (t *Tree) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
-	// Alt+↑ / Alt+↓ reorder the selected item among siblings. The bubbletea
-	// `tea.KeyMsg.Alt` is the only modifier field (no Ctrl/Meta here).
-	if msg.Alt {
-		switch msg.Type {
-		case tea.KeyDown:
-			if t.MoveSelectedDown() {
-				return nil
-			}
-		case tea.KeyUp:
-			if t.MoveSelectedUp() {
-				return nil
-			}
-		}
-	}
-
 	switch msg.Type {
-	case tea.KeyTab, tea.KeyDown:
-		t.SelectNext()
-	case tea.KeyShiftTab, tea.KeyUp:
+	case tea.KeyF1:
+		t.OpenHelp()
+	case tea.KeyF2:
+		if sel := t.SelectedItem(); sel != nil {
+			t.startRename(sel)
+		}
+	case tea.KeyF10:
+		if sel := t.SelectedItem(); sel != nil {
+			t.showContextMenu(0, 1)
+		} else {
+			t.showRootMenu(0, 1)
+		}
+	case tea.KeyUp:
 		t.SelectPrev()
+	case tea.KeyDown:
+		t.SelectNext()
+	case tea.KeyHome:
+		t.SelectFirst()
+	case tea.KeyEnd:
+		t.SelectLast()
+	case tea.KeyPgUp:
+		t.SelectPage(-1)
+	case tea.KeyPgDown:
+		t.SelectPage(1)
+	case tea.KeyLeft:
+		t.NavigateLeft()
+	case tea.KeyRight:
+		t.NavigateRight()
 	case tea.KeyEnter:
 		if t.selected >= 0 && t.selected < len(t.flat) {
 			sel := t.flat[t.selected]
 			if sel.IsFolder {
 				t.ToggleFolder(sel)
-				return nil
+				if t.onSelectFolder != nil {
+					t.onSelectFolder(sel)
+				}
+				return func() tea.Msg {
+					return FolderSelectedMsg{Item: sel}
+				}
 			}
 			if t.onSelectChat != nil {
 				t.onSelectChat(sel)
@@ -184,12 +205,38 @@ func (t *Tree) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
-	// Header is row 0 (toolbar buttons are now in the header, left side).
+	// Popover takes priority over the underlying tree and toolbar.
+	if t.popover != nil {
+		if t.popover.HandleMouse(msg) {
+			return nil
+		}
+	}
+
+	// Header is row 0.
 	if msg.Y == 0 {
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			// Collapse button removed — now on the warp border.
-			// Toolbar buttons on the left.
 			return t.handleToolbarClick(msg)
+		}
+		return nil
+	}
+
+	// Footer buttons.
+	if msg.Y == t.height-treeFooterHeight {
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			switch {
+			case msg.X < 6:
+				if t.onOpenHelp != nil {
+					t.onOpenHelp()
+				} else {
+					t.OpenHelp()
+				}
+			case msg.X >= 8 && msg.X < 16:
+				if t.onOpenSettings != nil {
+					t.onOpenSettings()
+				} else {
+					t.showSettingsMenu(int(msg.X), int(msg.Y))
+				}
+			}
 		}
 		return nil
 	}
@@ -201,17 +248,9 @@ func (t *Tree) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			t.selected = idx
 			t.showContextMenu(int(msg.X), int(msg.Y))
 		} else {
-			t.showCreateMenu(nil, int(msg.X), int(msg.Y))
+			t.showRootMenu(int(msg.X), int(msg.Y))
 		}
 		return nil
-	}
-
-	// Popover (context menu) takes priority.
-	// Popover handles its own lifecycle through OnClose.
-	if t.popover != nil {
-		if t.popover.HandleMouse(msg) {
-			return nil
-		}
 	}
 
 	switch msg.Action {
@@ -221,11 +260,11 @@ func (t *Tree) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return t.handleLeftPress(msg)
 		case tea.MouseButtonWheelUp:
 			t.scroll--
-			t.clampScroll(t.height - 1)
+			t.clampScroll(t.contentHeight())
 			return nil
 		case tea.MouseButtonWheelDown:
 			t.scroll++
-			t.clampScroll(t.height - 1)
+			t.clampScroll(t.contentHeight())
 			return nil
 		}
 	case tea.MouseActionMotion:
@@ -245,6 +284,15 @@ func (t *Tree) handleMouse(msg tea.MouseMsg) tea.Cmd {
 
 func (t *Tree) handleToolbarClick(msg tea.MouseMsg) tea.Cmd {
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return nil
+	}
+
+	rootMenuWidth := lipgloss.Width(" ⋮ ")
+	plusWidth := lipgloss.Width(" + ")
+	plusStart := t.width - 1 - plusWidth
+	rootMenuStart := plusStart - rootMenuWidth
+	if int(msg.X) >= rootMenuStart && int(msg.X) < plusStart {
+		t.showRootMenu(int(msg.X), int(msg.Y)+1)
 		return nil
 	}
 

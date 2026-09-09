@@ -11,6 +11,7 @@ import (
 
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/slug"
+	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	"github.com/google/uuid"
 	warp "github.com/starframe-dev/warp"
 )
@@ -118,9 +119,10 @@ type Tree struct {
 	// Context menu (popover)
 	popover *warp.Popover
 
-	// Modal (input or confirmation) — directly managed by Tree
+	// Modal (input, confirmation, or help) — directly managed by Tree
 	modal       *warp.Modal
 	modalActive bool
+	helpMode    bool
 
 	// Modal input (for creating/renaming)
 	inputMode   bool
@@ -128,6 +130,7 @@ type Tree struct {
 	inputValue  string
 	inputCursor int               // rune cursor position within inputValue
 	inputDone   func(name string) // called on Enter with the typed name
+	inputError  string            // validation or operation error shown in the modal
 
 	// Delete confirmation mode
 	confirmMode bool
@@ -176,12 +179,24 @@ type Tree struct {
 	// Callback when the user requests to stop an active session
 	onStopSession func(*Item)
 
+	// Callback fired after the active theme changes.
+	onThemeChange func(string)
+
+	// Callbacks for application-level overlays. When unset, Tree keeps its
+	// local overlay fallback for standalone use and unit tests.
+	onOpenHelp     func()
+	onOpenSettings func()
+
 	// Callback fired after an item is moved to a new parent. The arguments are
 	// the bare session ID (no profile prefix) of the item before and after the
 	// move. They are equal when the move did not change the session identity
 	// (e.g. re-ordering siblings within the same parent).
 	profile     string
 	onItemMoved func(item *Item, oldSessionID, newSessionID string)
+
+	// onRename runs before the tree item is changed. Returning an error keeps
+	// the old name and leaves the input modal open.
+	onRename func(item *Item, newName string) error
 
 	// ActiveSessions holds the set of currently running session IDs (keyed by
 	// the same identifier used to create the emulator).
@@ -198,8 +213,7 @@ type Tree struct {
 	// NO_COLOR environment variable is present.
 	NoColor bool
 
-	// Theme controls the color scheme. One of "auto" (default, detect from
-	// terminal), "dark", "light", or "mono" (same as NoColor).
+	// Theme is the persisted identifier of the active visual theme.
 	Theme string
 
 	// Profile name for state isolation (e.g. "ai" → ~/.automata/ai/state.json)
@@ -217,6 +231,7 @@ func New() *Tree {
 		hoverIdx:        -1,
 		height:          24, // Default until first render
 		prevSelectedIdx: -1,
+		Theme:           apptheme.Default().ID,
 	}
 }
 
@@ -258,6 +273,15 @@ func (t *Tree) AddTerminal(name string) *Tree {
 	t.rebuildFlat()
 	t.autoSave()
 	return t
+}
+
+// Reset removes all items from the tree (root and descendants) and rebuilds
+// the flat visible list. State on disk is not touched — call SaveState
+// afterwards if you want persistence to follow. Useful for tests that need
+// to start from an empty tree and for production flows that switch profile.
+func (t *Tree) Reset() {
+	t.root = nil
+	t.rebuildFlat()
 }
 
 // Folder finds a root-level folder by name. Returns nil if not found.
@@ -322,6 +346,7 @@ func (t *Tree) ToggleFolder(item *Item) {
 	}
 	item.Expanded = !item.Expanded
 	t.rebuildFlat()
+	t.autoSave()
 }
 
 // MoveSelectedUp moves the selected item one position up among its siblings.
@@ -508,6 +533,94 @@ func (t *Tree) SelectPrev() {
 	t.ensureVisible()
 }
 
+// SelectFirst moves selection to the first visible item.
+func (t *Tree) SelectFirst() {
+	if len(t.flat) == 0 {
+		return
+	}
+	t.selected = 0
+	t.ensureVisible()
+}
+
+// SelectLast moves selection to the last visible item.
+func (t *Tree) SelectLast() {
+	if len(t.flat) == 0 {
+		return
+	}
+	t.selected = len(t.flat) - 1
+	t.ensureVisible()
+}
+
+// SelectPage moves selection by one visible page.
+func (t *Tree) SelectPage(direction int) {
+	if len(t.flat) == 0 || direction == 0 {
+		return
+	}
+	page := t.contentHeight()
+	if page < 1 {
+		page = 1
+	}
+	if t.selected < 0 {
+		t.selected = 0
+	} else {
+		t.selected += direction * page
+	}
+	if t.selected < 0 {
+		t.selected = 0
+	}
+	if t.selected >= len(t.flat) {
+		t.selected = len(t.flat) - 1
+	}
+	t.ensureVisible()
+}
+
+// NavigateLeft collapses the selected folder or selects its parent.
+func (t *Tree) NavigateLeft() {
+	sel := t.SelectedItem()
+	if sel == nil {
+		return
+	}
+	if sel.IsFolder && sel.Expanded {
+		sel.Expanded = false
+		t.rebuildFlat()
+		t.reselectItem(sel)
+		t.autoSave()
+		return
+	}
+	if sel.parent != nil {
+		t.reselectItem(sel.parent)
+		t.ensureVisible()
+	}
+}
+
+// NavigateRight expands the selected folder or selects its first child.
+func (t *Tree) NavigateRight() {
+	sel := t.SelectedItem()
+	if sel == nil || !sel.IsFolder {
+		return
+	}
+	if !sel.Expanded {
+		sel.Expanded = true
+		t.rebuildFlat()
+		t.reselectItem(sel)
+		t.autoSave()
+		return
+	}
+	if len(sel.Children) > 0 {
+		t.reselectItem(sel.Children[0])
+		t.ensureVisible()
+	}
+}
+
+// contentHeight returns the number of rows available for tree items.
+func (t *Tree) contentHeight() int {
+	h := t.height - 2
+	if h < 1 {
+		return 1
+	}
+	return h
+}
+
 // ensureVisible makes sure the selected item is within the visible scroll area.
 func (t *Tree) ensureVisible() {
 	if t.selected < 0 {
@@ -516,11 +629,7 @@ func (t *Tree) ensureVisible() {
 	if t.selected < t.scroll {
 		t.scroll = t.selected
 	}
-	// Reserve 1 line for header (toolbar is now in the header).
-	contentHeight := t.height - 1
-	if contentHeight < 1 {
-		contentHeight = 1
-	}
+	contentHeight := t.contentHeight()
 	if t.selected >= t.scroll+contentHeight {
 		t.scroll = t.selected - contentHeight + 1
 		t.clampScroll(contentHeight)
@@ -694,12 +803,145 @@ func (t *Tree) addChildTerminal(parent *Item, name string) {
 	t.autoSave()
 }
 
-func (t *Tree) renameItem(item *Item, name string) {
-	if name != "" {
-		item.Name = name
-		t.rebuildFlat()
-		t.autoSave()
+// sortChildrenAlphabetically reorders parent.Children in place: folders
+// first (A→Z), then chats (A→Z), then terminals (A→Z). Stable sort
+// preserves the original relative order of items sharing a name+kind, so
+// users who rely on drag-and-drop can re-sort without losing intent when
+// names are unique. The folder itself, its position in the parent list,
+// and any deeper hierarchy are not touched.
+func (t *Tree) sortChildrenAlphabetically(parent *Item) {
+	if parent == nil || len(parent.Children) < 2 {
+		return
 	}
+	sortItemsAlphabetically(parent.Children)
+	parent.Expanded = true
+	t.rebuildFlat()
+	t.autoSave()
+}
+
+// sortRootByName reorders only active root items by name. Archived folders
+// remain in the archived group at the end of the root list.
+func (t *Tree) sortRootByName() {
+	t.sortRoot(func(items []*Item) {
+		sort.SliceStable(items, func(i, j int) bool {
+			return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+		})
+	})
+}
+
+// sortRootByType groups active root items by kind and sorts each group by name.
+// Archived folders remain in the archived group at the end of the root list.
+func (t *Tree) sortRootByType() {
+	t.sortRoot(sortItemsAlphabetically)
+}
+
+func (t *Tree) sortRoot(sortItems func([]*Item)) {
+	if len(t.root) < 2 {
+		return
+	}
+
+	selected := t.SelectedItem()
+	active := make([]*Item, 0, len(t.root))
+	archived := make([]*Item, 0)
+	for _, item := range t.root {
+		if item.IsFolder && item.Archived {
+			archived = append(archived, item)
+			continue
+		}
+		active = append(active, item)
+	}
+	sortItems(active)
+	sortItems(archived)
+	t.root = append(active, archived...)
+	t.rebuildFlat()
+	if selected != nil {
+		t.reselectItem(selected)
+	}
+	t.autoSave()
+}
+
+// sortRootAlphabetically preserves the historical type-first root sort.
+func (t *Tree) sortRootAlphabetically() {
+	t.sortRootByType()
+}
+
+// sortItemsAlphabetically is the shared ordering kernel: folders first,
+// then chats, then terminals, A→Z case-insensitive. Stable sort keeps
+// the relative order of items that share both kind and name.
+func sortItemsAlphabetically(items []*Item) {
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		rankA := itemKindRank(a)
+		rankB := itemKindRank(b)
+		if rankA != rankB {
+			return rankA < rankB
+		}
+		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+	})
+}
+
+// itemKindRank returns a small int that places folders before chats
+// before terminals. Standalone items (root level) share the chat rank.
+func itemKindRank(it *Item) int {
+	switch {
+	case it.IsFolder:
+		return 0
+	case it.IsTerminal:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// RenameItem applies the same validated rename flow used by the UI.
+func (t *Tree) RenameItem(item *Item, name string) error {
+	return t.renameItem(item, name)
+}
+
+func (t *Tree) renameItem(item *Item, name string) error {
+	if item == nil {
+		return fmt.Errorf("item is required")
+	}
+
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("name cannot be empty")
+	}
+	if slug.Slug(name) == "" {
+		return fmt.Errorf("name must contain a letter or digit")
+	}
+	for _, sibling := range t.siblings(item) {
+		if sibling == item {
+			continue
+		}
+		if slug.Slug(sibling.Name) == slug.Slug(name) {
+			return fmt.Errorf("name conflicts with %q", sibling.Name)
+		}
+	}
+	if item.Name == name {
+		return nil
+	}
+
+	if t.onRename != nil {
+		if err := t.onRename(item, name); err != nil {
+			return err
+		}
+	}
+
+	item.Name = name
+	t.rebuildFlat()
+	t.autoSave()
+	return nil
+}
+
+func (t *Tree) siblings(item *Item) []*Item {
+	if item == nil {
+		return nil
+	}
+	if item.parent != nil {
+		return item.parent.Children
+	}
+	return t.root
 }
 
 func (t *Tree) deleteItem(item *Item) {
@@ -849,11 +1091,12 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 			{Name: "New Folder", Action: func() { t.startInput("Folder name:", func(name string) { t.addChildFolder(sel, name) }) }},
 			{Name: "New Chat", Action: func() { t.startInput("Chat name:", func(name string) { t.addChildChat(sel, name) }) }},
 			{Name: "New Terminal", Action: func() { t.startInput("Terminal name:", func(name string) { t.addChildTerminal(sel, name) }) }},
-			{Name: "Rename", Action: func() { t.startInput("Rename:", func(name string) { t.renameItem(sel, name) }) }},
+			{Name: "Rename", Action: func() { t.startRename(sel) }},
 			{Name: archiveLabel, Action: func() { t.toggleArchive(sel) }},
 			{Name: "Move up", Action: func() { t.MoveSelectedUp() }},
 			{Name: "Move down", Action: func() { t.MoveSelectedDown() }},
 			{Name: "Move out", Action: func() { t.MoveSelectedOut() }},
+			{Name: "Sort A→Z", Action: func() { t.sortChildrenAlphabetically(sel) }},
 		}
 		// Bind/Reveal/Unbind only make sense for anchored folders.
 		if sel.BoundPath != "" {
@@ -879,25 +1122,69 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 			deleteLabel = "Delete chat"
 		}
 		items = []warp.PopoverItem{
-			{Name: "Rename", Action: func() { t.startInput("Rename:", func(name string) { t.renameItem(sel, name) }) }},
+			{Name: "Rename", Action: func() { t.startRename(sel) }},
 			{Name: "Move up", Action: func() { t.MoveSelectedUp() }},
 			{Name: "Move down", Action: func() { t.MoveSelectedDown() }},
 			{Name: deleteLabel, Action: func() { t.startConfirm(sel) }},
 		}
 	} else {
-		items = []warp.PopoverItem{
-			{Name: "New Folder", Action: func() { t.startInput("Folder name:", func(name string) { t.AddFolder(name) }) }},
-			{Name: "New Chat", Action: func() { t.startInput("Chat name:", func(name string) { t.AddChat(name) }) }},
-			{Name: "New Terminal", Action: func() { t.startInput("Terminal name:", func(name string) { t.AddTerminal(name) }) }},
-		}
+		items = t.rootMenuItems()
 	}
 	return items
+}
+
+func (t *Tree) rootMenuItems() []warp.PopoverItem {
+	items := t.rootSortMenuItems()
+	return append(items,
+		warp.PopoverItem{Name: "New Folder", Action: func() { t.startInput("Folder name:", func(name string) { t.AddFolder(name) }) }},
+		warp.PopoverItem{Name: "New Chat", Action: func() { t.startInput("Chat name:", func(name string) { t.AddChat(name) }) }},
+		warp.PopoverItem{Name: "New Terminal", Action: func() { t.startInput("Terminal name:", func(name string) { t.AddTerminal(name) }) }},
+	)
+}
+
+func (t *Tree) rootSortMenuItems() []warp.PopoverItem {
+	return []warp.PopoverItem{
+		{Name: "Sort by name", Action: func() { t.sortRootByName() }},
+		{Name: "Sort by type", Action: func() { t.sortRootByType() }},
+	}
 }
 
 func (t *Tree) showContextMenu(x, y int) {
 	sel := t.ItemAt(t.selected)
 	items := t.buildContextMenuItems(sel)
 
+	t.popover = &warp.Popover{
+		Items:   items,
+		X:       x,
+		Y:       y,
+		OnClose: func() { t.popover = nil },
+	}
+}
+
+func (t *Tree) showRootMenu(x, y int) {
+	t.popover = &warp.Popover{
+		Items:   t.rootMenuItems(),
+		X:       x,
+		Y:       y,
+		OnClose: func() { t.popover = nil },
+	}
+}
+
+func (t *Tree) showSettingsMenu(x, y int) {
+	items := make([]warp.PopoverItem, 0, len(apptheme.All()))
+	for _, item := range apptheme.All() {
+		label := item.Name
+		if item.ID == t.ThemeID() {
+			label = "✓ " + label
+		}
+		id := item.ID
+		items = append(items, warp.PopoverItem{
+			Name: label,
+			Action: func() {
+				t.SetTheme(id)
+			},
+		})
+	}
 	t.popover = &warp.Popover{
 		Items:   items,
 		X:       x,
@@ -1019,21 +1306,66 @@ func (t *Tree) startConfirm(item *Item) {
 	t.modalActive = true
 }
 
+// OpenHelp opens the keyboard navigation help overlay.
+func (t *Tree) OpenHelp() {
+	if t.helpMode {
+		t.closeModal()
+		return
+	}
+	t.helpMode = true
+	t.modal = warp.NewModal(
+		"Keyboard help",
+		keyboardHelpText(),
+		[]warp.ModalButton{{Label: "Close", Action: func() { t.closeModal() }}},
+		func() { t.closeModal() },
+	)
+	t.modalActive = true
+}
+
+// HelpOpen reports whether the keyboard help overlay is visible.
+func (t *Tree) HelpOpen() bool {
+	return t.helpMode
+}
+
 // startInput enters input mode with the given prompt and callback.
 func (t *Tree) startInput(prompt string, done func(name string)) {
 	t.inputMode = true
 	t.inputPrompt = prompt
 	t.inputValue = ""
 	t.inputCursor = 0
+	t.inputError = ""
 	t.inputDone = done
 
 	t.updateInputModal()
 }
 
+// startRename opens the rename modal with the current name pre-filled.
+func (t *Tree) startRename(item *Item) {
+	if item == nil {
+		return
+	}
+	t.inputMode = true
+	t.inputPrompt = "Rename:"
+	t.inputValue = item.Name
+	t.inputCursor = len([]rune(item.Name))
+	t.inputError = ""
+	t.inputDone = func(name string) {
+		if err := t.renameItem(item, name); err != nil {
+			t.inputError = err.Error()
+			t.updateInputModal()
+		}
+	}
+	t.updateInputModal()
+}
+
 // confirmInput confirms the current input.
 func (t *Tree) confirmInput() {
+	t.inputError = ""
 	if t.inputDone != nil && t.inputValue != "" {
 		t.inputDone(t.inputValue)
+		if t.inputError != "" {
+			return
+		}
 	}
 	t.closeModal()
 }
@@ -1056,6 +1388,7 @@ func (t *Tree) inputCursorClamp() {
 
 // insertInput inserts runes at the current cursor position.
 func (t *Tree) insertInput(runes []rune) {
+	t.inputError = ""
 	cur := t.inputRunes()
 	t.inputCursorClamp()
 	out := make([]rune, 0, len(cur)+len(runes))
@@ -1068,6 +1401,7 @@ func (t *Tree) insertInput(runes []rune) {
 
 // deleteInputBefore deletes the rune before the cursor (backspace).
 func (t *Tree) deleteInputBefore() {
+	t.inputError = ""
 	runes := t.inputRunes()
 	t.inputCursorClamp()
 	if t.inputCursor == 0 {
@@ -1082,6 +1416,7 @@ func (t *Tree) deleteInputBefore() {
 
 // deleteInputAfter deletes the rune after the cursor (delete).
 func (t *Tree) deleteInputAfter() {
+	t.inputError = ""
 	runes := t.inputRunes()
 	t.inputCursorClamp()
 	if t.inputCursor >= len(runes) {
@@ -1116,11 +1451,53 @@ func (t *Tree) SetOnStopSession(fn func(*Item)) {
 	t.onStopSession = fn
 }
 
+// SetOnThemeChange registers a callback invoked after a theme is selected.
+func (t *Tree) SetOnThemeChange(fn func(string)) {
+	t.onThemeChange = fn
+}
+
+// SetOnOpenHelp registers a callback for the application-level Help overlay.
+func (t *Tree) SetOnOpenHelp(fn func()) {
+	t.onOpenHelp = fn
+}
+
+// SetOnOpenSettings registers a callback for the application-level Settings overlay.
+func (t *Tree) SetOnOpenSettings(fn func()) {
+	t.onOpenSettings = fn
+}
+
+// SetTheme applies a known theme, persists it, and notifies the application.
+func (t *Tree) SetTheme(id string) bool {
+	resolved, ok := apptheme.ByID(id)
+	if !ok {
+		return false
+	}
+	if t.Theme != resolved.ID {
+		t.Theme = resolved.ID
+	}
+	_ = t.SaveState()
+	if t.onThemeChange != nil {
+		t.onThemeChange(resolved.ID)
+	}
+	return true
+}
+
+// ThemeID returns the active theme identifier.
+func (t *Tree) ThemeID() string {
+	return apptheme.Resolve(t.Theme).ID
+}
+
 // SetOnItemMoved registers a callback fired after a successful move with
 // (item, oldSessionID, newSessionID). The IDs are bare (no profile prefix) and
 // stable across renames within the same parent.
 func (t *Tree) SetOnItemMoved(fn func(*Item, string, string)) {
 	t.onItemMoved = fn
+}
+
+// SetOnRename registers a callback that performs external data migration
+// before the tree item name changes. Returning an error aborts the rename.
+func (t *Tree) SetOnRename(fn func(*Item, string) error) {
+	t.onRename = fn
 }
 
 // SetProfile attaches a profile slug used to compute stable session IDs in
@@ -1341,7 +1718,9 @@ func (t *Tree) closeModal() {
 	t.inputValue = ""
 	t.inputCursor = 0
 	t.inputDone = nil
+	t.inputError = ""
 	t.confirmMode = false
+	t.helpMode = false
 	t.confirmItem = nil
 	t.confirmYes = nil
 	t.resetHover()
@@ -1354,6 +1733,9 @@ func (t *Tree) updateInputModal() {
 	before := string(runes[:t.inputCursor])
 	after := string(runes[t.inputCursor:])
 	content := before + "▌" + after
+	if t.inputError != "" {
+		content += "\nError: " + t.inputError
+	}
 	t.modal = warp.NewModal(t.inputPrompt, content,
 		[]warp.ModalButton{
 			{Label: "Create", Action: func() { t.confirmInput() }},

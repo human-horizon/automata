@@ -10,13 +10,39 @@ import (
 	"time"
 )
 
-// SessionRoots returns the directory where just-pi keeps session .jsonl files.
+// SessionRoots returns every ~/.ai/<agent>/pi/sessions/ directory that
+// currently exists on this machine. Each just-pi-style agent (just, getic,
+// synth, vexa, weft, ask, …) keeps its sessions under its own pi/ subdir,
+// so a new agent works without code changes. Falls back to
+// ~/.ai/just/pi/sessions/ when ~/.ai itself is missing or empty.
 func SessionRoots() []string {
 	home, _ := os.UserHomeDir()
 	if home == "" {
 		home = "/Users/a"
 	}
-	return []string{filepath.Join(home, ".ai", "just", "pi", "sessions")}
+	base := filepath.Join(home, ".ai")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return []string{filepath.Join(base, "just", "pi", "sessions")}
+	}
+	var roots []string
+	seen := make(map[string]bool)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sessionsDir := filepath.Join(base, e.Name(), "pi", "sessions")
+		if info, err := os.Stat(sessionsDir); err == nil && info.IsDir() {
+			if !seen[sessionsDir] {
+				roots = append(roots, sessionsDir)
+				seen[sessionsDir] = true
+			}
+		}
+	}
+	if len(roots) == 0 {
+		return []string{filepath.Join(base, "just", "pi", "sessions")}
+	}
+	return roots
 }
 
 // EncodeCwdDir returns the subdirectory name used by pi for a given working directory.
@@ -26,16 +52,21 @@ func EncodeCwdDir(cwd string) string {
 	return "--" + strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(cleaned) + "--"
 }
 
-// FindSessionJSONL searches for the .jsonl file for a given session id and working directory.
-// It prefers the current working directory, then falls back to all session directories.
-func FindSessionJSONL(sessionID, cwd string) string {
+// FindSessionJSONL searches for the .jsonl file for a given session id, working
+// directory and pi agent. When agentDir is non-empty the search is restricted
+// to that single agent's sessions dir — this is the safe path used by Clear so
+// that one profile cannot pick up another profile's sessions. When agentDir is
+// empty the search falls back to all known roots (discovered by SessionRoots),
+// which is the legacy behaviour used by tools and tests.
+func FindSessionJSONL(sessionID, cwd, agentDir string) string {
 	if sessionID == "" {
 		return ""
 	}
 
+	roots := sessionRootsFor(agentDir)
 	subdir := EncodeCwdDir(cwd)
 	preferred := sessionFileCandidate{}
-	for _, root := range SessionRoots() {
+	for _, root := range roots {
 		candidate, ok := newestSessionFile(filepath.Join(root, subdir), sessionID)
 		if ok && candidate.newerThan(preferred) {
 			preferred = candidate
@@ -46,7 +77,7 @@ func FindSessionJSONL(sessionID, cwd string) string {
 	}
 
 	fallback := sessionFileCandidate{}
-	for _, root := range SessionRoots() {
+	for _, root := range roots {
 		entries, err := os.ReadDir(root)
 		if err != nil {
 			continue
@@ -62,6 +93,16 @@ func FindSessionJSONL(sessionID, cwd string) string {
 		}
 	}
 	return fallback.path
+}
+
+// sessionRootsFor returns the search roots for FindSessionJSONL. When agentDir
+// is non-empty, only that agent's sessions dir is returned; otherwise all
+// known roots are used.
+func sessionRootsFor(agentDir string) []string {
+	if agentDir == "" {
+		return SessionRoots()
+	}
+	return []string{filepath.Join(agentDir, "sessions")}
 }
 
 type sessionFileCandidate struct {
@@ -123,12 +164,17 @@ func readSessionID(path string) string {
 	return header.ID
 }
 
-// DeleteSessionJSONL removes the .jsonl file for a given session and cwd.
-// Returns the deleted path and nil on success, or empty string and error.
-func DeleteSessionJSONL(sessionID, cwd string) (string, error) {
-	p := FindSessionJSONL(sessionID, cwd)
+// DeleteSessionJSONL removes the .jsonl file for a given session and cwd,
+// restricted to the given pi agent. Passing an empty agentDir is an error:
+// Clear must always know which agent it's clearing, otherwise it could
+// delete another profile's session by accident.
+func DeleteSessionJSONL(sessionID, cwd, agentDir string) (string, error) {
+	if agentDir == "" {
+		return "", fmt.Errorf("agentDir is required for safe deletion")
+	}
+	p := FindSessionJSONL(sessionID, cwd, agentDir)
 	if p == "" {
-		return "", fmt.Errorf("session file not found for %q", sessionID)
+		return "", fmt.Errorf("session file not found for %q in agent %q", sessionID, agentDir)
 	}
 	if err := os.Remove(p); err != nil {
 		return "", err
@@ -138,15 +184,18 @@ func DeleteSessionJSONL(sessionID, cwd string) (string, error) {
 
 // FamiliarsJSONLPath returns the absolute path to familiars.json for the given
 // session. Profile-aware: when profile is non-empty the file lives under
-// ~/.ai/automata/profiles/<profile>/sessions/<sessionID>/familiars.json.
+// ~/.ai/automata/profiles/<profile-slug>/sessions/<sessionID>/familiars.json.
+//
+// IMPORTANT: profile names are case-preserved in memory (e.g. "HumanHorizon")
+// but the on-disk layout uses the lowercase slug ("humanhorizon"). We must
+// run the same ProfileSlug normalisation here as in paths.go, otherwise
+// ReadFile/WriteFile silently miss the directory and RemoveFamiliar becomes
+// a no-op — which leaves the familiar in familiars.json and the chat panel
+// resurrects it on the next poll. (See Anya's report 2026-08-25.)
 func FamiliarsJSONLPath(profile, sessionID string) string {
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	base := filepath.Join(home, ".ai", "automata")
+	base := BaseDir()
 	if profile != "" {
-		base = filepath.Join(base, "profiles", profile)
+		base = ProfileDir(profile)
 	}
 	return filepath.Join(base, "sessions", sessionID, "familiars.json")
 }
@@ -163,4 +212,50 @@ func ClearFamiliarsJSONL(profile, sessionID string) error {
 		return nil
 	}
 	return os.WriteFile(path, []byte("[]"), 0644)
+}
+
+// FamiliarEntry mirrors the JSON shape stored in familiars.json. Only the
+// fields we care about are parsed; anything else is dropped on rewrite.
+type FamiliarEntry struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionId"`
+	Created   string `json:"created,omitempty"`
+}
+
+// RemoveFamiliar deletes the entry whose SessionID equals familiarID from
+// the session's familiars.json, then rewrites the file with the remaining
+// entries. A missing file or a missing entry is a no-op (returns nil).
+// Used by ChatPanel when the user closes a familiar via the × button.
+func RemoveFamiliar(profile, sessionID, familiarID string) error {
+	path := FamiliarsJSONLPath(profile, sessionID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var entries []FamiliarEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		// File exists but isn't a JSON array — leave it alone rather
+		// than silently trampling it. Surface the error so the caller
+		// can log it.
+		return fmt.Errorf("familiars.json at %s is not a JSON array: %w", path, err)
+	}
+	kept := make([]FamiliarEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.SessionID == familiarID {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if len(kept) == len(entries) {
+		// Nothing to remove — leave the file untouched.
+		return nil
+	}
+	out, err := json.MarshalIndent(kept, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0644)
 }

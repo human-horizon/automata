@@ -11,24 +11,12 @@ import (
 
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
+	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fsnotify/fsnotify"
 	warp "github.com/starframe-dev/warp"
 )
-
-// kanbanTickMsg is sent periodically to (a) attempt to reattach a watcher
-// if the kanban directory appeared after SetDomain, and (b) reload tasks on
-// a long-interval fallback so we don't get stuck if fsnotify misses an event.
-type kanbanTickMsg time.Time
-
-// kanbanFallbackInterval is the heartbeat used for the fallback reattach +
-// periodic reload. It is intentionally much larger than the previous
-// 150 ms heartbeat: a 150 ms tick caused a constant stream of useless
-// Update + View cycles (the #1 source of the "100% CPU after an hour"
-// regression). The fsnotify watcher handles real changes; this tick is
-// only a safety net.
-const kanbanFallbackInterval = 5 * time.Second
 
 // kanbanChangedMsg is sent by watchKanbanCmd when fsnotify reports a change
 // in the kanban directory. We use a single-message Cmd that re-arms itself
@@ -45,12 +33,11 @@ type ChatInfo struct {
 var kanbanColumns = []struct {
 	status string
 	label  string
-	style  lipgloss.Style
 }{
-	{"todo", "Todo", lipgloss.NewStyle().Foreground(lipgloss.Color("#a89984"))},
-	{"pending", "Pending", lipgloss.NewStyle().Foreground(lipgloss.Color("#d79921"))},
-	{"progress", "Progress", lipgloss.NewStyle().Foreground(lipgloss.Color("#458588"))},
-	{"done", "Done", lipgloss.NewStyle().Foreground(lipgloss.Color("#98971a"))},
+	{"todo", "Todo"},
+	{"pending", "Pending"},
+	{"progress", "Progress"},
+	{"done", "Done"},
 }
 
 // Status transitions: current → button label → next status
@@ -72,6 +59,7 @@ var statusTransitions = map[string][]transition{
 type KanbanPanel struct {
 	profile string
 	domain  string
+	palette apptheme.Theme
 	tasks   []kanban.Task
 	tab     *warp.Tab
 
@@ -97,10 +85,6 @@ type KanbanPanel struct {
 	// for the periodic poll.
 	watcher *fsnotify.Watcher
 
-	// tickPending is true while a kanbanTickMsg is already scheduled, so we
-	// don't enqueue duplicate heartbeats on every Update.
-	tickPending bool
-
 	// watchPending is true while a watchKanbanCmd is already in flight — it
 	// blocks on watcher.Events and is re-armed after every event.
 	watchPending bool
@@ -120,6 +104,7 @@ type KanbanPanel struct {
 func NewKanbanPanel(profile string) *KanbanPanel {
 	k := &KanbanPanel{
 		profile:      profile,
+		palette:      apptheme.Default(),
 		tab:          warp.NewTab("kanban"),
 		btnPanel:     newKanbanBtnPanel(),
 		colPanels:    make([]*kanbanColPanel, len(kanbanColumns)),
@@ -144,6 +129,11 @@ func NewKanbanPanel(profile string) *KanbanPanel {
 	return k
 }
 
+// SetTheme updates the palette used by the Kanban panel.
+func (k *KanbanPanel) SetTheme(palette apptheme.Theme) {
+	k.palette = palette
+}
+
 // SetDomain reloads tasks for the given domain.
 func (k *KanbanPanel) SetDomain(domain string) {
 	if k.domain == domain {
@@ -155,14 +145,13 @@ func (k *KanbanPanel) SetDomain(domain string) {
 	k.closeWatcher()
 	k.reload()
 	k.setupWatcher()
-	k.tickPending = false // ensure a fresh tick is scheduled on the next Update
-	k.watchPending = false
+	k.watchPending = false // ensure a fresh watcher cmd is scheduled on the next Update
 }
 
 // setupWatcher attaches an fsnotify.Watcher to the domain's kanban
 // directory so any external edit to a task .md file is reflected in the UI
 // without waiting for the next periodic poll. The actual drain happens in
-// Update via kanbanTickMsg.
+// Update via kanbanChangedMsg.
 func (k *KanbanPanel) setupWatcher() {
 	if k.domain == "" {
 		return
@@ -188,14 +177,6 @@ func (k *KanbanPanel) closeWatcher() {
 		k.watcher.Close()
 		k.watcher = nil
 	}
-}
-
-// tickCmd schedules the next kanban tick. Returned from Update so the
-// heartbeat keeps firing as long as the panel is alive.
-func (k *KanbanPanel) tickCmd() tea.Cmd {
-	return tea.Tick(kanbanFallbackInterval, func(t time.Time) tea.Msg {
-		return kanbanTickMsg(t)
-	})
 }
 
 // watchKanbanCmd blocks on the fsnotify event channel and returns a single
@@ -320,17 +301,6 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 			}
 		}
 		baseCmd = k.tab.Update(msg)
-	case kanbanTickMsg:
-		// Fallback: re-attach the watcher if the kanban directory appeared
-		// after SetDomain, and reload tasks so external edits show up even
-		// if fsnotify misses an event.
-		k.tickPending = false
-		if k.watcher == nil {
-			k.setupWatcher()
-		}
-		k.reload()
-		k.lastRefresh = time.Now()
-		baseCmd = nil
 	case kanbanChangedMsg:
 		// fsnotify reported a change — reload and re-arm the watcher.
 		k.watchPending = false
@@ -339,13 +309,6 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 		baseCmd = nil
 	default:
 		baseCmd = k.tab.Update(msg)
-	}
-
-	// Schedule the next fallback tick (cheap, every 5s) only if no tick
-	// is already in flight.
-	if !k.tickPending {
-		k.tickPending = true
-		baseCmd = tea.Batch(baseCmd, k.tickCmd())
 	}
 
 	// Re-arm the blocking fsnotify Cmd so we keep receiving changes.
@@ -358,8 +321,9 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 	return baseCmd
 }
 
-// drainWatcher is no longer used — the blocking watchKanbanCmd + fallback
-// tick handle all change detection.
+// drainWatcher is no longer used — the blocking watchKanbanCmd handles all
+// change detection. Kept as a stub so external callers that referenced it
+// still compile.
 func (k *KanbanPanel) drainWatcher() {}
 
 func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
@@ -605,20 +569,21 @@ func compactFallback(width, height int) string {
 }
 
 func (k *KanbanPanel) renderPicker(width, height int) string {
+	styles := k.styles()
 	var b strings.Builder
 
 	// Header
 	header := fmt.Sprintf(" Выберите чат для задачи \"%s\"", k.pendingTask.Title)
-	b.WriteString(titleStyle.Render(header))
+	b.WriteString(styles.title.Render(header))
 	b.WriteString("\n")
 	b.WriteString(strings.Repeat("─", width))
 	b.WriteString("\n")
 
 	// Chat list
 	for i, chat := range k.chats {
-		style := itemStyle
+		style := styles.item
 		if i == k.pickerHover {
-			style = kanbanCardHoverStyle
+			style = styles.cardHover
 		}
 		line := fmt.Sprintf("  💬 %s", chat.Name)
 		if lipgloss.Width(line) > width {
@@ -671,9 +636,13 @@ func newKanbanBtnPanel() *kanbanBtnPanel {
 
 func (b *kanbanBtnPanel) View(width, height int) string {
 	text := " + Новая задача "
-	style := kanbanBtnStyle
+	styles := newKanbanStyles(apptheme.Default())
+	if b.parent != nil {
+		styles = b.parent.styles()
+	}
+	style := styles.button
 	if b.hover {
-		style = kanbanBtnHoverStyle
+		style = styles.buttonHover
 	}
 	// Wrap in an outer style that gives the button a small horizontal margin
 	// so it doesn't sit flush against the left edge of the panel.
@@ -704,13 +673,13 @@ func (b *kanbanBtnPanel) Update(msg tea.Msg) tea.Cmd {
 // --- Column panel ---
 
 type kanbanColPanel struct {
-	colIndex  int
-	tasks     []kanban.Task
-	width     int
-	height    int
-	hoverRow  int
-	hoverBtn  string // which button is hovered: "transit", "delete", or ""
-	parent    *KanbanPanel
+	colIndex int
+	tasks    []kanban.Task
+	width    int
+	height   int
+	hoverRow int
+	hoverBtn string // which button is hovered: "transit", "delete", or ""
+	parent   *KanbanPanel
 
 	// scrollOffset is the number of lines scrolled past from the top of the
 	// column. Used when tasks don't fit vertically.
@@ -733,6 +702,10 @@ func (c *kanbanColPanel) View(width, height int) string {
 	c.width = width
 	c.height = height
 	col := kanbanColumns[c.colIndex]
+	styles := newKanbanStyles(apptheme.Default())
+	if c.parent != nil {
+		styles = c.parent.styles()
+	}
 
 	var b strings.Builder
 
@@ -743,7 +716,7 @@ func (c *kanbanColPanel) View(width, height int) string {
 	}
 	header := fmt.Sprintf("%s %s (%d) ", indicator, col.label, len(c.tasks))
 	header = padOrTruncate(header, width)
-	b.WriteString(col.style.Render(header))
+	b.WriteString(styles.columns[c.colIndex].Render(header))
 	b.WriteString("\n")
 
 	// scrollOffset is the number of content lines (after header) to skip.
@@ -827,21 +800,23 @@ func (c *kanbanColPanel) View(width, height int) string {
 // lines including top/bottom borders. The card has 2 internal padding columns
 // (one on each side of the content), so the inner width is width-2.
 func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
+	palette := apptheme.Default()
+	styles := newKanbanStyles(palette)
+	if c.parent != nil {
+		palette = c.parent.palette
+		styles = c.parent.styles()
+	}
 	width := c.width
 	if width < 4 {
 		width = 4
 	}
 	inner := width - 2
 
-	borderColor := lipgloss.Color("#3c3836")
+	borderStyle := styles.border
+	bgStyle := styles.background
 	if isHover {
-		borderColor = lipgloss.Color("#d79921")
-	}
-	borderStyle := lipgloss.NewStyle().Foreground(borderColor)
-
-	bgStyle := lipgloss.NewStyle()
-	if isHover {
-		bgStyle = bgStyle.Background(lipgloss.Color("#504945"))
+		borderStyle = styles.border.Copy().Foreground(lipgloss.Color(palette.Border))
+		bgStyle = styles.backgroundHover
 	}
 
 	// Top border
@@ -880,7 +855,7 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	titlePad := strings.Repeat(" ", titleMax-lipgloss.Width(title))
 	del := " ×"
 	if isHover && c.hoverBtn == "delete" {
-		del = kanbanDeleteStyle.Render(" ×")
+		del = styles.delete.Render(" ×")
 	}
 	titleContent := title + titlePad + del
 	titleLine := wrapLine(titleContent)
@@ -899,7 +874,7 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 		if lipgloss.Width(assigned) > inner {
 			assigned = assigned[:inner]
 		}
-		styled := kanbanAssignedStyle.Render(assigned)
+		styled := styles.assigned.Render(assigned)
 		// Pad to fill the inner width after styling.
 		visW := lipgloss.Width(styled)
 		if visW < inner {
@@ -917,7 +892,7 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 		if lipgloss.Width(sub) > inner {
 			sub = sub[:inner]
 		}
-		styled := kanbanSubstatusStyle.Render(sub)
+		styled := styles.substatus.Render(sub)
 		visW := lipgloss.Width(styled)
 		pad := ""
 		if visW < inner {
@@ -931,9 +906,9 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	// Transition buttons — always visible
 	for _, t := range statusTransitions[task.Status] {
 		btnText := " " + t.label + " "
-		btnStyle := kanbanTransitBtnStyle
+		btnStyle := styles.transit
 		if isHover && c.hoverBtn == t.next {
-			btnStyle = kanbanTransitBtnHoverStyle
+			btnStyle = styles.transitHover
 		}
 		btn := btnStyle.Render(btnText)
 		visW := lipgloss.Width(btn)
@@ -950,7 +925,7 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	label := " Файл задачи"
 	href := "file://" + task.Path
 	hyperlinked := fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", href, label)
-	link := kanbanCardPathStyle.Render(hyperlinked)
+	link := styles.cardPath.Render(hyperlinked)
 	visW := lipgloss.Width(link)
 	pad := ""
 	if visW < inner {
@@ -1247,19 +1222,6 @@ type voidPanel struct{}
 
 func (voidPanel) View(width, height int) string { return "" }
 func (voidPanel) Update(msg tea.Msg) tea.Cmd    { return nil }
-
-var (
-	kanbanCardStyle         = lipgloss.NewStyle().Padding(0, 1)
-	kanbanCardHoverStyle    = lipgloss.NewStyle().Padding(0, 1).Background(lipgloss.Color("#504945"))
-	kanbanCardPathStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
-	kanbanAssignedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#83a598")).Padding(0, 1)
-	kanbanSubstatusStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#d3869b")).Italic(true).Padding(0, 1)
-	kanbanDeleteStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#cc241d")).Bold(true)
-	kanbanTransitBtnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#ebdbb2")).Background(lipgloss.Color("#458588")).Padding(0, 1)
-	kanbanTransitBtnHoverStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#ebdbb2")).Background(lipgloss.Color("#689d6a")).Bold(true).Padding(0, 1)
-	kanbanBtnStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("#ebdbb2")).Background(lipgloss.Color("#458588")).Bold(true).Padding(0, 1)
-	kanbanBtnHoverStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#ebdbb2")).Background(lipgloss.Color("#689d6a")).Bold(true).Padding(0, 1)
-)
 
 func padOrTruncate(s string, w int) string {
 	if lipgloss.Width(s) >= w {

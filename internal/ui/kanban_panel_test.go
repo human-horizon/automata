@@ -182,11 +182,19 @@ func TestKanbanWatchCmdReactsToFsnotifyEvent(t *testing.T) {
 	}
 }
 
-// TestFallbackIntervalIs5s guards against regressing to a busy 150ms heartbeat.
-// The previous design caused 100% CPU after long sessions.
-func TestFallbackIntervalIs5s(t *testing.T) {
-	if kanbanFallbackInterval < time.Second {
-		t.Errorf("kanbanFallbackInterval = %v, want >= 1s to avoid 100%% CPU", kanbanFallbackInterval)
+// TestNoKanbanTickFallbackExists guards against regressing to a periodic
+// poll — the kanban panel must stay event-driven via fsnotify. If a
+// `tickCmd` or `kanbanTickMsg` ever comes back, this test fails.
+func TestNoKanbanTickFallbackExists(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "internal", "ui", "kanban_panel.go"))
+	if err != nil {
+		t.Fatalf("read kanban_panel.go: %v", err)
+	}
+	contents := string(src)
+	for _, banned := range []string{"kanbanTickMsg", "tickCmd", "tickPending", "kanbanFallbackInterval"} {
+		if strings.Contains(contents, banned) {
+			t.Errorf("kanban_panel.go still references %q — the panel must stay event-driven via fsnotify", banned)
+		}
 	}
 }
 

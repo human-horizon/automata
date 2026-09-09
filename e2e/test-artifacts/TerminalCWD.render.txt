@@ -1,10 +1,50 @@
-Automata (cue-test-cwd)    + <                                                                                        │Knowledge [× auto] [× dual]              
-  cwdtest ■ ⋮ ○ idle         │                                                                                        │── Status                                
-                             │                                                                                        │  (no status)                            
-                             │                                                                                        │── Plans                                 
+Automata (cue-test-cwd)  ⋮  +<Warning: No project session found with id 'cue-test-cwd__cwdtest'; creating a new sessio│Knowledge [× auto] [× dual]              
+  cwdtest ■ ⋮ ○ idle         │n with that id.                                                                         │── Status                                
+                             │Model scope: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, MiniMax-M3, deepseek-v4-flash, qw│  (no status)                            
+                             │en-3.5-9b, qwen-3.8-27b, qwen3.8-max, qwen3.8-flash, gpt-6-astra (Ctrl+P to cycle)      │── Plans                                 
                              │                                                                                        │  (no plans)                             
-                             │                                                                                        │── Jobs                                  
-                             │                                                                                        │  (no running jobs)                      
+                             │ pi v0.83.0                                                                             │── Jobs                                  
+                             │ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more        │  (no running jobs)                      
+                             │ Press ctrl+o to show full startup help and loaded resources.                           │                                         
+                             │                                                                                        │                                         
+                             │ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.  │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │[Context]                                                                               │                                         
+                             │  ~/.ai/just/pi/SYSTEM.md                                                               │                                         
+                             │                                                                                        │                                         
+                             │[Skills]                                                                                │                                         
+                             │  ai-caveman, ai-consultation, ai-my-mistakes, ai-stop-slop, ai-weft, dev-coding-style, │                                         
+                             │dev-deploy-quality, dev-golang, dev-pnpm, dev-python, dev-spec-first,                   │                                         
+                             │explore-web-search, knowledge-clickhouse, knowledge-code-check, knowledge-code-specs,   │                                         
+                             │knowledge-codekeeper, knowledge-dream-frame, knowledge-hermes-agent,                    │                                         
+                             │knowledge-pi-extension, knowledge-qwik, knowledge-rune-map, knowledge-secret-agent,     │                                         
+                             │knowledge-view-print, remote-app-flowy, remote-dev-vps, remote-google-drive,            │                                         
+                             │testing-cue-tty, testing-tauri, testing-testing                                         │                                         
+                             │                                                                                        │                                         
+                             │[Prompts]                                                                               │                                         
+                             │  /@DevOps, /@АртДиректорИДизайнер, /@Архитектор, /@БагФиксер, /@ГеймДизайнер,          │                                         
+                             │/@ИдейныйВдохновитель, /@Исследователь, /@Критик, /@Минималист, /@Оптимизатор,          │                                         
+                             │/@Переводчик, /@Перфекционист, /@Планировщик, /@Разработчик, /@Специалист,              │                                         
+                             │/@СюжетныйМастер, /@Тестер, /@ТехническийПисатель, /@Управляющая, /#ЛаконичныйУльтра    │                                         
+                             │                                                                                        │                                         
+                             │[Extensions]                                                                            │                                         
+                             │  automata, automata-idle-notify, dual, familiar, job, session                          │                                         
+                             │                                                                                        │                                         
+                             │[Themes]                                                                                │                                         
+                             │  gruvbox                                                                               │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │ cd /tmp                                                                                │                                         
+                             │                                                                                        │                                         
+                             │                                                                                        │                                         
+                             │ ⠹ Working...                                                                           │                                         
+                             │                                                                                        │                                         
+                             │────────────────────────────────────────────────────────────────────────────────────────│                                         
+                             │                                                                                        │                                         
+                             │────────────────────────────────────────────────────────────────────────────────────────│                                         
+                             │~/Space/Projects/HumanHorizon/automata/e2e (main)                                       │                                         
+                             │$0.000 (sub) 0.0%/272k (auto)                           (openai-codex) gpt-6-astra • max│                                         
                              │                                                                                        │                                         
                              │                                                                                        │                                         
                              │                                                                                        │                                         
@@ -12,44 +52,4 @@ Automata (cue-test-cwd)    + <                                                  
                              │                                                                                        │                                         
                              │                                                                                        │                                         
                              │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │                                                                                        │                                         
-                             │ Main                                                                           × Clear │                                         
+? Help                       │ Main                                                                           × Clear │                                         

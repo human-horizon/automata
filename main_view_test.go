@@ -5,17 +5,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/HumanHorizon/automata/internal/paths"
+	"github.com/HumanHorizon/automata/internal/status"
 	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/HumanHorizon/automata/internal/ui"
 	"github.com/Starframe/portalis"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/fsnotify/fsnotify"
 	"github.com/muesli/termenv"
 	warp "github.com/starframe-dev/warp"
 )
@@ -141,7 +145,7 @@ func TestPiLaunchHonorsPiCmdOverride(t *testing.T) {
 func TestCreateChatEmulatorWithoutPiCommandReturnsNil(t *testing.T) {
 	t.Setenv("PI_CMD", "")
 	t.Setenv("PATH", t.TempDir()) // no just-pi on PATH
-	app := &App{tree: tree.New()}  // no piAgentDir
+	app := &App{tree: tree.New()} // no piAgentDir
 
 	t.Log("Когда: ни piAgentDir, ни just-pi, ни PI_CMD недоступны")
 	em := app.createChatEmulator("profile__chat")
@@ -351,6 +355,75 @@ func TestClearKillsFamiliarsOfThisSession(t *testing.T) {
 	}
 }
 
+// TestCloseFamiliarCleansHostState verifies that confirmed familiar close
+// removes the emulator state, JSONL history, and familiars.json entry.
+func TestCloseFamiliarCleansHostState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
+
+	const (
+		profile = "close-familiar-profile"
+		mainSID = "close-familiar-profile__chat"
+		famSID  = "close-familiar-profile__chat__expert"
+		cwd     = "/tmp"
+	)
+
+	famJSONL := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
+	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	chatPanel := ui.NewChatPanel(mainEm, mainSID, profile)
+	container := ui.NewContainer(chatPanel)
+	familiarsPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(familiarsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll familiars directory: %v", err)
+	}
+	if err := os.WriteFile(familiarsPath, []byte(`[{"id":"expert","sessionId":"`+famSID+`"},{"id":"helper","sessionId":"`+mainSID+`__helper"}]`), 0o644); err != nil {
+		t.Fatalf("WriteFile familiars.json: %v", err)
+	}
+
+	app := &App{
+		container:      container,
+		tree:           tree.New(),
+		activeSessions: map[string]struct{}{mainSID: {}, famSID: {}},
+		emulatorCache: map[string]*portalis.Emulator{
+			famSID: familiarEm,
+		},
+		familiarEmulatorCache: map[string]*portalis.Emulator{
+			famSID: familiarEm,
+		},
+		profile:    profile,
+		piAgentDir: filepath.Join(home, ".ai", "just", "pi"),
+	}
+	app.tree.Profile = profile
+
+	app.closeFamiliar(famSID, familiarEm)
+
+	if _, ok := app.emulatorCache[famSID]; ok {
+		t.Fatal("familiar remained in emulatorCache")
+	}
+	if _, ok := app.familiarEmulatorCache[famSID]; ok {
+		t.Fatal("familiar remained in familiarEmulatorCache")
+	}
+	if _, ok := app.activeSessions[famSID]; ok {
+		t.Fatal("familiar remained in activeSessions")
+	}
+	if _, err := os.Stat(famJSONL); !os.IsNotExist(err) {
+		t.Fatalf("familiar JSONL still exists: %v", err)
+	}
+	data, err := os.ReadFile(familiarsPath)
+	if err != nil {
+		t.Fatalf("ReadFile familiars.json: %v", err)
+	}
+	var entries []paths.FamiliarEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("decode familiars.json: %v", err)
+	}
+	if len(entries) != 1 || entries[0].SessionID != mainSID+"__helper" {
+		t.Fatalf("unexpected remaining familiars: %#v", entries)
+	}
+}
+
 // TestClearKillsFamiliarsRespectsProfile verifies that ClearFamiliarsJSONL
 // resolves familiars.json under the profile-scoped path, not the default one.
 func TestClearKillsFamiliarsRespectsProfile(t *testing.T) {
@@ -358,10 +431,10 @@ func TestClearKillsFamiliarsRespectsProfile(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	const (
-		profile  = "humanhorizon"
-		mainSID  = "humanhorizon__chat"
-		famSID   = "humanhorizon__chat__expert"
-		cwd      = "/Users/a/Space"
+		profile = "humanhorizon"
+		mainSID = "humanhorizon__chat"
+		famSID  = "humanhorizon__chat__expert"
+		cwd     = "/Users/a/Space"
 	)
 
 	famJSONL := writeJSONLFixture(t, home, cwd, famSID, time.Now())
@@ -420,4 +493,559 @@ func writeJSONLFixture(t *testing.T, home, cwd, sessionID string, modTime time.T
 		t.Fatalf("Chtimes: %v", err)
 	}
 	return path
+}
+
+// TestClearReplacesPanelEmulator verifies that after Clear the active
+// ChatPanel's chatSession (and its wrapped TermPanel) point to the freshly
+// started emulator — not the stopped one. Without the fix, View() would
+// render the dead emulator's empty screen instead of the new pi prompt.
+//
+// The test injects startEmulatorSyncFn to avoid spawning a real PTY, and
+// reflects into TermPanel.em to confirm the swap (the field is unexported).
+func TestClearReplacesPanelEmulator(t *testing.T) {
+	t.Setenv("PI_CMD", "/bin/sh")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	const sessionID = "humanhorizon__chat"
+
+	// 1. Original emulator wrapped by the ChatPanel.
+	origEm := portalis.NewEmulator(sessionID, "chat", "/bin/sh", nil)
+	cp := ui.NewChatPanel(origEm, sessionID, "humanhorizon")
+
+	// 2. Container in chat mode holding the ChatPanel.
+	container := ui.NewContainer(nil)
+	container.SetChat(cp, sessionID)
+
+	// 3. Minimal App wired up with the container and cache.
+	app := &App{
+		container:      container,
+		tree:           tree.New(),
+		activeSessions: map[string]struct{}{sessionID: {}},
+		emulatorCache:  map[string]*portalis.Emulator{sessionID: origEm},
+		piAgentDir:     filepath.Join(home, ".ai", "just", "pi"),
+	}
+	app.startEmulatorSyncFn = func(em *portalis.Emulator, env []string) error { return nil }
+
+	// 4. Sanity: panel holds the original emulator before Clear.
+	if cp.Sessions()[0].Em() != origEm {
+		t.Fatalf("precondition: cp.sessions[0].em != origEm")
+	}
+
+	// 5. Act: Clear.
+	if msg := app.clearSessionCmd(sessionID, "", nil)(); msg == nil {
+		t.Fatalf("clearSessionCmd returned nil")
+	}
+
+	// 6. emulatorCache holds a new emulator (different object).
+	newEm := app.emulatorCache[sessionID]
+	if newEm == nil {
+		t.Fatal("emulatorCache[sessionID] is nil after Clear")
+	}
+	if newEm == origEm {
+		t.Fatal("emulatorCache[sessionID] is still the original emulator (was not replaced)")
+	}
+
+	// 7. ChatPanel's chatSession now points at the new emulator.
+	if got := cp.Sessions()[0].Em(); got != newEm {
+		t.Fatalf("cp.sessions[0].em = %p, want new emulator %p", got, newEm)
+	}
+
+	// 8. TermPanel wrapped by chatSession points at the new emulator too.
+	//    Read the unexported TermPanel.em via unsafe because reflect's
+	//    Value.Interface() refuses unexported fields. We only use this in
+	//    tests; the production API stays narrow.
+	panel := cp.Sessions()[0].Panel()
+	if panel == nil {
+		t.Fatal("chatSession.Panel() returned nil")
+	}
+	panelVal := reflect.ValueOf(panel).Elem()
+	emField := panelVal.FieldByName("em")
+	if !emField.IsValid() {
+		t.Fatal("TermPanel.em field not found via reflection")
+	}
+	panelEm := *(**portalis.Emulator)(unsafe.Pointer(emField.UnsafeAddr()))
+	if panelEm != newEm {
+		t.Fatalf("TermPanel.em = %p, want new emulator %p", panelEm, newEm)
+	}
+
+	// 9. View() after a ResizeMsg must not panic and must render from the
+	//    new emulator (deterministic: both old and new are empty since we
+	//    never spawned a PTY, but the call exercises the render path).
+	cp.Update(warp.ResizeMsg{Width: 80, Height: 24})
+	if out := cp.View(80, 24); out == "" {
+		t.Fatal("ChatPanel.View() returned empty string after Clear+Resize")
+	}
+}
+
+// newTestApp builds a minimal App for watcher/badge tests. It points the
+// session base dir at a fresh temp HOME so the test never touches the
+// user's real ~/.ai/automata. The Tree, status reader and per-session
+// watcher map are initialised; everything else is left nil because the
+// watcher code under test never touches warp/container/emulator.
+func newTestApp(t *testing.T, profile string) *App {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tr := tree.New()
+	tr.Profile = profile
+	tr.AddChat("agent")
+	return &App{
+		tree:            tr,
+		profile:         profile,
+		piAgentDir:      filepath.Join(home, ".ai", profile, "pi"),
+		statusReader:    status.NewCachedReader(profile),
+		sessionWatchers: make(map[string]*fsnotify.Watcher),
+	}
+}
+
+// TestRecomputeTreeStatusBadgesReadsAction walks every chat, reads the
+// matching on-disk status.json and pushes the resulting emoji map to the
+// Tree. We assert the map contains the right key→glyph and that the Tree
+// exposes it through StatusBadge.
+func TestRecomputeTreeStatusBadgesReadsAction(t *testing.T) {
+	app := newTestApp(t, "test")
+	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])
+	sessionDir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "status.json"),
+		[]byte(`{"action":"thinking"}`), 0o644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	app.recomputeTreeStatusBadges()
+
+	if got := app.tree.StatusBadge(app.tree.AllItems()[0]); got == "" {
+		t.Fatalf("expected badge after refresh, got empty")
+	}
+	if got := app.tree.StatusBadge(app.tree.AllItems()[0]); got != "~" {
+		t.Fatalf("expected ~ for action=thinking, got %q", got)
+	}
+}
+
+// TestRecomputeTreeStatusBadgesIdleLeavesEmpty writes a status.json with
+// action=idle and confirms the Tree has no badge (the Tree renders
+// "○ idle" itself, so the map must omit the key to avoid a duplicate
+// glyph).
+func TestRecomputeTreeStatusBadgesIdleLeavesEmpty(t *testing.T) {
+	app := newTestApp(t, "test")
+	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])
+	sessionDir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "status.json"),
+		[]byte(`{"action":"idle"}`), 0o644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	app.recomputeTreeStatusBadges()
+
+	if got := app.tree.StatusBadge(app.tree.AllItems()[0]); got != "" {
+		t.Fatalf("expected empty badge for action=idle, got %q", got)
+	}
+}
+
+// TestSetupStatusWatcherCreatesMissingBase proves the watcher setup
+// recovers when sessionBaseDir() doesn't exist yet: it must MkdirAll the
+// base and still attach a parent watcher.
+func TestSetupStatusWatcherCreatesMissingBase(t *testing.T) {
+	app := newTestApp(t, "")
+	base := app.sessionBaseDir()
+	if _, err := os.Stat(base); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be missing before setup, got err=%v", base, err)
+	}
+
+	app.setupStatusWatcher()
+
+	if app.statusWatcher == nil {
+		t.Fatal("expected statusWatcher to be created")
+	}
+	if _, err := os.Stat(base); err != nil {
+		t.Fatalf("expected base dir to be created, got %v", err)
+	}
+	app.statusWatcher.Close()
+}
+
+// TestSetupStatusWatcherAttachesPerSession creates two chat items, points
+// the Tree at one of them, and confirms setupStatusWatcher opens a parent
+// watcher plus one watcher per existing session directory.
+func TestSetupStatusWatcherAttachesPerSession(t *testing.T) {
+	app := newTestApp(t, "")
+	keys := make([]string, 0, 2)
+	for _, it := range app.tree.AllItems() {
+		if it.IsFolder || it.IsTerminal {
+			continue
+		}
+		k := app.tree.SessionKeyOf(it)
+		dir := filepath.Join(app.sessionBaseDir(), k)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		t.Fatal("test setup: no chat items were created")
+	}
+
+	app.setupStatusWatcher()
+	_ = app.syncSessionWatchers()
+	t.Cleanup(func() {
+		app.statusWatcher.Close()
+		for _, w := range app.sessionWatchers {
+			w.Close()
+		}
+	})
+
+	if app.statusWatcher == nil {
+		t.Fatal("expected parent statusWatcher to be created")
+	}
+	for _, k := range keys {
+		if _, ok := app.sessionWatchers[k]; !ok {
+			t.Errorf("missing sessionWatcher for %q (have %d watchers)",
+				k, len(app.sessionWatchers))
+		}
+	}
+}
+
+// TestSyncSessionWatchersPrunesHidden removes a chat from the Tree and
+// confirms the matching per-session watcher is closed and dropped from
+// the map, so file descriptors don't leak.
+func TestSyncSessionWatchersPrunesHidden(t *testing.T) {
+	app := newTestApp(t, "")
+	it := app.tree.AllItems()[0]
+	key := app.tree.SessionKeyOf(it)
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	app.setupStatusWatcher()
+	_ = app.syncSessionWatchers()
+	t.Cleanup(func() {
+		app.statusWatcher.Close()
+		for _, w := range app.sessionWatchers {
+			w.Close()
+		}
+	})
+	if _, ok := app.sessionWatchers[key]; !ok {
+		t.Fatal("expected watcher after setup")
+	}
+
+	// Hide the chat by clearing the tree, then re-sync.
+	app.tree.Reset()
+
+	_ = app.syncSessionWatchers()
+
+	if _, ok := app.sessionWatchers[key]; ok {
+		t.Errorf("expected watcher for %q to be pruned, still present", key)
+	}
+}
+
+// TestWatchTreeStatusCmdNilWithoutWatcher asserts the blocking cmd is
+// inert when no watcher is mounted, so Update never schedules a goroutine
+// that would deadlock on a closed channel.
+func TestWatchTreeStatusCmdNilWithoutWatcher(t *testing.T) {
+	app := newTestApp(t, "")
+	if cmd := app.watchTreeStatusCmd(); cmd != nil {
+		t.Errorf("expected nil cmd without watcher, got %T", cmd)
+	}
+}
+
+// TestTreeStatusChangedMsgTriggersRefresh pushes treeStatusChangedMsg into
+// Update and confirms a fresh recompute happened (badge appears) plus a
+// re-arm cmd is returned. The recompute works against an on-disk
+// status.json written before the message fires.
+func TestTreeStatusChangedMsgTriggersRefresh(t *testing.T) {
+	app := newTestApp(t, "")
+	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"),
+		[]byte(`{"action":"thinking"}`), 0o644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	// Mount the watcher (skipping Init's full wiring) so watchTreeStatusCmd
+	// has something to return.
+	app.setupStatusWatcher()
+	t.Cleanup(func() {
+		app.statusWatcher.Close()
+		for _, w := range app.sessionWatchers {
+			w.Close()
+		}
+	})
+	app.statusWatchPending = true // so the first re-arm is allowed
+
+	_, cmd := app.Update(treeStatusChangedMsg{})
+
+	if got := app.tree.StatusBadge(app.tree.AllItems()[0]); got == "" {
+		t.Errorf("expected badge to be recomputed, got empty")
+	}
+	if cmd == nil {
+		t.Errorf("expected re-arm cmd, got nil")
+	}
+	if !app.statusWatchPending {
+		t.Errorf("expected statusWatchPending=true after re-arm")
+	}
+}
+
+// TestWatchSessionCmdNilWithoutWatcher asserts watchSessionCmd is inert
+// when the requested key has no mounted watcher, so Update never schedules
+// a goroutine that would deadlock on a closed channel.
+func TestWatchSessionCmdNilWithoutWatcher(t *testing.T) {
+	app := newTestApp(t, "")
+	if cmd := app.watchSessionCmd("missing"); cmd != nil {
+		t.Errorf("expected nil cmd for missing watcher, got %T", cmd)
+	}
+}
+
+// TestSyncSessionWatchersReturnsCmdsOnlyForNewWatchers ensures the cmd
+// chain is started exactly once per per-session watcher. On the first
+// syncSessionWatchers, all watchers are new and produce cmds; on a second
+// call with no Tree changes, no new cmds are produced.
+func TestSyncSessionWatchersReturnsCmdsOnlyForNewWatchers(t *testing.T) {
+	app := newTestApp(t, "")
+	for _, it := range app.tree.AllItems() {
+		if it.IsFolder || it.IsTerminal {
+			continue
+		}
+		dir := filepath.Join(app.sessionBaseDir(), app.tree.SessionKeyOf(it))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+
+	app.setupStatusWatcher()
+	t.Cleanup(func() {
+		app.statusWatcher.Close()
+		for _, w := range app.sessionWatchers {
+			w.Close()
+		}
+	})
+
+	first := app.syncSessionWatchers()
+	if len(first) == 0 {
+		t.Fatal("expected first syncSessionWatchers to produce cmds for newly attached watchers")
+	}
+
+	second := app.syncSessionWatchers()
+	if len(second) != 0 {
+		t.Errorf("expected no new cmds on second sync (no Tree changes), got %d", len(second))
+	}
+}
+
+// TestPerSessionWatcherCmdChainReceivesEvents writes status.json inside a
+// session directory and asserts that watchSessionCmd for that key returns
+// treeStatusChangedMsg within a short timeout. This is the regression
+// test for the bug where per-session watchers were mounted but never
+// had a goroutine reading their Events channel.
+func TestPerSessionWatcherCmdChainReceivesEvents(t *testing.T) {
+	app := newTestApp(t, "")
+	it := app.tree.AllItems()[0]
+	key := app.tree.SessionKeyOf(it)
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"),
+		[]byte(`{"action":"thinking"}`), 0o644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	app.setupStatusWatcher()
+	_ = app.syncSessionWatchers()
+	t.Cleanup(func() {
+		app.statusWatcher.Close()
+		for _, w := range app.sessionWatchers {
+			w.Close()
+		}
+	})
+
+	cmd := app.watchSessionCmd(key)
+	if cmd == nil {
+		t.Fatal("expected cmd for mounted watcher")
+	}
+
+	done := make(chan tea.Msg, 1)
+	go func() {
+		done <- cmd()
+	}()
+
+	// Trigger an event in a separate goroutine to give FSEvents/kqueue
+	// time to deliver the first read.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = os.WriteFile(filepath.Join(dir, "status.json"),
+			[]byte(`{"action":"write"}`), 0o644)
+	}()
+
+	select {
+	case msg := <-done:
+		if _, ok := msg.(treeStatusChangedMsg); !ok {
+			t.Errorf("expected treeStatusChangedMsg, got %T", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for per-session watcher event")
+	}
+}
+
+// TestPerSessionWatcherRearmsAfterEvent verifies the cmd-chain keeps
+// firing after the first event. Without re-arming (see rearmSessionWatchers
+// in main.go) the blocking read is one-shot: subsequent writes to status.json
+// would be silently lost and the Tree badge would freeze.
+func TestPerSessionWatcherRearmsAfterEvent(t *testing.T) {
+	app := newTestApp(t, "")
+	it := app.tree.AllItems()[0]
+	key := app.tree.SessionKeyOf(it)
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"),
+		[]byte(`{"action":"thinking"}`), 0o644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	app.setupStatusWatcher()
+	_ = app.syncSessionWatchers()
+	t.Cleanup(func() {
+		app.statusWatcher.Close()
+		for _, w := range app.sessionWatchers {
+			w.Close()
+		}
+	})
+
+	// Drain the first event to confirm the chain works once.
+	first := app.watchSessionCmd(key)
+	if first == nil {
+		t.Fatal("expected first cmd")
+	}
+	firstDone := make(chan tea.Msg, 1)
+	go func() { firstDone <- first() }()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(dir, "status.json"),
+		[]byte(`{"action":"write"}`), 0o644); err != nil {
+		t.Fatalf("write status (1st trigger): %v", err)
+	}
+	select {
+	case msg := <-firstDone:
+		if _, ok := msg.(treeStatusChangedMsg); !ok {
+			t.Fatalf("expected treeStatusChangedMsg from first event, got %T", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first event did not arrive")
+	}
+
+	// Now simulate what Update does: take the re-arm cmd and run it.
+	// The Update path returns tea.Batch(allCmds...), but rearmSessionWatchers
+	// is the relevant slice; if any of its entries fires on a fresh event,
+	// the chain is correctly re-armed.
+	rearm := app.rearmSessionWatchers()
+	if len(rearm) == 0 {
+		t.Fatal("expected rearmSessionWatchers to return at least one cmd")
+	}
+	for _, c := range rearm {
+		if c == nil {
+			t.Fatal("expected non-nil re-arm cmd")
+		}
+	}
+
+	// Pick the cmd for our specific key and verify it can fire on a new event.
+	target := app.watchSessionCmd(key)
+	if target == nil {
+		t.Fatal("expected re-arm cmd for target key")
+	}
+	secondDone := make(chan tea.Msg, 1)
+	go func() { secondDone <- target() }()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(dir, "status.json"),
+		[]byte(`{"action":"grep"}`), 0o644); err != nil {
+		t.Fatalf("write status (2nd trigger): %v", err)
+	}
+
+	select {
+	case msg := <-secondDone:
+		if _, ok := msg.(treeStatusChangedMsg); !ok {
+			t.Errorf("expected treeStatusChangedMsg from re-armed chain, got %T", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out — per-session cmd-chain did not re-arm after first event")
+	}
+}
+
+// TestClearSessionCmdRefusesWithoutPiAgentDir is the safety net: a Clear
+// with an empty piAgentDir must NOT touch any JSONL. After this fix Clear
+// refuses by design — it's the only way to guarantee one profile cannot
+// delete another profile's sessions.
+func TestClearSessionCmdRefusesWithoutPiAgentDir(t *testing.T) {
+	app := newTestApp(t, "test")
+	app.piAgentDir = "" // simulate the legacy / unsafe state explicitly
+
+	it := app.tree.AllItems()[0]
+	sessionID := app.tree.SessionKeyOf(it)
+	cwd := "/Users/a/Space"
+
+	// Write a JSONL inside the agent dir the new fixture picked. With
+	// piAgentDir cleared, DeleteSessionJSONL would otherwise have a shot at it.
+	agentDir := filepath.Join(t.TempDir(), "agent")
+	dir := filepath.Join(agentDir, "sessions", paths.EncodeCwdDir(cwd))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(dir, "must_remain.jsonl")
+	if err := os.WriteFile(target, []byte(`{"id":"x"}`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	msg := app.clearSessionCmd(sessionID, cwd, nil)()
+	if msg != nil {
+		t.Errorf("clearSessionCmd with empty piAgentDir must return nil, got %T", msg)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("target JSONL must be untouched, stat err: %v", err)
+	}
+}
+
+func TestAppSessionBaseDirUsesCanonicalPaths(t *testing.T) {
+	dataHome := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("HOME", home)
+
+	tests := []struct {
+		name    string
+		profile string
+		want    string
+	}{
+		{
+			name:    "default profile",
+			profile: "",
+			want:    filepath.Join(dataHome, "profiles", "default", "sessions"),
+		},
+		{
+			name:    "unicode profile slug",
+			profile: "Проект Ω",
+			want:    filepath.Join(dataHome, "profiles", "proekt-ω", "sessions"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			app := &App{profile: test.profile}
+			if got := app.sessionBaseDir(); got != test.want {
+				t.Fatalf("sessionBaseDir() = %q, want %q", got, test.want)
+			}
+		})
+	}
+
+	if _, err := os.Stat(filepath.Join(dataHome, "sessions")); !os.IsNotExist(err) {
+		t.Fatalf("legacy sessions root must not be used, stat err: %v", err)
+	}
 }

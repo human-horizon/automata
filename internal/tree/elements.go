@@ -31,6 +31,8 @@ func (t *Tree) Elements(width, height int) []warp.Element {
 			elems = append(elems, t.inputModalElements()...)
 		} else if t.confirmMode {
 			elems = append(elems, t.confirmModalElements()...)
+		} else if t.helpMode {
+			elems = append(elems, t.helpModalElements()...)
 		}
 		return elems
 	}
@@ -38,7 +40,6 @@ func (t *Tree) Elements(width, height int) []warp.Element {
 	elems = append(elems, t.treeElements()...)
 	return elems
 }
-
 
 func (t *Tree) headerElements() []warp.Element {
 	if t.Collapsed {
@@ -52,7 +53,10 @@ func (t *Tree) headerElements() []warp.Element {
 		}
 	}
 
+	rootMenuW := lipgloss.Width(" ⋮ ")
 	plusW := lipgloss.Width(" + ")
+	plusX := t.width - 1 - plusW
+	rootMenuX := plusX - rootMenuW
 
 	return []warp.Element{
 		{
@@ -60,10 +64,13 @@ func (t *Tree) headerElements() []warp.Element {
 			Name:   "Automata",
 			Bounds: warp.Bounds{X: 0, Y: 0, W: t.width, H: 1},
 			Children: []warp.Element{
-				{Role: "button", Name: "+Add", Action: "add", Bounds: warp.Bounds{X: t.width - 1 - plusW, Y: 0, W: plusW, H: 1}},
+				{Role: "button", Name: "root-menu", Action: "root-menu", Bounds: warp.Bounds{X: rootMenuX, Y: 0, W: rootMenuW, H: 1}},
+				{Role: "button", Name: "+Add", Action: "add", Bounds: warp.Bounds{X: plusX, Y: 0, W: plusW, H: 1}},
 				{Role: "button", Name: "collapse", Action: "collapse", Bounds: warp.Bounds{X: t.width - 1, Y: 0, W: 1, H: 1}},
 			},
 		},
+		{Role: "button", Name: "? Help", Action: "help", Bounds: warp.Bounds{X: 0, Y: t.height - 1, W: 6, H: 1}},
+		{Role: "button", Name: "Settings", Action: "settings", Bounds: warp.Bounds{X: 8, Y: t.height - 1, W: 8, H: 1}},
 	}
 }
 
@@ -72,10 +79,7 @@ func (t *Tree) treeElements() []warp.Element {
 		return nil
 	}
 
-	contentHeight := t.height - 1
-	if contentHeight < 1 {
-		contentHeight = 1
-	}
+	contentHeight := t.contentHeight()
 	t.clampScroll(contentHeight)
 
 	start := t.scroll
@@ -169,7 +173,10 @@ func (t *Tree) popoverElements() []warp.Element {
 	if menuY < 0 {
 		menuY = 0
 	}
-	contentHeight := t.height - 1
+	contentHeight := t.height - treeFooterHeight
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
 	if menuY+len(t.popover.Items) > contentHeight {
 		menuY = contentHeight - len(t.popover.Items)
 		if menuY < 0 {
@@ -201,6 +208,12 @@ func menuActionName(name string) string {
 		return "rename"
 	case "delete":
 		return "delete"
+	case "sort by name":
+		return "sort-name"
+	case "sort by type":
+		return "sort-type"
+	case "settings":
+		return "settings"
 	}
 	return ""
 }
@@ -214,7 +227,7 @@ func (t *Tree) inputModalElements() []warp.Element {
 	boxWidth := t.modal.BoxWidth()
 
 	titleY := startY + 2 // box[2]: title line
-	inputY := startY + 3  // box[3]: input line
+	inputY := startY + 3 // box[3]: input line
 	btnY := startY + 4   // box[4]: button line
 
 	var elems []warp.Element
@@ -271,6 +284,19 @@ func (t *Tree) inputModalElements() []warp.Element {
 	}
 
 	return elems
+}
+
+func (t *Tree) helpModalElements() []warp.Element {
+	if t.modal == nil {
+		return nil
+	}
+	startX := t.modal.StartX()
+	startY := t.modal.StartY()
+	boxWidth := t.modal.BoxWidth()
+	return []warp.Element{
+		{Role: "help", Name: "Keyboard help", Bounds: warp.Bounds{X: startX, Y: startY, W: boxWidth, H: t.height}},
+		{Role: "button", Name: "Close", Action: "close-help", Bounds: warp.Bounds{X: startX, Y: startY + 4, W: boxWidth, H: 1}},
+	}
 }
 
 func (t *Tree) confirmModalElements() []warp.Element {
@@ -332,4 +358,3 @@ func (t *Tree) confirmModalElements() []warp.Element {
 
 	return elems
 }
-

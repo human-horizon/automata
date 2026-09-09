@@ -7,64 +7,29 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/HumanHorizon/automata/internal/paths"
 )
 
-// dataHome returns the base directory for ai-knowledge data.
-// Data is stored under ~/.ai/automata/profiles/<profile> so that ai-knowledge
-// integrates with Automata.
-func dataHome() string {
-	if v := os.Getenv("AI_DATA_HOME"); v != "" {
-		return v
+// effectiveProfile preserves explicit profile precedence and uses AI_PROFILE
+// only when the caller leaves the profile empty. paths.DomainDir applies the
+// canonical slug and default profile mapping.
+func effectiveProfile(profile string) string {
+	if profile != "" {
+		return profile
 	}
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	return filepath.Join(home, ".ai", "automata")
+	return os.Getenv("AI_PROFILE")
 }
 
-func homeDir() string {
-	return dataHome()
-}
-
-// profileSlug returns the profile directory name. Empty profile maps to "default".
-func profileSlug() string {
-	profile := os.Getenv("AI_PROFILE")
-	if profile == "" {
-		return "default"
-	}
-	return slugify(profile)
-}
-
-func domainDir(profile, domain string) string {
-	if profile == "" {
-		profile = profileSlug()
-	}
-	return filepath.Join(dataHome(), "profiles", profile, "domains", domain)
-}
-
-// slugify is a minimal slug used only for profile directory names.
-func slugify(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		default:
-			if b.Len() > 0 && b.String()[b.Len()-1] != '-' {
-				b.WriteRune('-')
-			}
-		}
-	}
-	return strings.Trim(b.String(), "-")
+type NoteSection struct {
+	Title   string `json:"title"`
+	Content string `json:"content"`
 }
 
 type NoteSummary struct {
-	Title string   `json:"title"`
-	Notes []string `json:"notes"`
+	Title    string        `json:"title"`
+	Notes    []string      `json:"notes,omitempty"`
+	Sections []NoteSection `json:"sections,omitempty"`
 }
 
 type Data struct {
@@ -87,12 +52,27 @@ func NewCachedReader() *CachedReader {
 	return &CachedReader{cache: make(map[string]cachedNotesEntry)}
 }
 
+func normalizeNotes(notes []NoteSummary) []NoteSummary {
+	for i := range notes {
+		if len(notes[i].Sections) > 0 || len(notes[i].Notes) == 0 {
+			continue
+		}
+
+		legacyLines := make([]string, 0, len(notes[i].Notes))
+		for _, line := range notes[i].Notes {
+			legacyLines = append(legacyLines, "- "+line)
+		}
+		notes[i].Sections = []NoteSection{{Content: strings.Join(legacyLines, "\n")}}
+	}
+	return notes
+}
+
 // Read returns notes for a domain, using mtime cache to skip unchanged files.
 func (r *CachedReader) Read(profile, domain string) (*Data, error) {
 	if domain == "" {
 		return &Data{Notes: []NoteSummary{}}, nil
 	}
-	path := filepath.Join(domainDir(profile, domain), "notes.json")
+	path := filepath.Join(paths.DomainDir(effectiveProfile(profile), domain), "notes.json")
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -118,7 +98,7 @@ func (r *CachedReader) Read(profile, domain string) (*Data, error) {
 	}
 	var notes []NoteSummary
 	_ = json.Unmarshal(raw, &notes)
-	data := &Data{Notes: notes}
+	data := &Data{Notes: normalizeNotes(notes)}
 	r.cache[path] = cachedNotesEntry{data: data, mtime: fi.ModTime()}
 	return data, nil
 }
@@ -130,13 +110,14 @@ func Read(profile, domain string) (*Data, error) {
 		}, nil
 	}
 
-	notesPath := filepath.Join(domainDir(profile, domain), "notes.json")
+	notesPath := filepath.Join(paths.DomainDir(effectiveProfile(profile), domain), "notes.json")
 
 	if raw, err := os.ReadFile(notesPath); err == nil {
 		data := &Data{
 			Notes: []NoteSummary{},
 		}
 		_ = json.Unmarshal(raw, &data.Notes)
+		data.Notes = normalizeNotes(data.Notes)
 		return data, nil
 	}
 

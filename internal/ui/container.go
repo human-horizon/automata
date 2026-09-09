@@ -1,13 +1,12 @@
 package ui
 
 import (
-	"fmt"
-	"os"
 	"time"
 
 	akcontext "github.com/HumanHorizon/automata/internal/ai-knowledge/context"
 	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/memory"
+	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	"github.com/HumanHorizon/automata/internal/tree"
 	tea "github.com/charmbracelet/bubbletea"
 	warp "github.com/starframe-dev/warp"
@@ -30,6 +29,7 @@ const (
 type Container struct {
 	innerTab *warp.Tab
 	mode     ContainerMode
+	palette  apptheme.Theme
 
 	// Panels.
 	chatTerminal   warp.Panel
@@ -52,6 +52,7 @@ type Container struct {
 func NewContainer(initial warp.Panel) *Container {
 	c := &Container{
 		mode:      ChatMode,
+		palette:   apptheme.Default(),
 		planWidth: 40,
 	}
 	if initial != nil {
@@ -105,11 +106,39 @@ func (c *Container) planFraction(width int) float64 {
 func (c *Container) SetChat(terminal warp.Panel, sessionID string) {
 	c.mode = ChatMode
 	c.chatTerminal = terminal
+	if chat, ok := terminal.(*ChatPanel); ok {
+		chat.SetTheme(c.palette)
+	}
 	if c.knowledgePanel == nil {
 		c.knowledgePanel = NewKnowledgePanel()
 	}
 	c.knowledgePanel.SetSession(sessionID)
 	c.rebuildLayout()
+	c.innerTab.SetFocus(terminal)
+}
+
+// RenameSessionIDs updates the currently displayed chat and knowledge
+// panels after a tree rename. The caller has already stopped the emulators.
+func (c *Container) RenameSessionIDs(mapping map[string]string) {
+	if cp, ok := c.chatTerminal.(*ChatPanel); ok {
+		cp.RenameSessionIDs(mapping)
+	}
+	if c.knowledgePanel != nil {
+		if newID, ok := mapping[c.knowledgePanel.sessionID]; ok {
+			c.knowledgePanel.SetSession(newID)
+		}
+	}
+}
+
+// RenameDomains updates the currently displayed folder context after a tree
+// rename. The caller has already moved the domain directories.
+func (c *Container) RenameDomains(mapping map[string]string) {
+	if c.contextPanel == nil {
+		return
+	}
+	if newDomain, ok := mapping[c.contextPanel.domain]; ok {
+		c.contextPanel.SetDomain(newDomain)
+	}
 }
 
 // SetFolder switches the container to folder domain mode.
@@ -118,8 +147,24 @@ func (c *Container) SetFolder(folder *tree.Item) {
 	if c.contextPanel == nil {
 		c.contextPanel = NewContextPanel(c.profile)
 	}
+	c.contextPanel.SetTheme(c.palette)
 	c.contextPanel.SetDomain(folder.Domain(c.profile))
 	c.rebuildLayout()
+	c.innerTab.SetFocus(c.contextPanel)
+}
+
+// SetTheme applies a palette to all native panels currently owned by the container.
+func (c *Container) SetTheme(palette apptheme.Theme) {
+	c.palette = palette
+	if c.knowledgePanel != nil {
+		c.knowledgePanel.SetTheme(palette)
+	}
+	if c.contextPanel != nil {
+		c.contextPanel.SetTheme(palette)
+	}
+	if chat, ok := c.chatTerminal.(*ChatPanel); ok {
+		chat.SetTheme(palette)
+	}
 }
 
 // SetChats forwards the chat list to the context panel for the kanban picker.
@@ -187,7 +232,7 @@ func (c *Container) RefreshKnowledgeCmd() tea.Cmd {
 				msg.Jobs = j
 			}
 		}
-		if domain != "" && profile != "" {
+		if domain != "" {
 			if d, err := memory.Read(profile, domain); err == nil {
 				msg.Memory = d
 			}
@@ -215,7 +260,7 @@ func (c *Container) ApplyKnowledgeRefresh(msg KnowledgeRefreshMsg) {
 	}
 }
 
-// Active returns the currently displayed panel.
+// Active returns the currently displayed primary panel.
 func (c *Container) Active() warp.Panel {
 	if c.mode == ChatMode {
 		return c.chatTerminal
@@ -224,6 +269,30 @@ func (c *Container) Active() warp.Panel {
 		return c.contextPanel
 	}
 	return nil
+}
+
+// Knowledge returns the right-side knowledge panel in chat mode.
+func (c *Container) Knowledge() warp.Panel {
+	if c.mode != ChatMode {
+		return nil
+	}
+	return c.knowledgePanel
+}
+
+// Focused returns the panel currently focused inside the container.
+func (c *Container) Focused() warp.Panel {
+	if c.innerTab == nil {
+		return nil
+	}
+	return c.innerTab.Focus()
+}
+
+// SetFocus focuses a panel inside the container.
+func (c *Container) SetFocus(panel warp.Panel) {
+	if c.innerTab == nil || panel == nil {
+		return
+	}
+	c.innerTab.SetFocus(panel)
 }
 
 // SetProfile sets the profile used to compute folder domains.
@@ -288,12 +357,6 @@ func (c *Container) updateSplitFraction() {
 }
 
 func (c *Container) handleMouse(msg tea.MouseMsg) tea.Cmd {
-	f, _ := os.OpenFile("/tmp/container-mouse.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if f != nil {
-		fmt.Fprintf(f, "container: action=%d btn=%d x=%d y=%d mode=%d\n",
-			msg.Action, msg.Button, msg.X, msg.Y, c.mode)
-		f.Close()
-	}
 	if c.mode != ChatMode {
 		return c.innerTab.HandleMouse(msg)
 	}

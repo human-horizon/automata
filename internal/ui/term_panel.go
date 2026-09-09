@@ -35,4 +35,11 @@ func (p *TermPanel) Start() tea.Cmd {
 	return p.em.Start()
 }
 
+// SetEm atomically replaces the underlying emulator. Used by clearSessionCmd
+// to swap in a freshly-started PTY without restarting the surrounding panel.
+// Does not call Stop or Start — the caller is responsible for lifecycle.
+func (p *TermPanel) SetEm(em *portalis.Emulator) {
+	p.em = em
+}
+
 var _ warp.Panel = (*TermPanel)(nil)

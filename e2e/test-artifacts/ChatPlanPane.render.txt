@@ -1,4 +1,4 @@
-Automata (cue-test-plan)   + <                                                                                               │Knowledge [× auto] [× dual]       
+Automata (cue-test-plan)  ⋮  <                                                                                               │Knowledge [× auto] [× dual]       
 No chats yet — create one!   │                                                                                               │── Status                         
                              │                                                                                               │  (no status)                     
                              │                                                                                               │── Plans                          
@@ -52,4 +52,4 @@ No chats yet — create one!   │                                              
                              │                                                                                               │                                  
                              │                                                                                               │                                  
                              │                                                                                               │                                  
-                             │                                                                                               │                                  
+? Help  Settings             │                                                                                               │                                  

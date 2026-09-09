@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/HumanHorizon/automata/internal/paths"
+	apptheme "github.com/HumanHorizon/automata/internal/theme"
 )
 
 const legacyStateFileName = ".automata/state.json"
@@ -16,6 +17,7 @@ type TreeState struct {
 	Items          []*StateItem `json:"items"`
 	TreeWidth      int          `json:"tree_width,omitempty"`
 	PlanWidth      int          `json:"plan_width,omitempty"`
+	Theme          string       `json:"theme,omitempty"`
 	ActiveSessions []string     `json:"active_sessions,omitempty"`
 }
 
@@ -86,6 +88,11 @@ func (t *Tree) LoadState() error {
 	t.root = fromStateItems(state.Items)
 	t.treeWidth = state.TreeWidth
 	t.planWidth = state.PlanWidth
+	if state.Theme != "" {
+		if _, ok := apptheme.ByID(state.Theme); ok {
+			t.Theme = state.Theme
+		}
+	}
 	if len(state.ActiveSessions) > 0 {
 		t.activeSessions = make(map[string]struct{}, len(state.ActiveSessions))
 		for _, id := range state.ActiveSessions {
@@ -115,6 +122,7 @@ func (t *Tree) toState() *TreeState {
 		Items:          toStateItems(t.root),
 		TreeWidth:      t.treeWidth,
 		PlanWidth:      t.planWidth,
+		Theme:          apptheme.Resolve(t.Theme).ID,
 		ActiveSessions: t.ActiveSessionIDs(),
 	}
 }

@@ -10,7 +10,7 @@ import (
 type stubPanel struct{}
 
 func (stubPanel) View(width, height int) string { return "" }
-func (stubPanel) Update(msg tea.Msg) tea.Cmd  { return nil }
+func (stubPanel) Update(msg tea.Msg) tea.Cmd    { return nil }
 
 // TestKnowledgePanelEmpty ensures an uninitialised panel renders without crashing.
 func TestKnowledgePanelEmpty(t *testing.T) {

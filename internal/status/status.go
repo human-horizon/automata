@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/HumanHorizon/automata/internal/paths"
 )
 
 // Record mirrors the fields we care about from status.json. Other fields are
@@ -24,8 +26,12 @@ type CachedReader struct {
 }
 
 type cachedEntry struct {
-	value  string
-	mtime  time.Time
+	value string
+	mtime time.Time
+}
+
+func statusPath(profile, sessionID string) string {
+	return filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 }
 
 // NewCachedReader creates a reader that caches by mtime.
@@ -42,11 +48,7 @@ func (r *CachedReader) Read(sessionID string) string {
 	if sessionID == "" {
 		return ""
 	}
-	base := dataHome()
-	if r.profile != "" {
-		base = filepath.Join(base, "profiles", slugify(r.profile))
-	}
-	path := filepath.Join(base, "sessions", sessionID, "status.json")
+	path := statusPath(r.profile, sessionID)
 
 	// Check mtime cache
 	fi, err := os.Stat(path)
@@ -80,11 +82,7 @@ func Read(profile, sessionID string) string {
 	if sessionID == "" {
 		return ""
 	}
-	base := dataHome()
-	if profile != "" {
-		base = filepath.Join(base, "profiles", slugify(profile))
-	}
-	path := filepath.Join(base, "sessions", sessionID, "status.json")
+	path := statusPath(profile, sessionID)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -126,6 +124,12 @@ func Emoji(action string) string {
 		return ""
 	case "stop":
 		return "X"
+	// "active" and "status" are known actions with no dedicated glyph and
+	// no Word mapping — they map to empty so the Tree falls back to
+	// "○ idle" and the right panel can still render the canonical word
+	// (e.g. "● active") through actionIcon without a competing glyph.
+	case "active", "status":
+		return ""
 	}
 	if action == "" {
 		return ""
@@ -148,44 +152,4 @@ func Word(action string) string {
 		return ""
 	}
 	return ""
-}
-
-func dataHome() string {
-	if v := os.Getenv("AI_DATA_HOME"); v != "" {
-		return v
-	}
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		return "/Users/a"
-	}
-	return filepath.Join(home, ".ai", "automata")
-}
-
-func slugify(s string) string {
-	out := make([]byte, 0, len(s))
-	prevDash := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z':
-			out = append(out, c)
-			prevDash = false
-		case c >= 'A' && c <= 'Z':
-			out = append(out, c+32)
-			prevDash = false
-		case c >= '0' && c <= '9':
-			out = append(out, c)
-			prevDash = false
-		default:
-			if !prevDash && len(out) > 0 {
-				out = append(out, '-')
-				prevDash = true
-			}
-		}
-	}
-	// Trim trailing dash.
-	for len(out) > 0 && out[len(out)-1] == '-' {
-		out = out[:len(out)-1]
-	}
-	return string(out)
 }

@@ -8,101 +8,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// ── Color palette (semantic, no explicit background) ──────────────
-// These work on both light and dark terminals. When NO_COLOR is set
-// or Theme=="mono" all lipgloss styling is skipped.
 const (
-	cHeaderFg   = "#a89984" // muted gray for header text
-	cTitleFg    = "#ebdbb2" // warm white for title
-	cCollapse   = "#d5c4a1" // light gray for collapse button
-	cFolder     = "#d79921" // yellow for folder names
-	cChat       = "#ebdbb2" // warm white for chat names
-	cArchived   = "#a89984" // gray for archived items
-	cSelected   = "#458588" // blue for selected background
-	cSelectedFg = "#282828" // dark for selected text
-	cStatus     = "#a89984" // gray for status text
-	cActive     = "#98971a" // green for active status
-	cIdle       = "#a89984" // gray for idle status
-	cBranch     = "#504945" // dim for tree branch lines
-	cEmpty      = "#a89984" // gray for empty state
-	cScrollbar  = "#504945" // dim for scrollbar
-)
-
-var (
-	headerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cHeaderFg)).
-			Bold(true)
-
-	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cTitleFg))
-
-	collapseStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cCollapse))
-
-	folderStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cFolder))
-
-	chatStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cChat))
-
-	archivedStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cArchived))
-
-	selectedStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color(cSelected)).
-			Foreground(lipgloss.Color(cSelectedFg))
-
-	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cStatus))
-
-	activeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cActive))
-
-	idleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cIdle))
-
-	branchStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cBranch))
-
-	emptyStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cEmpty))
-
-	scrollbarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(cScrollbar))
-
-	// ── Modal / popover styles (unchanged from original) ──────────
-	modalBorderStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#3c3836")).
-				Foreground(lipgloss.Color("#fbf1c7")).
-				BorderStyle(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("#d79921")).
-				Padding(1, 2)
-
-	modalTitleStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("#3c3836")).
-			Foreground(lipgloss.Color("#d79921")).
-			Bold(true)
-
-	modalInputStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("#282828")).
-			Foreground(lipgloss.Color("#fbf1c7"))
-
-	modalHintStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("#3c3836")).
-			Foreground(lipgloss.Color("#a89984"))
-
-	modalCloseStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("#3c3836")).
-			Foreground(lipgloss.Color("#cc241d"))
-
-	dimStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#a89984"))
-
-	actionIconStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#a89984"))
-
-	actionIconHoverStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#d79921"))
+	treeHeaderHeight = 1
+	treeFooterHeight = 1
 )
 
 // noColor reports whether the tree should skip all ANSI styling.
@@ -126,15 +34,19 @@ func (t *Tree) View(width, height int) string {
 
 	t.height = height
 	t.width = width
+	styles := t.styles()
 
 	if t.Collapsed {
 		return t.renderCollapsed(width, height)
 	}
 
-	// Reserve one line for header (toolbar is now in the header).
-	contentHeight := height - 1
+	contentHeight := height - treeHeaderHeight - treeFooterHeight
 	if contentHeight < 1 {
 		contentHeight = 1
+	}
+	contentEnd := treeHeaderHeight + contentHeight
+	if contentEnd > height {
+		contentEnd = height
 	}
 
 	// Content width (leave 1 char for scrollbar).
@@ -189,7 +101,7 @@ func (t *Tree) View(width, height int) string {
 			if needsScrollbar {
 				row := i - start
 				if row >= thumbPos && row < thumbPos+thumbSize {
-					styled += scrollbarStyle.Render("▐")
+					styled += styles.scrollbarStyle.Render("▐")
 				} else {
 					styled += " "
 				}
@@ -200,7 +112,7 @@ func (t *Tree) View(width, height int) string {
 		}
 
 		// Pad remaining content lines.
-		for len(lines) < height {
+		for len(lines) < contentEnd {
 			pad := strings.Repeat(" ", contentWidth)
 			if needsScrollbar {
 				pad += " "
@@ -210,10 +122,10 @@ func (t *Tree) View(width, height int) string {
 		}
 	} else {
 		// Empty state.
-		msg := emptyStyle.Width(contentWidth).Render("No chats yet — create one!")
+		msg := styles.emptyStyle.Width(contentWidth).Render("No chats yet — create one!")
 		lines = append(lines, msg)
 		t.rowToFlat = append(t.rowToFlat, -1)
-		for len(lines) < height {
+		for len(lines) < contentEnd {
 			pad := strings.Repeat(" ", contentWidth)
 			if width > contentWidth {
 				pad += " "
@@ -221,6 +133,19 @@ func (t *Tree) View(width, height int) string {
 			lines = append(lines, pad)
 			t.rowToFlat = append(t.rowToFlat, -1)
 		}
+	}
+
+	if len(lines) > contentEnd {
+		lines = lines[:contentEnd]
+		t.rowToFlat = t.rowToFlat[:contentEnd]
+	}
+	if len(lines) < height {
+		lines = append(lines, t.renderFooter(width))
+		t.rowToFlat = append(t.rowToFlat, -1)
+	}
+	for len(lines) < height {
+		lines = append(lines, strings.Repeat(" ", width))
+		t.rowToFlat = append(t.rowToFlat, -1)
 	}
 
 	// Context menu overlay.
@@ -407,25 +332,26 @@ func (t *Tree) renderItemLine(item *Item, width int, selected, hovered bool, bi 
 
 	// ── Styling ──
 	nc := t.noColor()
+	styles := t.styles()
 
 	// Label style.
 	var labelStyle lipgloss.Style
 	if selected {
-		labelStyle = selectedStyle
+		labelStyle = styles.selectedStyle
 	} else if item.Archived {
-		labelStyle = archivedStyle
+		labelStyle = styles.archivedStyle
 	} else if item.IsFolder {
-		labelStyle = folderStyle
+		labelStyle = styles.folderStyle
 	} else {
-		labelStyle = chatStyle
+		labelStyle = styles.chatStyle
 	}
 
 	// Status style.
 	var stStyle lipgloss.Style
 	if strings.HasPrefix(status, "●") {
-		stStyle = activeStyle
+		stStyle = styles.activeStyle
 	} else {
-		stStyle = idleStyle
+		stStyle = styles.idleStyle
 	}
 
 	// ── Assemble ──
@@ -447,8 +373,8 @@ func (t *Tree) renderItemLine(item *Item, width int, selected, hovered bool, bi 
 
 	// With ANSI colors.
 	labelPart := labelStyle.Render(label)
-	stopPart := actionIconStyle.Render(stopIcon)
-	menuPart := actionIconStyle.Render(menuIcon)
+	stopPart := styles.actionIconStyle.Render(stopIcon)
+	menuPart := styles.actionIconStyle.Render(menuIcon)
 
 	var line string
 	if status != "" {
@@ -466,17 +392,18 @@ func (t *Tree) renderItemLine(item *Item, width int, selected, hovered bool, bi 
 
 	// If selected, re-render entire line with selected background to fill width.
 	if selected {
-		line = selectedStyle.Width(width).Render(stripANSI(line))
+		line = styles.selectedStyle.Width(width).Render(stripANSI(line))
 	}
 
 	return line
 }
 
 func (t *Tree) actionButton(symbol, action string, hovered bool) string {
+	styles := t.styles()
 	if hovered && t.actionIcon == "hover-"+action {
-		return actionIconHoverStyle.Render(symbol)
+		return styles.actionIconHoverStyle.Render(symbol)
 	}
-	return actionIconStyle.Render(symbol)
+	return styles.actionIconStyle.Render(symbol)
 }
 
 // ── Header ───────────────────────────────────────────────────────
@@ -488,36 +415,52 @@ func (t *Tree) renderHeader(width int) string {
 		title = "Automata (" + t.Profile + ") "
 	}
 
-	// Toolbar button "+" at the right edge (flush to border/collapse symbol).
+	// Toolbar buttons are flush to the right edge before the collapse border.
+	rootMenuBtn := " ⋮ "
 	plusBtn := " + "
 
-	// Collapse button removed — now on the warp border.
-
+	// Collapse button is rendered by warp on the panel border.
 	nc := t.noColor()
+	styles := t.styles()
 
 	if nc {
-		// Plain text header.
 		line := title
-		// Pad to make room for "+" at the right edge.
-		needed := lipgloss.Width(line) + lipgloss.Width(plusBtn)
+		needed := lipgloss.Width(line) + lipgloss.Width(rootMenuBtn) + lipgloss.Width(plusBtn)
 		if needed < width {
 			line += strings.Repeat(" ", width-needed)
 		}
-		line += plusBtn
+		line += rootMenuBtn + plusBtn
 		return line
 	}
 
-	// Styled header.
-	titlePart := titleStyle.Render(title)
-	plusPart := headerStyle.Copy().Foreground(lipgloss.Color("#98971a")).Render(plusBtn)
+	titlePart := styles.titleStyle.Render(title)
+	rootMenuPart := styles.actionIconHoverStyle.Copy().Bold(true).Render(rootMenuBtn)
+	plusPart := styles.activeStyle.Copy().Bold(true).Render(plusBtn)
 
 	line := titlePart
-	lineW := lipgloss.Width(stripANSI(line)) + lipgloss.Width(stripANSI(plusPart))
+	lineW := lipgloss.Width(stripANSI(line)) + lipgloss.Width(stripANSI(rootMenuPart)) + lipgloss.Width(stripANSI(plusPart))
 	if lineW < width {
 		line += strings.Repeat(" ", width-lineW)
 	}
-	line += plusPart
+	line += rootMenuPart + plusPart
 	return line
+}
+
+func (t *Tree) renderFooter(width int) string {
+	label := "? Help  Settings"
+	styles := t.styles()
+	if t.noColor() {
+		if len(label) < width {
+			return label + strings.Repeat(" ", width-len(label))
+		}
+		return label[:width]
+	}
+	styled := styles.headerStyle.Render(label)
+	lineWidth := lipgloss.Width(stripANSI(styled))
+	if lineWidth < width {
+		styled += strings.Repeat(" ", width-lineWidth)
+	}
+	return styled
 }
 
 func (t *Tree) renderCollapsed(width, height int) string {
@@ -537,6 +480,7 @@ func (t *Tree) renderCollapsed(width, height int) string {
 
 func (t *Tree) archiveLineRows(width int) map[int]string {
 	lines := make(map[int]string)
+	styles := t.styles()
 	contentWidth := width - 1
 	if contentWidth < 1 {
 		contentWidth = width
@@ -550,7 +494,7 @@ func (t *Tree) archiveLineRows(width int) map[int]string {
 			lineWidth = 4
 		}
 		line := prefix + strings.Repeat("─", lineWidth)
-		lines[idx] = archivedStyle.Render(line)
+		lines[idx] = styles.archivedStyle.Render(line)
 	}
 
 	firstArchivedRoot := -1

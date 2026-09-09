@@ -13,50 +13,78 @@ import (
 
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/context"
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
+	apptheme "github.com/HumanHorizon/automata/internal/theme"
 )
 
-var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#edb449"))
-	sectionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
-	itemStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#cdccc3"))
-	doneStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#bef264"))
-	emptyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Italic(true)
-	pathStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#83a598"))
-)
+type renderStyles struct {
+	title   lipgloss.Style
+	section lipgloss.Style
+	item    lipgloss.Style
+	done    lipgloss.Style
+	empty   lipgloss.Style
+	path    lipgloss.Style
+}
 
-// actionIcon maps a status action to a single emoji + label. Unknown actions
-// fall back to a generic indicator.
-func actionIcon(action, description string) string {
+func newRenderStyles(palette apptheme.Theme) renderStyles {
+	return renderStyles{
+		title:   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(palette.TextStrong)),
+		section: lipgloss.NewStyle().Foreground(lipgloss.Color(palette.TextMuted)),
+		item:    lipgloss.NewStyle().Foreground(lipgloss.Color(palette.Text)),
+		done:    lipgloss.NewStyle().Foreground(lipgloss.Color(palette.Lime)),
+		empty:   lipgloss.NewStyle().Foreground(lipgloss.Color(palette.TextDim)).Italic(true),
+		path:    lipgloss.NewStyle().Foreground(lipgloss.Color(palette.TextDim)),
+	}
+}
+
+// actionIcon maps a status action to a single bullet + canonical word.
+// Idle is intentionally empty so the Knowledge panel does not duplicate the
+// "○ idle" indicator that the Tree already shows. Description is rendered
+// separately below the main line (see View), so we never concatenate it here.
+//
+// Canonical words match internal/tree/render.go:statusEmojiToWord so the two
+// panels read the same status the same way.
+func actionIcon(action, _ string) string {
 	switch action {
 	case "thinking":
-		return "~ thinking"
+		return "● thinking"
 	case "read":
-		return "R " + description
+		return "● read"
 	case "write":
-		return "W " + description
+		return "● write"
 	case "grep":
-		return "G " + description
+		return "● grep"
+	case "find":
+		return "● find"
+	case "analyze":
+		return "● analyze"
+	case "wait":
+		return "● wait"
+	case "job":
+		return "● job"
 	case "run":
-		return "> " + description
-	case "idle":
-		return ""
-	case "stop":
-		return "X " + description
+		return "● run"
 	case "status":
-		return "i " + description
-	case "active", "analyze":
-		return "A " + description
+		return "● status"
+	case "active":
+		return "● active"
+	case "stop":
+		return "● stopped"
+	case "idle", "":
+		return ""
 	default:
-		if action == "" {
-			return ""
-		}
-		return action + " " + description
+		return "● " + action
 	}
 }
 
 // View renders the knowledge data into a fixed-width string. It is safe to
 // call from any goroutine; it does not touch any external state.
 func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask string) string {
+	return ViewWithTheme(width, height, ctx, js, currentTask, apptheme.Default())
+}
+
+// ViewWithTheme renders the knowledge panel with the supplied palette.
+func ViewWithTheme(width, height int, ctx *context.Data, js []jobs.Job, currentTask string, palette apptheme.Theme) string {
+	styles := newRenderStyles(palette)
 	if width <= 0 {
 		width = 80
 	}
@@ -65,7 +93,7 @@ func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask strin
 	}
 
 	var b strings.Builder
-	writeSection(&b, "Status")
+	writeSection(&b, "Status", styles.section)
 	if ctx != nil && ctx.Status != nil {
 		s := ctx.Status
 		main := s.DisplayText()
@@ -74,28 +102,28 @@ func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask strin
 			main = icon
 		}
 		for _, line := range wrapString("  "+main, width) {
-			b.WriteString(itemStyle.Render(line))
+			b.WriteString(styles.item.Render(line))
 			b.WriteString("\n")
 		}
-		if s.Description != "" && s.Action != "" && !strings.HasSuffix(main, s.Description) {
+		if s.Description != "" && (s.Action == "read" || s.Action == "write" || s.Action == "run") && !strings.HasSuffix(main, s.Description) {
 			for _, line := range wrapString("  "+s.Description, width) {
-				b.WriteString(pathStyle.Render(line))
+				b.WriteString(styles.path.Render(line))
 				b.WriteString("\n")
 			}
 		}
 	} else {
-		b.WriteString(emptyStyle.Render("  (no status)"))
+		b.WriteString(styles.empty.Render("  (no status)"))
 		b.WriteString("\n")
 	}
 
 	// Show current task ABOVE Plans (not inside Plans)
 	if currentTask != "" {
-		writeSection(&b, "Task")
-		b.WriteString(titleStyle.Render("  ▶ " + currentTask))
+		writeSection(&b, "Task", styles.section)
+		b.WriteString(styles.title.Render("  ▶ " + currentTask))
 		b.WriteString("\n")
 	}
 
-	writeSection(&b, "Plans")
+	writeSection(&b, "Plans", styles.section)
 
 	if ctx != nil && len(ctx.Plans) > 0 {
 		names := make([]string, 0, len(ctx.Plans))
@@ -105,15 +133,15 @@ func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask strin
 		sort.Strings(names)
 		for _, name := range names {
 			steps := ctx.Plans[name]
-			b.WriteString(titleStyle.Render("  " + name))
+			b.WriteString(styles.title.Render("  " + name))
 			b.WriteString("\n")
 			for _, s := range steps {
 				mark := "[ ]"
 				text := s.Text
-				style := itemStyle
+				style := styles.item
 				if s.Done {
 					mark = "[x]"
-					style = doneStyle
+					style = styles.done
 				}
 				line := fmt.Sprintf("    %s %s", mark, text)
 				for _, wl := range wrapString(line, width) {
@@ -123,11 +151,11 @@ func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask strin
 			}
 		}
 	} else {
-		b.WriteString(emptyStyle.Render("  (no plans)"))
+		b.WriteString(styles.empty.Render("  (no plans)"))
 		b.WriteString("\n")
 	}
 
-	writeSection(&b, "Jobs")
+	writeSection(&b, "Jobs", styles.section)
 	if len(js) > 0 {
 		for _, j := range js {
 			mark := "•"
@@ -136,12 +164,12 @@ func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask strin
 			}
 			line := fmt.Sprintf("  %s %s", mark, firstLine(j.Command))
 			for _, wl := range wrapString(line, width) {
-				b.WriteString(itemStyle.Render(wl))
+				b.WriteString(styles.item.Render(wl))
 				b.WriteString("\n")
 			}
 		}
 	} else {
-		b.WriteString(emptyStyle.Render("  (no running jobs)"))
+		b.WriteString(styles.empty.Render("  (no running jobs)"))
 		b.WriteString("\n")
 	}
 
@@ -155,8 +183,8 @@ func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask strin
 	return strings.Join(lines, "\n")
 }
 
-func writeSection(b *strings.Builder, title string) {
-	b.WriteString(sectionStyle.Render("── " + title + " "))
+func writeSection(b *strings.Builder, title string, style lipgloss.Style) {
+	b.WriteString(style.Render("── " + title + " "))
 	b.WriteString("\n")
 	_ = time.Now()
 }

@@ -7,10 +7,12 @@ import (
 	"strings"
 	"testing"
 
+	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	"github.com/Starframe/portalis"
 	tea "github.com/charmbracelet/bubbletea"
-	warp "github.com/starframe-dev/warp"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	warp "github.com/starframe-dev/warp"
 )
 
 func TestRenderTabBarTruncatesANSIWithoutBreakingSequences(t *testing.T) {
@@ -70,6 +72,16 @@ func (f *fakePanel) View(width, height int) string {
 	return strings.Join(out, "\n")
 }
 func (f *fakePanel) Update(tea.Msg) tea.Cmd { return nil }
+
+type messageRecordingPanel struct {
+	messages []tea.Msg
+}
+
+func (p *messageRecordingPanel) View(width, height int) string { return "" }
+func (p *messageRecordingPanel) Update(msg tea.Msg) tea.Cmd {
+	p.messages = append(p.messages, msg)
+	return nil
+}
 
 // recordingPanel captures every warp.ResizeMsg it receives so tests can
 // assert how ChatPanel resized its children.
@@ -376,5 +388,297 @@ func TestSessionsExporter(t *testing.T) {
 	}
 	if all[1].FamiliarID() != "f1" {
 		t.Fatalf("expected f1, got %q", all[1].FamiliarID())
+	}
+}
+
+// TestRenderTabBarColorsFamiliarGrey verifies familiar tabs use semantic
+// surface/raised theme colors rather than the main selection colors.
+func TestRenderTabBarColorsFamiliarGrey(t *testing.T) {
+	palette := apptheme.Default()
+	inactive := familiarTabStyle(palette, false)
+	active := familiarTabStyle(palette, true)
+
+	inactiveBG, ok := inactive.GetBackground().(lipgloss.Color)
+	if !ok || string(inactiveBG) != palette.Surface {
+		t.Fatalf("inactive familiar background = %q, want %q", inactiveBG, palette.Surface)
+	}
+	activeBG, ok := active.GetBackground().(lipgloss.Color)
+	if !ok || string(activeBG) != palette.Raised {
+		t.Fatalf("active familiar background = %q, want %q", activeBG, palette.Raised)
+	}
+}
+
+// TestRenderTabBarFamiliarHasCloseButton ensures the × button is appended
+// to familiar tabs. Main tabs must not have it.
+func TestRenderTabBarFamiliarHasCloseButton(t *testing.T) {
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main"},
+			{name: "expert", familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil)},
+		},
+		activeIdx: 0,
+		width:     60,
+	}
+	bar := strip(cp.renderTabBar(60))
+	if got := strings.Count(bar, "×"); got != 2 {
+		t.Fatalf("expected familiar × plus main × Clear, got %d\n%s", got, bar)
+	}
+	// The Main tab has padding " Main " — familiar's × should appear AFTER
+	// "expert", while the main Clear button's × appears at the right edge.
+	mainIdx := strings.Index(bar, "Main")
+	expertIdx := strings.Index(bar, "expert")
+	closeIdx := strings.Index(bar[expertIdx:], "×")
+	if mainIdx < 0 || expertIdx < 0 || closeIdx < 0 {
+		t.Fatalf("expected Main, expert and familiar × in tab bar\n%s", bar)
+	}
+	closeIdx += expertIdx
+	if closeIdx < expertIdx+len("expert") || closeIdx < mainIdx+len("Main")+2 {
+		t.Errorf("familiar × should sit after the expert tab label\n%s", bar)
+	}
+	if !strings.Contains(bar[expertIdx:], "expert  × ") {
+		t.Errorf("familiar close control must render as × after the label\n%s", bar)
+	}
+}
+
+// TestHandleMouseFamiliarCloseButtonTriggersConfirm clicks the × region
+// of a familiar tab and verifies pendingCloseFamiliar is set.
+func TestHandleMouseFamiliarCloseButtonTriggersConfirm(t *testing.T) {
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main"},
+			{name: "expert", familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil)},
+		},
+		activeIdx: 0,
+		width:     60,
+		height:    5,
+		started:   true,
+		known:     map[string]bool{},
+	}
+	// Tab layout: " Main " (6) + space (1) + " expert " (8) + " ×" (2) = 17.
+	// × region starts at column 6 + 1 + 8 = 15. Click anywhere within 15..16.
+	msg := tea.MouseMsg{X: 16, Y: 4, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}
+	cp.Update(msg)
+	if cp.pendingCloseFamiliar != "f1" {
+		t.Fatalf("expected pendingCloseFamiliar=\"f1\", got %q", cp.pendingCloseFamiliar)
+	}
+	if cp.closeFamiliarModal == nil {
+		t.Fatal("expected closeFamiliarModal to be created")
+	}
+}
+
+// TestConfirmYesDropsTabAndCallsCallback confirms via Y and verifies the
+// tab is removed plus the onCloseFamiliar callback fires with the right id.
+func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
+	var capturedID string
+	var capturedEm *portalis.Emulator
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main"},
+			{name: "expert", familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil), panel: &fakePanel{}},
+		},
+		activeIdx: 0,
+		started:   true,
+		known:     map[string]bool{},
+	}
+	cp.SetOnCloseFamiliar(func(id string, em *portalis.Emulator) {
+		capturedID = id
+		capturedEm = em
+	})
+	cp.pendingCloseFamiliar = "f1"
+	cp.openCloseFamiliarModal("expert")
+
+	// closeFamiliarByID is now synchronous; Update may return nil or a
+	// poll cmd. Either is acceptable — the cleanup must have already run.
+	_ = cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if len(cp.sessions) != 1 {
+		t.Fatalf("expected 1 session after close, got %d", len(cp.sessions))
+	}
+	if cp.sessions[0].familiarID != "" {
+		t.Errorf("main tab must remain, got familiarID=%q", cp.sessions[0].familiarID)
+	}
+	if cp.pendingCloseFamiliar != "" {
+		t.Errorf("pendingCloseFamiliar should be cleared, got %q", cp.pendingCloseFamiliar)
+	}
+	if cp.closeFamiliarModal != nil {
+		t.Error("closeFamiliarModal should be cleared")
+	}
+	if capturedID != "f1" {
+		t.Errorf("onCloseFamiliar called with %q, want f1", capturedID)
+	}
+	if capturedEm == nil {
+		t.Error("onCloseFamiliar should receive the familiar's emulator")
+	}
+}
+
+// TestClickOutsideCloseModalCancels verifies that a click outside the modal
+// dismisses the confirmation without changing the session list.
+func TestClickOutsideCloseModalCancels(t *testing.T) {
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", panel: &fakePanel{}, familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil)},
+		},
+		activeIdx: 0,
+		width:     60,
+		height:    10,
+		started:   true,
+		known:     map[string]bool{},
+	}
+	cp.pendingCloseFamiliar = "f1"
+	cp.openCloseFamiliarModal("expert")
+
+	cp.Update(tea.MouseMsg{X: 0, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+
+	if len(cp.sessions) != 2 {
+		t.Fatalf("expected 2 sessions after outside click, got %d", len(cp.sessions))
+	}
+	if cp.pendingCloseFamiliar != "" {
+		t.Errorf("pendingCloseFamiliar should be cleared, got %q", cp.pendingCloseFamiliar)
+	}
+	if cp.closeFamiliarModal != nil {
+		t.Error("closeFamiliarModal should be cleared after outside click")
+	}
+}
+
+// TestRemoveFamiliarBeforeActiveKeepsActiveTab verifies that removing a tab
+// before the active one preserves the active session rather than shifting to
+// the following tab.
+func TestRemoveFamiliarBeforeActiveKeepsActiveTab(t *testing.T) {
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main"},
+			{name: "expert", familiarID: "f1"},
+			{name: "helper", familiarID: "f2"},
+			{name: "reviewer", familiarID: "f3"},
+		},
+		activeIdx: 2,
+	}
+
+	cp.removeFamiliar("expert")
+
+	if len(cp.sessions) != 3 {
+		t.Fatalf("expected 3 sessions after remove, got %d", len(cp.sessions))
+	}
+	if cp.activeIdx != 1 {
+		t.Fatalf("expected activeIdx=1 after removing earlier tab, got %d", cp.activeIdx)
+	}
+	if got := cp.sessions[cp.activeIdx].familiarID; got != "f2" {
+		t.Fatalf("active familiar changed to %q, want f2", got)
+	}
+}
+
+// TestDeadFamiliarPtyExitRemovesMatchingTab verifies that a familiar PTY
+// exit still removes only the matching familiar and updates activeIdx.
+func TestDeadFamiliarPtyExitRemovesMatchingTab(t *testing.T) {
+	mainEm := portalis.NewEmulator("main-session", "Main", "/bin/sh", nil)
+	familiarEm := portalis.NewEmulator("familiar-session", "expert", "/bin/sh", nil)
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main", em: mainEm, panel: &fakePanel{}},
+			{name: "expert", familiarID: "f1", em: familiarEm, panel: &fakePanel{}},
+		},
+		activeIdx: 1,
+		started:   true,
+		known:     map[string]bool{"expert": true},
+	}
+
+	cp.Update(portalis.PtyExitMsg{SessionID: "familiar-session"})
+
+	if len(cp.sessions) != 1 || cp.sessions[0].name != "Main" {
+		t.Fatalf("matching familiar exit left unexpected sessions: %#v", cp.sessions)
+	}
+	if cp.activeIdx != 0 {
+		t.Fatalf("expected activeIdx=0 after familiar exit, got %d", cp.activeIdx)
+	}
+	if cp.known["expert"] {
+		t.Fatal("dead familiar remained in known set")
+	}
+}
+
+// TestMainPtyExitStaysInMainTabAndRoutesToPanel verifies that a main-session
+// PTY exit neither removes Main nor gets swallowed by familiar cleanup.
+func TestMainPtyExitStaysInMainTabAndRoutesToPanel(t *testing.T) {
+	mainEm := portalis.NewEmulator("main-session", "Main", "/bin/sh", nil)
+	familiarEm := portalis.NewEmulator("familiar-session", "expert", "/bin/sh", nil)
+	mainPanel := &messageRecordingPanel{}
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main", em: mainEm, panel: mainPanel},
+			{name: "expert", familiarID: "f1", em: familiarEm, panel: &fakePanel{}},
+		},
+		activeIdx: 0,
+		started:   true,
+		known:     map[string]bool{"expert": true},
+	}
+
+	cp.Update(portalis.PtyExitMsg{SessionID: "main-session"})
+
+	if len(cp.sessions) != 2 {
+		t.Fatalf("main PTY exit removed a tab, got %d sessions", len(cp.sessions))
+	}
+	if cp.sessions[0].familiarID != "" || cp.sessions[0].name != "Main" {
+		t.Fatalf("main tab was replaced: %#v", cp.sessions[0])
+	}
+	if len(mainPanel.messages) != 1 {
+		t.Fatalf("main PTY exit was not routed to Main panel, got %d messages", len(mainPanel.messages))
+	}
+	if _, ok := mainPanel.messages[0].(portalis.PtyExitMsg); !ok {
+		t.Fatalf("main panel received %T, want portalis.PtyExitMsg", mainPanel.messages[0])
+	}
+}
+
+// TestConfirmEscLeavesTabIntact presses Escape and verifies the familiar tab
+// stays put.
+func TestConfirmEscLeavesTabIntact(t *testing.T) {
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil), panel: &fakePanel{}},
+		},
+		activeIdx: 0,
+		started:   true,
+		known:     map[string]bool{},
+	}
+	cp.pendingCloseFamiliar = "f1"
+	cp.openCloseFamiliarModal("expert")
+
+	cp.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if len(cp.sessions) != 2 {
+		t.Fatalf("expected 2 sessions after Escape, got %d", len(cp.sessions))
+	}
+	if cp.pendingCloseFamiliar != "" {
+		t.Errorf("pendingCloseFamiliar should be cleared, got %q", cp.pendingCloseFamiliar)
+	}
+	if cp.closeFamiliarModal != nil {
+		t.Error("closeFamiliarModal should be cleared after Escape")
+	}
+}
+
+// TestConfirmNoLeavesTabIntact presses N and verifies the familiar tab
+// stays put.
+func TestConfirmNoLeavesTabIntact(t *testing.T) {
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main"},
+			{name: "expert", familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil)},
+		},
+		activeIdx: 0,
+		started:   true,
+		known:     map[string]bool{},
+	}
+	cp.pendingCloseFamiliar = "f1"
+	cp.openCloseFamiliarModal("expert")
+
+	cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+
+	if len(cp.sessions) != 2 {
+		t.Fatalf("expected 2 sessions after cancel, got %d", len(cp.sessions))
+	}
+	if cp.pendingCloseFamiliar != "" {
+		t.Errorf("pendingCloseFamiliar should be cleared, got %q", cp.pendingCloseFamiliar)
+	}
+	if cp.closeFamiliarModal != nil {
+		t.Error("closeFamiliarModal should be cleared")
 	}
 }

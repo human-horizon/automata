@@ -4,16 +4,16 @@
 // Base layout:
 //
 //	~/.ai/automata/
-// 	└── profiles/
-// 	    └── <profile-slug>/
-// 	        ├── state.json
-// 	        ├── sessions/<session-id>/
-// 	        │   ├── settings.json
-// 	        │   ├── tasks.json
-// 	        │   ├── plans.json
-// 	        │   └── status.json
-// 	        └── domains/<domain>/
-// 	            └── notes.json
+//	└── profiles/
+//	    └── <profile-slug>/
+//	        ├── state.json
+//	        ├── sessions/<session-id>/
+//	        │   ├── settings.json
+//	        │   ├── tasks.json
+//	        │   ├── plans.json
+//	        │   └── status.json
+//	        └── domains/<domain>/
+//	            └── notes.json
 package paths
 
 import (

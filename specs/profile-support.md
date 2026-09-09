@@ -45,6 +45,21 @@ automata --profile "Human Horizon"
 - `Item.Domain(profile)` в `internal/tree/model.go` отвечает за это
   формирование.
 
+#### Контракт фазы 1
+- `internal/ai-knowledge/memory` и `internal/ui/ContextPanel` разрешают
+  каталоги доменов только через каноническую `paths.DomainDir`.
+- `internal/ui/Container.RefreshKnowledgeCmd` должен использовать этот контракт;
+  проверка `profile != ""` не должна пропускать чтение памяти профиля по
+  умолчанию.
+- Область реализации: `internal/ui/container.go`.
+- Для пустого имени профиля сохраняется порядок разрешения: `AI_PROFILE` →
+  `default`, если `AI_PROFILE` не задан или пуст.
+- Приёмка должна покрывать профиль с Unicode/кириллицей, пользовательский
+  `AI_DATA_HOME` и путь watcher'а; во всех случаях используется
+  канонический каталог домена.
+- В фазу 1 не входят `TypeScript extension`, миграция, `AUTOMATA_HOME`,
+  F5/F7 и диагностика мыши в `/tmp`.
+
 ## Реализация
 - `main.go`: `--profile` flag, `SessionManager.Profile`, `Tree.Profile`.
 - `internal/paths/paths.go`: единые функции для путей

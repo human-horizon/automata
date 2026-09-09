@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -230,9 +231,74 @@ func TestDeleteItem(t *testing.T) {
 func TestRenameItem(t *testing.T) {
 	tr := New()
 	tr.AddFolder("old")
-	tr.renameItem(tr.root[0], "new")
+	if err := tr.renameItem(tr.root[0], "new"); err != nil {
+		t.Fatalf("renameItem: %v", err)
+	}
 	if tr.root[0].Name != "new" {
 		t.Errorf("expected name 'new', got %q", tr.root[0].Name)
+	}
+}
+
+func TestRenameRejectsSlugConflict(t *testing.T) {
+	tr := New()
+	tr.AddChat("Alpha")
+	tr.AddChat("other")
+
+	if err := tr.renameItem(tr.root[1], " alpha "); err == nil {
+		t.Fatal("expected slug conflict")
+	}
+	if tr.root[1].Name != "other" {
+		t.Fatalf("conflicting rename changed name to %q", tr.root[1].Name)
+	}
+}
+
+func TestRenameCallbackRunsBeforeTreeMutation(t *testing.T) {
+	tr := New()
+	tr.AddChat("old")
+	called := false
+	tr.SetOnRename(func(item *Item, newName string) error {
+		called = true
+		if item.Name != "old" {
+			t.Errorf("callback saw mutated name %q", item.Name)
+		}
+		if newName != "new" {
+			t.Errorf("callback saw name %q", newName)
+		}
+		return nil
+	})
+
+	if err := tr.renameItem(tr.root[0], "new"); err != nil {
+		t.Fatalf("renameItem: %v", err)
+	}
+	if !called || tr.root[0].Name != "new" {
+		t.Fatalf("rename callback or mutation missing: called=%v name=%q", called, tr.root[0].Name)
+	}
+}
+
+func TestRenameErrorKeepsModalOpen(t *testing.T) {
+	tr := New()
+	tr.AddChat("old")
+	tr.SetOnRename(func(*Item, string) error {
+		return fmt.Errorf("migration failed")
+	})
+	tr.startRename(tr.root[0])
+	tr.inputValue = "new"
+	tr.confirmInput()
+
+	if tr.root[0].Name != "old" || !tr.modalActive || tr.inputError != "migration failed" {
+		t.Fatalf("rename error changed state: name=%q modal=%v error=%q", tr.root[0].Name, tr.modalActive, tr.inputError)
+	}
+}
+
+func TestF2StartsRenameForSelectedItem(t *testing.T) {
+	tr := New()
+	tr.AddTerminal("terminal")
+	tr.selected = 0
+
+	tr.handleKey(tea.KeyMsg{Type: tea.KeyF2})
+
+	if !tr.inputMode || tr.inputValue != "terminal" {
+		t.Fatalf("F2 did not open prefilled rename modal: mode=%v value=%q", tr.inputMode, tr.inputValue)
 	}
 }
 
@@ -886,5 +952,151 @@ func TestFindItemBySessionID(t *testing.T) {
 	notFound := tree.FindItemBySessionID("find-test__missing")
 	if notFound != nil {
 		t.Fatalf("expected nil for missing session, got %+v", notFound)
+	}
+}
+
+// TestFolderContextMenuIncludesSort is the regression for the new "Sort
+// A→Z" entry that lets the user reorder a folder's children alphabetically
+// without losing drag-and-drop intent on every reload.
+func TestFolderContextMenuIncludesSort(t *testing.T) {
+	tr := New()
+	tr.AddFolder("f")
+	items := tr.buildContextMenuItems(tr.root[0])
+	var found bool
+	for _, m := range items {
+		if m.Name == "Sort A→Z" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("folder context menu missing Sort A→Z")
+	}
+}
+
+// TestSortChildrenAlphabetically checks the ordering rule and the
+// "folders before chats before terminals" invariant. The mix deliberately
+// has the wrong initial order to make sure the call actually moves things.
+func TestSortChildrenAlphabetically(t *testing.T) {
+	tr := New()
+	tr.AddFolder("f")
+	f := tr.root[0]
+
+	// Build a mixed folder in reverse alphabetical order so every item
+	// has to move.
+	f.AddChild(&Item{Name: "zulu-chat"})
+	f.AddChild(&Item{Name: "alpha-folder", IsFolder: true})
+	f.AddChild(&Item{Name: "mike-terminal", IsTerminal: true})
+	f.AddChild(&Item{Name: "bravo-chat"})
+	f.AddChild(&Item{Name: "yankee-folder", IsFolder: true})
+
+	tr.sortChildrenAlphabetically(f)
+
+	wantNames := []string{"alpha-folder", "yankee-folder", "bravo-chat", "zulu-chat", "mike-terminal"}
+	if len(f.Children) != len(wantNames) {
+		t.Fatalf("children count = %d, want %d", len(f.Children), len(wantNames))
+	}
+	for i, want := range wantNames {
+		if got := f.Children[i].Name; got != want {
+			t.Errorf("children[%d] = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestSortChildrenAlphabeticallyIsCaseInsensitive confirms that case
+// doesn't break ordering — "Bravo" and "alpha" must end up next to each
+// other in the right spot, not split by ASCII case.
+func TestSortChildrenAlphabeticallyIsCaseInsensitive(t *testing.T) {
+	tr := New()
+	tr.AddFolder("f")
+	f := tr.root[0]
+
+	f.AddChild(&Item{Name: "Zeta"})
+	f.AddChild(&Item{Name: "alpha"})
+	f.AddChild(&Item{Name: "Mike"})
+
+	tr.sortChildrenAlphabetically(f)
+
+	wantNames := []string{"alpha", "Mike", "Zeta"}
+	for i, want := range wantNames {
+		if got := f.Children[i].Name; got != want {
+			t.Errorf("children[%d] = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestSortChildrenAlphabeticallyNoopForEmptyOrSingle makes sure the
+// function doesn't panic or rebuild on trivial inputs.
+func TestSortChildrenAlphabeticallyNoopForEmptyOrSingle(t *testing.T) {
+	tr := New()
+	tr.AddFolder("empty")
+	tr.sortChildrenAlphabetically(tr.root[0])
+	if len(tr.root[0].Children) != 0 {
+		t.Errorf("empty folder should stay empty, got %d children", len(tr.root[0].Children))
+	}
+
+	tr.AddFolder("solo")
+	tr.root[1].AddChild(&Item{Name: "only"})
+	tr.sortChildrenAlphabetically(tr.root[1])
+	if len(tr.root[1].Children) != 1 || tr.root[1].Children[0].Name != "only" {
+		t.Errorf("single-child folder disturbed: %+v", tr.root[1].Children)
+	}
+}
+
+// TestRootContextMenuIncludesSort confirms the empty-selection context
+// menu exposes both root sorting modes.
+func TestRootContextMenuIncludesSort(t *testing.T) {
+	tr := New()
+	items := tr.buildContextMenuItems(nil)
+	found := map[string]bool{}
+	for _, m := range items {
+		if m.Name == "Sort by name" || m.Name == "Sort by type" {
+			found[m.Name] = true
+		}
+	}
+	if !found["Sort by name"] || !found["Sort by type"] {
+		t.Fatalf("root context menu missing sort modes: %v", found)
+	}
+}
+
+// TestSortRootAlphabetically exercises the root-level entry point: a
+// deliberately unsorted mix of folders, chats and terminals must end up
+// grouped and A→Z, mirroring the children version.
+func TestSortRootAlphabetically(t *testing.T) {
+	tr := New()
+	tr.AddChat("zulu")
+	tr.AddFolder("alpha-folder")
+	tr.AddTerminal("mike")
+	tr.AddChat("bravo")
+	tr.AddFolder("yankee-folder")
+	// Trivial sanity: only one chat is allowed at root per AddChat, but
+	// multiple AddChat calls are supported — each appends. Confirm shape
+	// before sort.
+	if got := len(tr.root); got != 5 {
+		t.Fatalf("setup: root has %d items, want 5", got)
+	}
+
+	tr.sortRootAlphabetically()
+
+	wantOrder := []string{"alpha-folder", "yankee-folder", "bravo", "zulu", "mike"}
+	if len(tr.root) != len(wantOrder) {
+		t.Fatalf("root length = %d, want %d", len(tr.root), len(wantOrder))
+	}
+	for i, want := range wantOrder {
+		if got := tr.root[i].Name; got != want {
+			t.Errorf("root[%d] = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestSortRootAlphabeticallyNoopForSmall makes sure the root-level helper
+// doesn't panic or rebuild when there are 0 or 1 items.
+func TestSortRootAlphabeticallyNoopForSmall(t *testing.T) {
+	tr := New()
+	tr.sortRootAlphabetically() // empty
+	tr.AddChat("only")
+	tr.sortRootAlphabetically() // single
+	if len(tr.root) != 1 || tr.root[0].Name != "only" {
+		t.Errorf("root disturbed: %+v", tr.root)
 	}
 }

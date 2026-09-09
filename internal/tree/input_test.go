@@ -167,10 +167,10 @@ func TestConfirmModalButtonLine(t *testing.T) {
 
 func TestFindBracketPair(t *testing.T) {
 	tests := []struct {
-		s      string
-		start  int
-		wantS  int
-		wantE  int
+		s     string
+		start int
+		wantS int
+		wantE int
 	}{
 		{" [Del]  [Esc] ", 0, 1, 6},
 		{" [Del]  [Esc] ", 6, 8, 13},
@@ -407,5 +407,3 @@ func TestModalInputCursorAndSpaces(t *testing.T) {
 		t.Fatalf("expected input 'abcd' after Backspace, got %q", tr.inputValue)
 	}
 }
-
-

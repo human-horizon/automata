@@ -2,11 +2,13 @@ package ui
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
+	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	"github.com/Starframe/portalis"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -16,16 +18,16 @@ import (
 
 // FamiliarState matches the structure written by the pi familiar extension.
 type FamiliarState struct {
-	ID      string `json:"id"`
-	SessionID  string `json:"sessionId"`
-	Created string `json:"created"`
+	ID        string `json:"id"`
+	SessionID string `json:"sessionId"`
+	Created   string `json:"created"`
 }
 
 // chatSession represents one tab in the chat panel.
 type chatSession struct {
-	name   string
-	panel  warp.Panel
-	em     *portalis.Emulator
+	name       string
+	panel      warp.Panel
+	em         *portalis.Emulator
 	familiarID string // empty for main session
 }
 
@@ -36,6 +38,7 @@ type ChatPanel struct {
 	sessions  []*chatSession
 	activeIdx int
 	sessionID string
+	palette   apptheme.Theme
 	profile   string
 
 	// Polling state.
@@ -51,6 +54,25 @@ type ChatPanel struct {
 	// and restarting pi. Returning a non-nil cmd lets the panel chain after clear.
 	onClearSession func(sessionID, cwd string) tea.Cmd
 
+	// onCloseFamiliar is called when the user confirms closing a familiar via the
+	// × button on a familiar tab. The handler stops the emulator, deletes the
+	// familiar's JSONL, and removes its entry from familiars.json.
+	//
+	// Synchronous (no tea.Cmd return) on purpose: Modal.Action callbacks and
+	// the Y-key path both fire the close, and Modal.Action is a plain
+	// `func()` — there's no way to surface a returned cmd from inside it.
+	// Doing the cleanup synchronously here means both mouse and keyboard
+	// confirm paths work identically. See Anya's report 2026-08-25.
+	onCloseFamiliar func(familiarID string, em *portalis.Emulator)
+
+	// pendingCloseFamiliar holds the familiarID awaiting y/n confirmation.
+	// When non-empty, View draws a confirm overlay on top of the terminal area.
+	pendingCloseFamiliar string
+
+	// closeFamiliarModal is the Warp modal shown for pendingCloseFamiliar.
+	// Built lazily when pendingCloseFamiliar is set, dropped after confirm/cancel.
+	closeFamiliarModal *warp.Modal
+
 	// createFamiliarEmulator creates a portalis.Emulator for a new familiar tab.
 	// Returns the emulator and optional extra env vars for StartWithEnv.
 	// Set by main.go; has access to pi agent directory and other app state.
@@ -60,6 +82,7 @@ type ChatPanel struct {
 // NewChatPanel creates a ChatPanel with the given main session emulator.
 func NewChatPanel(mainEm *portalis.Emulator, sessionID, profile string) *ChatPanel {
 	return &ChatPanel{
+		palette: apptheme.Default(),
 		sessions: []*chatSession{
 			{
 				name:  "Main",
@@ -74,11 +97,26 @@ func NewChatPanel(mainEm *portalis.Emulator, sessionID, profile string) *ChatPan
 	}
 }
 
+// SetTheme updates the palette used by the chat tab bar.
+func (cp *ChatPanel) SetTheme(palette apptheme.Theme) {
+	cp.palette = palette
+}
+
 // SetOnClearSession sets the handler invoked when the user clicks the "× Clear"
 // button on the chat tab bar. The handler should stop the emulator, delete the
 // .jsonl file for the session, and restart pi.
 func (cp *ChatPanel) SetOnClearSession(fn func(sessionID, cwd string) tea.Cmd) {
 	cp.onClearSession = fn
+}
+
+// SetOnCloseFamiliar sets the handler invoked when the user confirms closing
+// a familiar via the × button on a familiar tab. The handler stops the
+// emulator, deletes the familiar's JSONL, and removes the entry from
+// familiars.json.
+//
+// Synchronous by design — see the comment on ChatPanel.onCloseFamiliar.
+func (cp *ChatPanel) SetOnCloseFamiliar(fn func(familiarID string, em *portalis.Emulator)) {
+	cp.onCloseFamiliar = fn
 }
 
 // SetCreateFamiliarEmulator sets the handler that creates a portalis.Emulator
@@ -96,6 +134,33 @@ func (cp *ChatPanel) ActiveEmulator() *portalis.Emulator {
 	return nil
 }
 
+// SessionID returns the owning session id (the main chat's sessionID).
+// Needed by callers outside the panel (e.g. main.go for clearSession
+// bookkeeping) that have to address the panel without poking at unexported
+// fields.
+func (cp *ChatPanel) SessionID() string {
+	return cp.sessionID
+}
+
+// RenameSessionIDs updates the main and familiar session IDs after an
+// external tree rename. Emulators are already stopped by the caller, so
+// changing their routing IDs cannot leave an old PTY event in flight.
+func (cp *ChatPanel) RenameSessionIDs(mapping map[string]string) {
+	if newID, ok := mapping[cp.sessionID]; ok {
+		cp.sessionID = newID
+	}
+	for _, session := range cp.sessions {
+		if session.em != nil {
+			if newID, ok := mapping[session.em.SessionID]; ok {
+				session.em.SessionID = newID
+			}
+		}
+		if newID, ok := mapping[session.familiarID]; ok {
+			session.familiarID = newID
+		}
+	}
+}
+
 // Sessions returns the underlying chat session list (Main + familiars).
 // Exposed for callers that need to inspect or mutate per-tab state
 // outside of the panel (e.g. clearSessionCmd in main.go).
@@ -108,6 +173,26 @@ func (cp *ChatPanel) Sessions() []*chatSession {
 // underlying PTY without poking at unexported fields.
 func (s *chatSession) Em() *portalis.Emulator {
 	return s.em
+}
+
+// Panel returns the warp.Panel wrapping the emulator. Exposed for tests
+// that need to inspect the wrapped panel's internal state after Clear
+// (e.g. TestClearReplacesPanelEmulator).
+func (s *chatSession) Panel() warp.Panel {
+	return s.panel
+}
+
+// SetEm replaces the emulator reference and updates the wrapped panel.
+// Used by clearSessionCmd to point the active chatSession at a freshly
+// restarted PTY so the UI no longer renders the stopped emulator.
+// Safe when panel is nil (defensive — shouldn't happen in practice).
+func (s *chatSession) SetEm(em *portalis.Emulator) {
+	s.em = em
+	if s.panel != nil {
+		if tp, ok := s.panel.(*TermPanel); ok {
+			tp.SetEm(em)
+		}
+	}
 }
 
 // FamiliarID returns the familiar session id for this chat session,
@@ -154,7 +239,7 @@ type pollFamiliarsMsg time.Time
 
 // familiarDetectedMsg is sent when a new familiar is found.
 type familiarDetectedMsg struct {
-	id     string
+	id         string
 	familiarID string
 }
 
@@ -259,9 +344,9 @@ func (cp *ChatPanel) addFamiliar(id, familiarID string) tea.Cmd {
 	// Create a TermPanel wrapping the emulator (same as Main tab).
 	panel := NewTermPanel(em)
 	cp.sessions = append(cp.sessions, &chatSession{
-		name:   id,
-		panel:  panel,
-		em:     em,
+		name:       id,
+		panel:      panel,
+		em:         em,
 		familiarID: familiarID,
 	})
 	// Start the emulator with the extra env (e.g. PI_CODING_AGENT_DIR, PI_OWNER_SESSION).
@@ -273,47 +358,106 @@ type stopper interface {
 	Stop()
 }
 
+// removeSessionAt stops and removes one tab while preserving the active tab
+// when a preceding inactive tab is deleted.
+func (cp *ChatPanel) removeSessionAt(index int) {
+	if index < 0 || index >= len(cp.sessions) {
+		return
+	}
+	if st, ok := cp.sessions[index].panel.(stopper); ok {
+		st.Stop()
+	}
+	cp.sessions = append(cp.sessions[:index], cp.sessions[index+1:]...)
+	if index < cp.activeIdx {
+		cp.activeIdx--
+	}
+	if cp.activeIdx >= len(cp.sessions) {
+		cp.activeIdx = len(cp.sessions) - 1
+	}
+	if cp.activeIdx < 0 {
+		cp.activeIdx = 0
+	}
+}
+
 // removeDeadFamiliar removes a familiar tab whose PTY has exited.
 // Matches by SessionID (the familiar's own session id, e.g.
 // humanhorizon__human-horizon.automata.ai-2__test6) and clears cp.known
 // so the next checkFamiliars poll re-creates the tab from familiars.json.
-func (cp *ChatPanel) removeDeadFamiliar(sessionID string) {
+func (cp *ChatPanel) removeDeadFamiliar(sessionID string) bool {
 	for i, s := range cp.sessions {
-		// Match if SessionID matches OR if the panel is a dead familiar
-		// (we no longer have an emulator reference for it).
-		if s.em != nil && s.em.SessionID != sessionID {
+		// Only familiar tabs may be removed here. Main-session PtyExitMsg
+		// must not flow through the familiar cleanup path.
+		if s == nil || s.familiarID == "" || s.em == nil || s.em.SessionID != sessionID {
 			continue
 		}
-		if st, ok := s.panel.(stopper); ok {
-			st.Stop()
-		}
 		delete(cp.known, s.name)
-		cp.sessions = append(cp.sessions[:i], cp.sessions[i+1:]...)
-		if cp.activeIdx >= len(cp.sessions) {
-			cp.activeIdx = len(cp.sessions) - 1
-		}
-		if cp.activeIdx < 0 {
-			cp.activeIdx = 0
-		}
-		return
+		cp.removeSessionAt(i)
+		return true
 	}
+	return false
 }
 
 // removeFamiliar removes the tab for a familiar that has been removed.
+// openCloseFamiliarModal builds a Warp modal asking the user to confirm
+// closing a familiar. The Yes action performs the close; No/Esc/× just
+// cancels. Y/N keys are handled in Update alongside the buttons, so both
+// keyboard and mouse paths converge on the same outcome.
+func (cp *ChatPanel) openCloseFamiliarModal(name string) {
+	fid := cp.pendingCloseFamiliar
+	cp.closeFamiliarModal = warp.NewModal(
+		"Close familiar",
+		fmt.Sprintf("Close %q?\nThis kills the PTY and deletes the session JSONL.", name),
+		[]warp.ModalButton{
+			{Label: "Yes", Action: func() {
+				cp.closeFamiliarModal = nil
+				cp.pendingCloseFamiliar = ""
+				cp.closeFamiliarByID(fid)
+			}},
+			{Label: "No", Action: func() {
+				cp.closeFamiliarModal = nil
+				cp.pendingCloseFamiliar = ""
+			}},
+		},
+		func() {
+			cp.closeFamiliarModal = nil
+			cp.pendingCloseFamiliar = ""
+		},
+	)
+}
+
+// closeFamiliarByID drops the familiar tab from cp.sessions and asks the
+// host (main.go via onCloseFamiliar) to clean up the underlying emulator,
+// JSONL, and familiars.json entry. The host callback is synchronous (no
+// cmd return) — that way it works identically whether the user confirms
+// via the Y key (handled in Update) or by clicking the Yes button in the
+// Modal overlay (handled in warp.ModalButton.Action, which is a plain
+// `func()` and can't surface a cmd).
+func (cp *ChatPanel) closeFamiliarByID(familiarID string) {
+	var (
+		idx = -1
+		em  *portalis.Emulator
+	)
+	for i, s := range cp.sessions {
+		if s.familiarID == familiarID {
+			idx = i
+			em = s.em
+			break
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	// Stop the panel synchronously so the terminal stops drawing.
+	cp.removeSessionAt(idx)
+	if cp.onCloseFamiliar != nil {
+		cp.onCloseFamiliar(familiarID, em)
+	}
+}
+
 func (cp *ChatPanel) removeFamiliar(id string) {
 	for i, s := range cp.sessions {
 		if s.name == id {
-			// Stop the familiar panel if it supports cleanup.
-			if st, ok := s.panel.(stopper); ok {
-				st.Stop()
-			}
-			cp.sessions = append(cp.sessions[:i], cp.sessions[i+1:]...)
-			if cp.activeIdx >= len(cp.sessions) {
-				cp.activeIdx = len(cp.sessions) - 1
-			}
-			if cp.activeIdx < 0 {
-				cp.activeIdx = 0
-			}
+			cp.removeSessionAt(i)
 			return
 		}
 	}
@@ -339,7 +483,12 @@ func (cp *ChatPanel) View(width, height int) string {
 
 	active := cp.sessions[cp.activeIdx]
 	termView := active.panel.View(width, termHeight)
-	return cp.joinWithBar(termView, termHeight, width)
+	out := cp.joinWithBar(termView, termHeight, width)
+	if cp.closeFamiliarModal != nil {
+		lines := cp.closeFamiliarModal.Overlay(strings.Split(out, "\n"), width, height)
+		out = strings.Join(lines, "\n")
+	}
+	return out
 }
 
 // joinWithBar appends the tab bar to the rendered terminal area, padding
@@ -357,8 +506,21 @@ func (cp *ChatPanel) joinWithBar(termView string, termHeight, width int) string 
 	return strings.Join(lines, "\n") + "\n" + tabBar
 }
 
+func familiarTabStyle(palette apptheme.Theme, active bool) lipgloss.Style {
+	background := palette.Surface
+	foreground := palette.TextMuted
+	if active {
+		background = palette.Raised
+		foreground = palette.TextStrong
+	}
+	return lipgloss.NewStyle().
+		Background(lipgloss.Color(background)).
+		Foreground(lipgloss.Color(foreground))
+}
+
 // renderTabBar renders the tab bar at the bottom. Layout, right-aligned:
-//     [...tabs...]   <padding>   <clear-btn>
+//
+//	[...tabs...]   <padding>   <clear-btn>
 func (cp *ChatPanel) renderTabBar(width int) string {
 	if width <= 0 {
 		return ""
@@ -366,20 +528,40 @@ func (cp *ChatPanel) renderTabBar(width int) string {
 
 	const clearBtnText = " × Clear "
 	clearW := ansi.StringWidth(clearBtnText)
+	palette := cp.palette
+	if palette.ID == "" {
+		palette = apptheme.Default()
+	}
+	familiarTabInactiveStyle := familiarTabStyle(palette, false)
+	familiarTabActiveStyle := familiarTabStyle(palette, true)
+	familiarCloseBtnStyle := lipgloss.NewStyle().Background(lipgloss.Color(palette.Error)).Foreground(lipgloss.Color(palette.TextStrong))
 
 	var tabs []string
 	for i, s := range cp.sessions {
-		tab := " " + s.name + " "
-		if i == cp.activeIdx {
-			tab = lipgloss.NewStyle().
-				Background(lipgloss.Color("4")).
-				Foreground(lipgloss.Color("0")).
-				Render(tab)
+		var tab string
+		var style lipgloss.Style
+		closeBtn := ""
+		if s.familiarID != "" {
+			// Two-cell close button: " ×" — the label's trailing space
+			// provides separation before the close affordance.
+			closeBtn = " ×"
+			if i == cp.activeIdx {
+				style = familiarTabActiveStyle
+			} else {
+				style = familiarTabInactiveStyle
+			}
+		} else if i == cp.activeIdx {
+			style = lipgloss.NewStyle().
+				Background(lipgloss.Color(palette.SelectionBackground)).
+				Foreground(lipgloss.Color(palette.SelectionForeground))
 		} else {
-			tab = lipgloss.NewStyle().
-				Background(lipgloss.Color("8")).
-				Foreground(lipgloss.Color("7")).
-				Render(tab)
+			style = lipgloss.NewStyle().
+				Background(lipgloss.Color(palette.Surface)).
+				Foreground(lipgloss.Color(palette.TextMuted))
+		}
+		tab = style.Render(" " + s.name + " ")
+		if closeBtn != "" {
+			tab += familiarCloseBtnStyle.Render(closeBtn)
 		}
 		tabs = append(tabs, tab)
 	}
@@ -388,8 +570,8 @@ func (cp *ChatPanel) renderTabBar(width int) string {
 
 	// Build "× Clear" button.
 	clearBtn := lipgloss.NewStyle().
-		Background(lipgloss.Color("#3c3836")).
-		Foreground(lipgloss.Color("#cc241d")).
+		Background(lipgloss.Color(palette.Surface)).
+		Foreground(lipgloss.Color(palette.Error)).
 		Bold(true).
 		Render(clearBtnText)
 
@@ -422,6 +604,41 @@ func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
 	var pollCmd tea.Cmd
 	if !cp.started {
 		pollCmd = cp.startPolling()
+	}
+
+	// Familiar-close confirmation modal swallows keys. While pending,
+	// Y/N/Esc close/cancel the prompt and nothing else is forwarded to the
+	// underlying session. Mouse events are routed to the modal so its
+	// buttons and ✕ work too.
+	if cp.pendingCloseFamiliar != "" {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "y", "Y":
+				id := cp.pendingCloseFamiliar
+				cp.pendingCloseFamiliar = ""
+				cp.closeFamiliarModal = nil
+				cp.closeFamiliarByID(id) // synchronous cleanup
+				return pollCmd
+			case "n", "N", "esc":
+				cp.pendingCloseFamiliar = ""
+				cp.closeFamiliarModal = nil
+				return pollCmd
+			}
+			return pollCmd // swallow other keys while modal is up
+		case tea.MouseMsg:
+			if cp.closeFamiliarModal != nil && cp.closeFamiliarModal.HandleMouse(msg) {
+				return pollCmd
+			}
+			// An unconsumed click is outside the modal. Dismiss the
+			// confirmation without forwarding the event to the tab bar or
+			// the active terminal.
+			if msg.Action == tea.MouseActionPress {
+				cp.pendingCloseFamiliar = ""
+				cp.closeFamiliarModal = nil
+			}
+			return pollCmd
+		}
 	}
 
 	var forwardCmd tea.Cmd
@@ -465,11 +682,13 @@ func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
 		}
 
 	case portalis.PtyExitMsg:
-		// When a PTY exits (familiar died), remove it from sessions and clear
+		// When a familiar PTY exits, remove it from sessions and clear
 		// cp.known so the next checkFamiliars poll can re-spawn it from
-		// familiars.json. The familiar's pi agent itself is responsible for
-		// shutting down cleanly (writes .kill marker on free_familiar).
-		cp.removeDeadFamiliar(msg.SessionID)
+		// familiars.json. Main PTY exits stay in Main and are routed to
+		// that panel so its emulator can process the lifecycle event.
+		if !cp.removeDeadFamiliar(msg.SessionID) {
+			forwardCmd = cp.routeBySessionID(msg)
+		}
 
 	default:
 		// Route messages with SessionID to the correct session.
@@ -584,7 +803,18 @@ func (cp *ChatPanel) handleMouse(msg tea.Msg) tea.Cmd {
 	x := 0
 	for i, s := range cp.sessions {
 		tabLen := len(s.name) + 2 // " name "
-		if int(m.X) >= x && int(m.X) < x+tabLen {
+		closeW := 0
+		if s.familiarID != "" {
+			closeW = 2 // " ×"
+		}
+		fullTabLen := tabLen + closeW
+		if int(m.X) >= x && int(m.X) < x+fullTabLen {
+			// Familiar × button is the rightmost closeW cells.
+			if s.familiarID != "" && int(m.X) >= x+tabLen {
+				cp.pendingCloseFamiliar = s.familiarID
+				cp.openCloseFamiliarModal(s.name)
+				return nil
+			}
 			if i != cp.activeIdx {
 				cp.activeIdx = i
 				// Send ResizeMsg to the new active session so it knows its size.
@@ -597,7 +827,7 @@ func (cp *ChatPanel) handleMouse(msg tea.Msg) tea.Cmd {
 			}
 			return nil
 		}
-		x += tabLen + 1 // +1 for space between tabs
+		x += fullTabLen + 1 // +1 for space between tabs
 	}
 
 	return nil

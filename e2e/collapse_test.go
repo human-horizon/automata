@@ -77,10 +77,10 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	t.Logf("screen before collapse:\n%s", before)
 
 	// Measure the chat panel width by locating the chat/knowledge border
-// (the column of "│Knowledge" in the header row). Subtract the tree
-// width: 30 chars when the tree is expanded, 1 when collapsed. This
-// yields the chat width. With the fix, after collapse the chat grows
-// from ~88 chars to ~118 chars.
+	// (the column of "│Knowledge" in the header row). Subtract the tree
+	// width: 30 chars when the tree is expanded, 1 when collapsed. This
+	// yields the chat width. With the fix, after collapse the chat grows
+	// from ~88 chars to ~118 chars.
 	beforeBorderCol := rightmostKnowledgeBorder(before)
 	treeWidthExpanded := 30
 	beforeWidth := beforeBorderCol - treeWidthExpanded

@@ -23,10 +23,10 @@ func projectRoot() string {
 
 // sessionStateItem mirrors internal/tree.StateItem for test fixtures.
 type sessionStateItem struct {
-	Name       string             `json:"name"`
-	IsFolder   bool               `json:"is_folder"`
-	Expanded   bool               `json:"expanded,omitempty"`
-	Items      []sessionStateItem `json:"items,omitempty"`
+	Name     string             `json:"name"`
+	IsFolder bool               `json:"is_folder"`
+	Expanded bool               `json:"expanded,omitempty"`
+	Items    []sessionStateItem `json:"items,omitempty"`
 }
 
 // sessionState mirrors internal/tree.TreeState for test fixtures.
@@ -111,6 +111,49 @@ func readSessionMarker(t *testing.T) string {
 		t.Fatalf("read session marker: %v", err)
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func TestRenameChatWithF2(t *testing.T) {
+	profile := "cue-test-rename"
+	profileDir := writeSessionFixture(t, profile, []sessionStateItem{
+		{Name: "Old Chat", IsFolder: false},
+	})
+
+	app, page := launchAutomataForSession(t, profile)
+	defer app.Close()
+
+	page.Press("F6")
+	page.WaitStable(100 * time.Millisecond)
+	page.Press("Down")
+	page.WaitStable(100 * time.Millisecond)
+	page.Press("F2")
+	page.WaitStable(100 * time.Millisecond)
+	for range "Old Chat" {
+		page.Press("Backspace")
+	}
+	page.Type("Renamed Chat")
+	page.Press("Enter")
+	page.WaitStable(300 * time.Millisecond)
+
+	text, err := page.Text()
+	if err != nil {
+		t.Fatalf("read screen after rename: %v", err)
+	}
+	if !strings.Contains(text, "Renamed Chat") {
+		t.Fatalf("renamed chat is not visible:\n%s", text)
+	}
+
+	data, err := os.ReadFile(filepath.Join(profileDir, "state.json"))
+	if err != nil {
+		t.Fatalf("read renamed state: %v", err)
+	}
+	var state sessionState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("decode renamed state: %v", err)
+	}
+	if len(state.Items) != 1 || state.Items[0].Name != "Renamed Chat" {
+		t.Fatalf("state name = %#v, want Renamed Chat", state.Items)
+	}
 }
 
 func TestRootChatSessionID(t *testing.T) {
