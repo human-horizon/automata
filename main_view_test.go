@@ -206,6 +206,93 @@ func TestRouteCachedEmulatorMessageHandlesAllPTYMessages(t *testing.T) {
 	}
 }
 
+func TestRouteCachedFamiliarEmulatorMessageKeepsListenChain(t *testing.T) {
+	const sessionID = "background-familiar"
+	em := portalis.NewEmulator(sessionID, "Expert", "/bin/sh", nil)
+	if err := em.StartSync(nil); err != nil {
+		t.Fatalf("start familiar emulator: %v", err)
+	}
+	defer em.Stop()
+
+	app := &App{
+		emulatorCache:         make(map[string]*portalis.Emulator),
+		familiarEmulatorCache: map[string]*portalis.Emulator{sessionID: em},
+	}
+
+	const marker = "background familiar output"
+	cmd, handled := app.routeCachedEmulatorMessage(portalis.PtyOutputMsg{
+		SessionID: sessionID,
+		Data:      []byte(marker),
+	})
+	if !handled {
+		t.Fatal("familiar PTY output was not handled while its ChatPanel was inactive")
+	}
+	if cmd == nil {
+		t.Fatal("familiar PTY output did not continue the Listen chain")
+	}
+	if got := em.View(80, 24); !strings.Contains(got, marker) {
+		t.Fatalf("familiar emulator view does not contain routed output %q: %q", marker, got)
+	}
+}
+
+func TestCreateFamiliarEmulatorReusesCachedEmulator(t *testing.T) {
+	t.Setenv("PI_CMD", "/bin/sh")
+	const sessionID = "cached-familiar"
+	app := &App{profile: "test"}
+
+	first, firstEnv := app.createFamiliarEmulator(sessionID)
+	if first == nil {
+		t.Fatal("first familiar emulator is nil")
+	}
+
+	second, secondEnv := app.createFamiliarEmulator(sessionID)
+	if second != first {
+		t.Fatalf("familiar emulator was recreated: first=%p second=%p", first, second)
+	}
+	if !reflect.DeepEqual(secondEnv, firstEnv) {
+		t.Fatalf("reused familiar environment = %#v, want %#v", secondEnv, firstEnv)
+	}
+	if got := app.familiarEmulatorCache[sessionID]; got != first {
+		t.Fatalf("cache contains %p, want original emulator %p", got, first)
+	}
+}
+
+func TestFamiliarExitEvictsCacheAndCreatesFreshEmulator(t *testing.T) {
+	t.Setenv("PI_CMD", "/bin/sh")
+	const sessionID = "exited-familiar"
+	app := &App{
+		activeSessions:        map[string]struct{}{sessionID: {}},
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+	}
+
+	first, firstEnv := app.createFamiliarEmulator(sessionID)
+	if first == nil {
+		t.Fatal("first familiar emulator is nil")
+	}
+
+	_, handled := app.routeCachedEmulatorMessage(portalis.PtyExitMsg{SessionID: sessionID})
+	if handled {
+		t.Fatal("familiar PtyExitMsg was swallowed before ChatPanel could remove its tab")
+	}
+	if _, ok := app.familiarEmulatorCache[sessionID]; ok {
+		t.Fatal("exited familiar remained in familiarEmulatorCache")
+	}
+	if _, ok := app.activeSessions[sessionID]; ok {
+		t.Fatal("exited familiar remained in activeSessions")
+	}
+
+	second, secondEnv := app.createFamiliarEmulator(sessionID)
+	if second == nil {
+		t.Fatal("replacement familiar emulator is nil")
+	}
+	if second == first {
+		t.Fatal("replacement familiar reused the exited emulator")
+	}
+	if !reflect.DeepEqual(secondEnv, firstEnv) {
+		t.Fatalf("replacement familiar environment = %#v, want %#v", secondEnv, firstEnv)
+	}
+}
+
 func TestRouteCachedEmulatorMessageLeavesUnknownMessagesForWarp(t *testing.T) {
 	app := &App{emulatorCache: make(map[string]*portalis.Emulator)}
 

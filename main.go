@@ -654,6 +654,13 @@ func (a *App) createChatEmulator(sessionID string) *portalis.Emulator {
 // Returns the emulator and its launch env for StartWithEnv (ChatPanel
 // appends PI_OWNER_SESSION before starting).
 func (a *App) createFamiliarEmulator(sessionID string) (*portalis.Emulator, []string) {
+	if a.familiarEmulatorCache == nil {
+		a.familiarEmulatorCache = make(map[string]*portalis.Emulator)
+	}
+	if em, ok := a.familiarEmulatorCache[sessionID]; ok && em != nil {
+		return em, em.StartEnv()
+	}
+
 	cmd, args, env := a.piLaunch(sessionID)
 	if cmd == "" {
 		log.Printf("automata: no pi command for familiar %q (piAgentDir=%q, PI_CMD unset, just-pi not on PATH)", sessionID, a.piAgentDir)
@@ -663,9 +670,6 @@ func (a *App) createFamiliarEmulator(sessionID string) (*portalis.Emulator, []st
 	em := portalis.NewEmulator(sessionID, sessionID, cmd, args)
 	em.SetStartEnv(env)
 	em.SetScrollbackLimit(1000)
-	if a.familiarEmulatorCache == nil {
-		a.familiarEmulatorCache = make(map[string]*portalis.Emulator)
-	}
 	a.familiarEmulatorCache[sessionID] = em
 	return em, env
 }
@@ -690,7 +694,24 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 		return nil, false
 	}
 
+	if _, isExit := msg.(portalis.PtyExitMsg); isExit {
+		if _, isFamiliar := a.familiarEmulatorCache[sessionID]; isFamiliar {
+			delete(a.familiarEmulatorCache, sessionID)
+			if _, active := a.activeSessions[sessionID]; active {
+				delete(a.activeSessions, sessionID)
+				if a.tree != nil {
+					a.tree.SetActiveSessions(a.activeSessions)
+				}
+			}
+			// Let the active ChatPanel remove the dead tab and keep polling.
+			return nil, false
+		}
+	}
+
 	em, ok := a.emulatorCache[sessionID]
+	if !ok || em == nil {
+		em, ok = a.familiarEmulatorCache[sessionID]
+	}
 	if !ok || em == nil {
 		// Unknown session IDs fall through to Warp for regular routing.
 		return nil, false
