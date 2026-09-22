@@ -69,7 +69,11 @@ func launchAutomataForSession(t *testing.T, profile string) (*cue.App, *cue.Page
 	if err := os.WriteFile(piCommand, []byte(piScript), 0o755); err != nil {
 		t.Fatalf("write fake pi command: %v", err)
 	}
-	app, err := cue.Launch(filepath.Join(root, "automata"),
+	binary := os.Getenv("AUTOMATA_BIN")
+	if binary == "" {
+		binary = filepath.Join(root, "automata")
+	}
+	app, err := cue.Launch(binary,
 		cue.WithArgs("--profile", profile),
 		cue.WithDir(root),
 		cue.WithSize(120, 40),
