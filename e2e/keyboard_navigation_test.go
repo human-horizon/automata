@@ -86,7 +86,23 @@ func TestSettingsMenuOpensAndPersistsTheme(t *testing.T) {
 		t.Fatalf("Settings is still inside the Tree panel: column %d\n%s", themeColumn, text)
 	}
 
-	page.Press("Enter")
+	lines, err = page.Lines()
+	if err != nil {
+		t.Fatalf("read settings items: %v", err)
+	}
+	themeRow := -1
+	themeColumn = -1
+	for row, line := range lines {
+		if column := strings.Index(line, "Dinosaur Earth"); column >= 0 {
+			themeRow = row
+			themeColumn = column
+			break
+		}
+	}
+	if themeRow < 0 {
+		t.Fatalf("Dinosaur Earth item is missing from settings menu:\n%s", strings.Join(lines, "\n"))
+	}
+	page.MouseClick(themeColumn+1, themeRow)
 	page.WaitStable(150 * time.Millisecond)
 	data, err := os.ReadFile(filepath.Join(profileDir, "state.json"))
 	if err != nil {

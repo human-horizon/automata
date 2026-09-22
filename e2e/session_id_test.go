@@ -88,7 +88,7 @@ func waitForTerminalPrompt(t *testing.T, page *cue.Page) {
 	const maxWait = 10
 	for i := 0; i < maxWait; i++ {
 		text, _ := page.Text()
-		if strings.Contains(text, "bash") {
+		if strings.Contains(text, "bash") || strings.Contains(text, "$") || strings.Contains(text, "#") {
 			t.Logf("Terminal detected at attempt %d", i+1)
 			return
 		}

@@ -212,8 +212,10 @@ func TestTerminalRestoresCWD(t *testing.T) {
 
 	text, _ = page.Text()
 	t.Logf("screen after reopen:\n%s", text)
-	// The default macOS bash prompt shortens the path to the directory name.
-	if err := cue.Expect(page).ToContain("Pro:tmp a$"); err != nil {
+	// Prompt formatting differs between macOS and Linux; the persisted CWD
+	// assertion above verifies the exact value, while the reopened prompt must
+	// still contain the restored directory.
+	if err := cue.Expect(page).ToContain("tmp"); err != nil {
 		t.Fatalf("terminal did not restore cwd /tmp: %v", err)
 	}
 }
