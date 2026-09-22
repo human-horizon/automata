@@ -168,6 +168,81 @@ func TestRenameFolderMigratesContextsAndJSONL(t *testing.T) {
 	}
 }
 
+func TestMoveRollbackRestoresRuntimeAndFilesystem(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	profile := "Rollback Profile"
+	tr := tree.New()
+	tr.Profile = profile
+	tr.AddFolder("source")
+	tr.AddFolder("target")
+	source := tr.Root()[0]
+	target := tr.Root()[1]
+	chat := &tree.Item{Name: "chat", CWD: "/work"}
+	source.AddChild(chat)
+	oldID := tr.SessionKeyOf(chat)
+	newID := fullRenameSessionID(profile, []string{"target"}, "chat")
+	if err := os.MkdirAll(paths.SessionDir(profile, oldID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	em := portalis.NewEmulator(oldID, "chat", "/bin/sh", nil)
+	app := &App{
+		tree:                  tr,
+		profile:               profile,
+		activeSessions:        map[string]struct{}{oldID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{oldID: em},
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		runningSessions:       map[string]struct{}{oldID: {}},
+		currentSessionID:      "unrelated-session",
+	}
+	startCalls := 0
+	app.startEmulatorSyncFn = func(*portalis.Emulator, []string) error {
+		startCalls++
+		return nil
+	}
+	plan, err := buildMovePlan(chat, target, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollback, err := app.applyRenamePlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.SessionDir(profile, newID)); err != nil {
+		t.Fatalf("new session missing before rollback: %v", err)
+	}
+	if _, ok := app.emulatorCache[oldID]; ok {
+		t.Fatal("runtime cache was not stopped before move commit")
+	}
+	if err := rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.SessionDir(profile, oldID)); err != nil {
+		t.Fatalf("old session missing after rollback: %v", err)
+	}
+	if _, err := os.Stat(paths.SessionDir(profile, newID)); !os.IsNotExist(err) {
+		t.Fatalf("new session remains after rollback: %v", err)
+	}
+	if app.emulatorCache[oldID] != em {
+		t.Fatal("runtime emulator cache was not restored")
+	}
+	if startCalls != 1 {
+		t.Fatalf("running emulator restart calls = %d, want 1", startCalls)
+	}
+	if _, ok := app.runningSessions[oldID]; !ok {
+		t.Fatal("running session was not restored")
+	}
+	if _, ok := app.activeSessions[oldID]; !ok {
+		t.Fatal("active session was not restored")
+	}
+	if app.currentSessionID != "unrelated-session" {
+		t.Fatalf("unrelated current session changed to %q", app.currentSessionID)
+	}
+	if got := tr.ActiveSessionIDs(); len(got) != 1 || got[0] != oldID {
+		t.Fatalf("tree active sessions after rollback = %v", got)
+	}
+}
+
 func TestRenameRejectsConflictWithoutMutation(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -254,7 +329,7 @@ func TestRenameStopsOnlySelectedSession(t *testing.T) {
 	}
 }
 
-func TestMoveChatAndTerminalReusesRenameMigration(t *testing.T) {
+func TestMoveChatReusesRenameMigrationWithoutMovingDomain(t *testing.T) {
 	home := t.TempDir()
 	dataHome := t.TempDir()
 	t.Setenv("HOME", home)
@@ -267,40 +342,41 @@ func TestMoveChatAndTerminalReusesRenameMigration(t *testing.T) {
 	app.tree.AddFolder("target")
 	source := app.tree.Root()[0]
 	target := app.tree.Root()[1]
-	chat := &tree.Item{Name: "chat", CWD: "/work"}
-	terminal := &tree.Item{Name: "shell", IsTerminal: true, CWD: "/work"}
-	source.AddChild(chat)
-	source.AddChild(terminal)
+	chatA := &tree.Item{Name: "chat-a", CWD: "/work"}
+	chatB := &tree.Item{Name: "chat-b", CWD: "/work"}
+	source.AddChild(chatA)
+	source.AddChild(chatB)
 
-	oldChatID := app.tree.SessionKeyOf(chat)
-	oldTerminalID := app.tree.SessionKeyOf(terminal)
-	newChatID := fullRenameSessionID(profile, []string{"target"}, "chat")
-	newTerminalID := fullRenameSessionID(profile, []string{"target"}, "shell")
-	oldChatDomain := sessionDomainID(oldChatID)
-	newChatDomain := sessionDomainID(newChatID)
-
-	for _, id := range []string{oldChatID, oldTerminalID} {
+	oldAID := app.tree.SessionKeyOf(chatA)
+	oldBID := app.tree.SessionKeyOf(chatB)
+	newAID := fullRenameSessionID(profile, []string{"target"}, "chat-a")
+	sourceDomain := source.Domain(profile)
+	targetDomain := target.Domain(profile)
+	for _, id := range []string{oldAID, oldBID} {
 		if err := os.MkdirAll(paths.SessionDir(profile, id), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.MkdirAll(paths.DomainDir(profile, oldChatDomain), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(paths.DomainDir(profile, sourceDomain), "kanban"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(paths.DomainDir(profile, oldChatDomain), "notes.json"), []byte("move notes"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(paths.DomainDir(profile, sourceDomain), "notes.json"), []byte("source notes"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	kanbanDir := filepath.Join(paths.DomainDir(profile, oldChatDomain), "kanban")
-	if err := os.MkdirAll(kanbanDir, 0o755); err != nil {
-		t.Fatal(err)
+	writeTask := func(name, title, assigned string) {
+		t.Helper()
+		path := filepath.Join(paths.DomainDir(profile, sourceDomain), "kanban", name)
+		data := fmt.Sprintf("---\ntitle: %s\nstatus: progress\nassigned_to: %s\n---\n%s\n", title, assigned, title)
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	kanbanPath := filepath.Join(kanbanDir, "move.md")
-	if err := os.WriteFile(kanbanPath, []byte(fmt.Sprintf("---\ntitle: Move\nstatus: progress\nassigned_to: %s\n---\nmove task\n", oldChatID)), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	oldFamiliarID := oldChatID + "__expert"
-	newFamiliarID := newChatID + "__expert"
-	familiarPath := paths.FamiliarsJSONLPath(profile, oldChatID)
+	writeTask("task-for-a.md", "Task A", oldAID)
+	writeTask("task-for-b.md", "Task B", oldBID)
+
+	oldFamiliarID := oldAID + "__expert"
+	newFamiliarID := newAID + "__expert"
+	familiarPath := paths.FamiliarsJSONLPath(profile, oldAID)
 	if err := os.MkdirAll(filepath.Dir(familiarPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -310,12 +386,12 @@ func TestMoveChatAndTerminalReusesRenameMigration(t *testing.T) {
 	if err := os.MkdirAll(paths.SessionDir(profile, oldFamiliarID), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	jsonlDir := filepath.Join(app.renameAgentDir(), "sessions", paths.EncodeCwdDir(chat.CWD))
+	jsonlDir := filepath.Join(app.renameAgentDir(), "sessions", paths.EncodeCwdDir(chatA.CWD))
 	if err := os.MkdirAll(jsonlDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	jsonlPath := filepath.Join(jsonlDir, "chat.jsonl")
-	if err := os.WriteFile(jsonlPath, []byte(fmt.Sprintf("{\"type\":\"session\",\"id\":%q}\n", oldChatID)), 0o600); err != nil {
+	jsonlPath := filepath.Join(jsonlDir, "chat-a.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(fmt.Sprintf("{\"type\":\"session\",\"id\":%q}\n", oldAID)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	familiarJSONLPath := filepath.Join(jsonlDir, "familiar.jsonl")
@@ -323,39 +399,41 @@ func TestMoveChatAndTerminalReusesRenameMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app.tree.MoveItem(chat, target)
+	app.tree.MoveItem(chatA, target)
 
-	if got := app.tree.SessionKeyOf(chat); got != newChatID {
-		t.Fatalf("chat session ID = %q, want %q", got, newChatID)
+	if got := app.tree.SessionKeyOf(chatA); got != newAID {
+		t.Fatalf("chat-a session ID = %q, want %q", got, newAID)
 	}
-	if _, err := os.Stat(paths.SessionDir(profile, oldChatID)); !os.IsNotExist(err) {
-		t.Fatalf("old chat session remains: %v", err)
+	if _, err := os.Stat(paths.SessionDir(profile, oldAID)); !os.IsNotExist(err) {
+		t.Fatalf("old chat-a session remains: %v", err)
 	}
-	if _, err := os.Stat(paths.SessionDir(profile, newChatID)); err != nil {
-		t.Fatalf("new chat session missing: %v", err)
+	if _, err := os.Stat(paths.SessionDir(profile, newAID)); err != nil {
+		t.Fatalf("new chat-a session missing: %v", err)
 	}
-	if _, err := os.Stat(paths.SessionDir(profile, oldTerminalID)); err != nil {
-		t.Fatalf("sibling terminal session was changed: %v", err)
+	if _, err := os.Stat(paths.SessionDir(profile, oldBID)); err != nil {
+		t.Fatalf("chat-b session changed: %v", err)
 	}
-	if _, err := os.Stat(paths.SessionDir(profile, newTerminalID)); err == nil {
-		t.Fatalf("sibling terminal moved unexpectedly")
+	gotNotes, err := os.ReadFile(filepath.Join(paths.DomainDir(profile, sourceDomain), "notes.json"))
+	if err != nil || string(gotNotes) != "source notes" {
+		t.Fatalf("source notes disappeared: err=%v notes=%q", err, gotNotes)
 	}
-	gotNotes, err := os.ReadFile(filepath.Join(paths.DomainDir(profile, newChatDomain), "notes.json"))
-	if err != nil || string(gotNotes) != "move notes" {
-		t.Fatalf("moved chat domain missing: err=%v notes=%q", err, gotNotes)
+	if _, err := os.Stat(paths.DomainDir(profile, targetDomain)); !os.IsNotExist(err) {
+		t.Fatalf("single-chat move created or moved a whole target domain: %v", err)
 	}
-	if _, err := os.Stat(paths.DomainDir(profile, oldChatDomain)); !os.IsNotExist(err) {
-		t.Fatalf("old chat domain remains: %v", err)
+	for name, want := range map[string]string{
+		"task-for-a.md": "assigned_to: " + newAID,
+		"task-for-b.md": "assigned_to: " + oldBID,
+	} {
+		data, readErr := os.ReadFile(filepath.Join(paths.DomainDir(profile, sourceDomain), "kanban", name))
+		if readErr != nil || !strings.Contains(string(data), want) {
+			t.Fatalf("task %s assignment changed incorrectly: err=%v data=%q", name, readErr, data)
+		}
 	}
 	gotJSONL, err := os.ReadFile(jsonlPath)
-	if err != nil || !strings.Contains(string(gotJSONL), newChatID) {
+	if err != nil || !strings.Contains(string(gotJSONL), newAID) {
 		t.Fatalf("session JSONL was not migrated: err=%v data=%q", err, gotJSONL)
 	}
-	gotKanban, err := os.ReadFile(filepath.Join(paths.DomainDir(profile, newChatDomain), "kanban", "move.md"))
-	if err != nil || !strings.Contains(string(gotKanban), "assigned_to: "+newChatID) {
-		t.Fatalf("Kanban assignment was not migrated: err=%v data=%q", err, gotKanban)
-	}
-	newFamiliarPath := paths.FamiliarsJSONLPath(profile, newChatID)
+	newFamiliarPath := paths.FamiliarsJSONLPath(profile, newAID)
 	gotFamiliars, err := os.ReadFile(newFamiliarPath)
 	if err != nil || !strings.Contains(string(gotFamiliars), newFamiliarID) {
 		t.Fatalf("familiars mapping was not migrated: err=%v data=%q", err, gotFamiliars)
@@ -363,16 +441,13 @@ func TestMoveChatAndTerminalReusesRenameMigration(t *testing.T) {
 	if _, err := os.Stat(paths.SessionDir(profile, oldFamiliarID)); !os.IsNotExist(err) {
 		t.Fatalf("old familiar session remains: %v", err)
 	}
-	if _, err := os.Stat(paths.SessionDir(profile, newFamiliarID)); err != nil {
-		t.Fatalf("new familiar session missing: %v", err)
-	}
 	gotFamiliarJSONL, err := os.ReadFile(familiarJSONLPath)
 	if err != nil || !strings.Contains(string(gotFamiliarJSONL), newFamiliarID) {
 		t.Fatalf("familiar JSONL was not migrated: err=%v data=%q", err, gotFamiliarJSONL)
 	}
 }
 
-func TestRenameRootChatMovesItsDomain(t *testing.T) {
+func TestRenameRootChatKeepsProfileDomain(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	profile := "test"
@@ -387,8 +462,11 @@ func TestRenameRootChatMovesItsDomain(t *testing.T) {
 	app.tree.AddChat("old")
 	chat := app.tree.Root()[0]
 	oldID := app.tree.SessionKeyOf(chat)
-	oldDomain := sessionDomainID(oldID)
-	domainDir := paths.DomainDir(profile, oldDomain)
+	if oldID == "" {
+		t.Fatal("root chat session ID is empty")
+	}
+	domain := paths.DomainID(profile, nil)
+	domainDir := paths.DomainDir(profile, domain)
 	if err := os.MkdirAll(domainDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -401,11 +479,10 @@ func TestRenameRootChatMovesItsDomain(t *testing.T) {
 		t.Fatalf("rename root chat: %v", err)
 	}
 	newID := app.tree.SessionKeyOf(chat)
-	newDomain := sessionDomainID(newID)
-	if _, err := os.Stat(filepath.Join(paths.DomainDir(profile, oldDomain), "notes.json")); !os.IsNotExist(err) {
-		t.Fatalf("old root domain still exists: %v", err)
+	if newID == oldID {
+		t.Fatalf("root chat session ID did not change: %q", newID)
 	}
-	got, err := os.ReadFile(filepath.Join(paths.DomainDir(profile, newDomain), "notes.json"))
+	got, err := os.ReadFile(filepath.Join(paths.DomainDir(profile, domain), "notes.json"))
 	if err != nil {
 		t.Fatalf("new root domain missing: %v", err)
 	}

@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -233,6 +235,183 @@ func TestPruneStaleSessionMarksDeadJobs(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected 0 running jobs after prune, got %d", count)
+	}
+}
+
+func writeKillSessionRecord(t *testing.T, sessionID string, pid int, startedAt string) (string, string) {
+	t.Helper()
+	jobDir := filepath.Join(sessionDir(sessionID), "jobs", "job_kill")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(jobDir, "job.json")
+	record := `{"id":"job_kill","command":"sleep","pid":` + strconv.Itoa(pid) + `,"status":"running"`
+	if startedAt != "" {
+		record += `,"startedAt":"` + startedAt + `"`
+	}
+	record += "}"
+	if err := os.WriteFile(metaPath, []byte(record), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return jobDir, metaPath
+}
+
+func TestKillSessionDoesNotSignalRecycledPIDAndCleansStaleRecord(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__kill-recycled"
+
+	called := 0
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+	})
+	processSignal = func(int, syscall.Signal) error {
+		called++
+		return nil
+	}
+	psRunnerOverride = func(int) (string, error) {
+		return time.Now().Add(10 * time.Minute).Local().Format("Mon Jan 2 15:04:05 2006"), nil
+	}
+
+	jobDir, _ := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+	if err := KillSession(sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if called != 0 {
+		t.Fatalf("recycled PID received a signal: %d calls", called)
+	}
+	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
+		t.Fatalf("stale recycled job was not cleaned: %v", err)
+	}
+}
+
+func TestKillSessionDoesNotSignalDeadPIDAndCleansStaleRecord(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__kill-dead"
+
+	called := 0
+	previousSignal := processSignal
+	t.Cleanup(func() { processSignal = previousSignal })
+	processSignal = func(int, syscall.Signal) error {
+		called++
+		return nil
+	}
+
+	jobDir, _ := writeKillSessionRecord(t, sessionID, 2_147_483_647, "")
+	if err := KillSession(sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if called != 0 {
+		t.Fatalf("dead PID received a signal: %d calls", called)
+	}
+	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
+		t.Fatalf("stale dead job was not cleaned: %v", err)
+	}
+}
+
+func TestKillSessionSignalsMatchingLivePIDAndWritesExitedMetadata(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__kill-live"
+
+	var signaledPID int
+	var signaledSignal syscall.Signal
+	previousSignal := processSignal
+	t.Cleanup(func() { processSignal = previousSignal })
+	processSignal = func(pid int, signal syscall.Signal) error {
+		signaledPID = pid
+		signaledSignal = signal
+		return nil
+	}
+
+	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), "")
+	if err := KillSession(sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if signaledPID != os.Getpid() || signaledSignal != syscall.SIGTERM {
+		t.Fatalf("signal = pid %d, signal %v; want pid %d, SIGTERM", signaledPID, signaledSignal, os.Getpid())
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "exited" {
+		t.Fatalf("live job status = %q, want exited", record.Status)
+	}
+	if _, err := os.Stat(jobDir); err != nil {
+		t.Fatalf("live job metadata disappeared: %v", err)
+	}
+}
+
+func TestKillSessionReturnsSignalErrorAndPreservesLiveMetadata(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__kill-error"
+
+	signalErr := errString("signal denied")
+	previousSignal := processSignal
+	t.Cleanup(func() { processSignal = previousSignal })
+	processSignal = func(int, syscall.Signal) error { return signalErr }
+
+	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), "")
+	if err := KillSession(sessionID); err == nil || !strings.Contains(err.Error(), "signal denied") {
+		t.Fatalf("KillSession error = %v, want signal error", err)
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "running" {
+		t.Fatalf("live job status after signal error = %q, want running", record.Status)
+	}
+	if _, err := os.Stat(jobDir); err != nil {
+		t.Fatalf("live job metadata disappeared after signal error: %v", err)
+	}
+}
+
+func writeProfileStaleJob(t *testing.T, profile, sessionID string) string {
+	t.Helper()
+	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", "job_stale")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(`{"id":"job_stale","pid":2147483647,"status":"running"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return jobDir
+}
+
+func TestCleanupStaleUsesExplicitProfileScope(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "wrong-profile")
+	profileA := "Profile A"
+	profileB := "Profile B"
+	jobA := writeProfileStaleJob(t, profileA, "chat-a")
+	jobB := writeProfileStaleJob(t, profileB, "chat-b")
+
+	if err := CleanupStaleForProfile(profileA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(jobA); !os.IsNotExist(err) {
+		t.Fatalf("explicit profile cleanup left profile A job: %v", err)
+	}
+	if _, err := os.Stat(jobB); err != nil {
+		t.Fatalf("explicit profile cleanup touched profile B unexpectedly: %v", err)
+	}
+
+	if err := CleanupStale(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(jobB); !os.IsNotExist(err) {
+		t.Fatalf("all-profile cleanup left profile B job: %v", err)
 	}
 }
 

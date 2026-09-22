@@ -13,12 +13,15 @@ import (
 	"github.com/HumanHorizon/automata/internal/slug"
 	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/HumanHorizon/automata/internal/ui"
+	"github.com/Starframe/portalis"
 )
 
 type renameSessionPlan struct {
-	oldID string
-	newID string
-	cwd   string
+	oldID      string
+	newID      string
+	cwd        string
+	taskDomain string
+	newDomain  string
 }
 
 type renameDomainPlan struct {
@@ -38,6 +41,15 @@ type renamePlan struct {
 	sessions  []renameSessionPlan
 	domains   []renameDomainPlan
 	familiars []renameFamiliarPlan
+}
+
+type renameRuntimeSnapshot struct {
+	emulators              map[string]*portalis.Emulator
+	familiarEmulators      map[string]*portalis.Emulator
+	activeSessions         map[string]struct{}
+	runningSessions        map[string]struct{}
+	currentSessionID       string
+	currentSessionCaptured bool
 }
 
 type renameDirectoryMove struct {
@@ -69,18 +81,6 @@ func fullRenameSessionID(profile string, folders []string, name string) string {
 	return slug.Slug(profile) + "__" + id
 }
 
-func renameDomainID(profile string, folders []string) string {
-	parts := make([]string, 0, len(folders))
-	for _, folder := range folders {
-		parts = append(parts, slug.Slug(folder))
-	}
-	domain := strings.Join(parts, ".")
-	if profile == "" {
-		return domain
-	}
-	return slug.Slug(profile) + "__" + domain
-}
-
 func (a *App) renameAgentDir() string {
 	if a.piAgentDir != "" {
 		return a.piAgentDir
@@ -90,13 +90,6 @@ func (a *App) renameAgentDir() string {
 		home = "/Users/a"
 	}
 	return filepath.Join(home, ".ai", "just", "pi")
-}
-
-func sessionDomainID(sessionID string) string {
-	if dot := strings.LastIndex(sessionID, "."); dot > 0 {
-		return sessionID[:dot]
-	}
-	return sessionID
 }
 
 func appendRenamePath(parts []string, name string) []string {
@@ -114,14 +107,13 @@ func buildRenamePlan(item *tree.Item, newName, profile string) (*renamePlan, err
 		parentFolders := item.Path()
 		oldID := fullRenameSessionID(profile, parentFolders, item.Name)
 		newID := fullRenameSessionID(profile, parentFolders, newName)
-		plan.domains = append(plan.domains, renameDomainPlan{
-			oldDomain: sessionDomainID(oldID),
-			newDomain: sessionDomainID(newID),
-		})
+		domain := paths.DomainID(profile, parentFolders)
 		plan.sessions = append(plan.sessions, renameSessionPlan{
-			oldID: oldID,
-			newID: newID,
-			cwd:   item.CWD,
+			oldID:      oldID,
+			newID:      newID,
+			cwd:        item.CWD,
+			taskDomain: domain,
+			newDomain:  domain,
 		})
 		return plan, nil
 	}
@@ -135,9 +127,11 @@ func buildRenamePlan(item *tree.Item, newName, profile string) (*renamePlan, err
 		}
 		oldFolders := appendRenamePath(oldParent, oldName)
 		newFolders := appendRenamePath(newParent, newFolderName)
+		oldDomain := paths.DomainID(profile, oldFolders)
+		newDomain := paths.DomainID(profile, newFolders)
 		plan.domains = append(plan.domains, renameDomainPlan{
-			oldDomain: renameDomainID(profile, oldFolders),
-			newDomain: renameDomainID(profile, newFolders),
+			oldDomain: oldDomain,
+			newDomain: newDomain,
 		})
 		for _, child := range folder.Children {
 			if child.IsFolder {
@@ -145,9 +139,11 @@ func buildRenamePlan(item *tree.Item, newName, profile string) (*renamePlan, err
 				continue
 			}
 			plan.sessions = append(plan.sessions, renameSessionPlan{
-				oldID: fullRenameSessionID(profile, oldFolders, child.Name),
-				newID: fullRenameSessionID(profile, newFolders, child.Name),
-				cwd:   child.CWD,
+				oldID:      fullRenameSessionID(profile, oldFolders, child.Name),
+				newID:      fullRenameSessionID(profile, newFolders, child.Name),
+				cwd:        child.CWD,
+				taskDomain: newDomain,
+				newDomain:  newDomain,
 			})
 		}
 	}
@@ -172,11 +168,13 @@ func buildMovePlan(item, newParent *tree.Item, profile string) (*renamePlan, err
 	if !item.IsFolder {
 		oldID := fullRenameSessionID(profile, oldFolders, item.Name)
 		newID := fullRenameSessionID(profile, newFolders, item.Name)
-		plan.domains = append(plan.domains, renameDomainPlan{
-			oldDomain: sessionDomainID(oldID),
-			newDomain: sessionDomainID(newID),
+		plan.sessions = append(plan.sessions, renameSessionPlan{
+			oldID:      oldID,
+			newID:      newID,
+			cwd:        item.CWD,
+			taskDomain: paths.DomainID(profile, oldFolders),
+			newDomain:  paths.DomainID(profile, newFolders),
 		})
-		plan.sessions = append(plan.sessions, renameSessionPlan{oldID: oldID, newID: newID, cwd: item.CWD})
 		return plan, nil
 	}
 
@@ -184,9 +182,11 @@ func buildMovePlan(item, newParent *tree.Item, profile string) (*renamePlan, err
 	walk = func(folder *tree.Item, oldParent, newParentPath []string) {
 		oldFolders := appendRenamePath(oldParent, folder.Name)
 		newFolders := appendRenamePath(newParentPath, folder.Name)
+		oldDomain := paths.DomainID(profile, oldFolders)
+		newDomain := paths.DomainID(profile, newFolders)
 		plan.domains = append(plan.domains, renameDomainPlan{
-			oldDomain: renameDomainID(profile, oldFolders),
-			newDomain: renameDomainID(profile, newFolders),
+			oldDomain: oldDomain,
+			newDomain: newDomain,
 		})
 		for _, child := range folder.Children {
 			if child.IsFolder {
@@ -194,9 +194,11 @@ func buildMovePlan(item, newParent *tree.Item, profile string) (*renamePlan, err
 				continue
 			}
 			plan.sessions = append(plan.sessions, renameSessionPlan{
-				oldID: fullRenameSessionID(profile, oldFolders, child.Name),
-				newID: fullRenameSessionID(profile, newFolders, child.Name),
-				cwd:   child.CWD,
+				oldID:      fullRenameSessionID(profile, oldFolders, child.Name),
+				newID:      fullRenameSessionID(profile, newFolders, child.Name),
+				cwd:        child.CWD,
+				taskDomain: newDomain,
+				newDomain:  newDomain,
 			})
 		}
 	}
@@ -217,6 +219,13 @@ func (a *App) applyRenameMappings(plan *renamePlan) {
 	}
 	if a.container != nil {
 		a.container.RenameSessionIDs(oldToNew)
+		sessionDomains := make(map[string]string, len(plan.sessions))
+		for _, session := range plan.sessions {
+			if session.newID != session.oldID {
+				sessionDomains[session.newID] = session.newDomain
+			}
+		}
+		a.container.RenameSessionDomains(sessionDomains)
 		domainMap := make(map[string]string, len(plan.domains))
 		for _, domain := range plan.domains {
 			if domain.oldDomain != domain.newDomain {
@@ -339,18 +348,98 @@ func (a *App) prepareRenamePlan(plan *renamePlan) error {
 	return nil
 }
 
-func (a *App) stopRenameSessions(plan *renamePlan) error {
+func renamePlanSessionIDs(plan *renamePlan) map[string]struct{} {
 	ids := make(map[string]struct{}, len(plan.sessions)+len(plan.familiars))
 	for _, session := range plan.sessions {
-		if session.oldID == session.newID {
-			continue
+		if session.oldID != session.newID {
+			ids[session.oldID] = struct{}{}
 		}
-		ids[session.oldID] = struct{}{}
 	}
 	for _, familiar := range plan.familiars {
 		ids[familiar.oldID] = struct{}{}
 	}
+	return ids
+}
 
+func (a *App) captureRenameRuntime(plan *renamePlan) renameRuntimeSnapshot {
+	ids := renamePlanSessionIDs(plan)
+	snapshot := renameRuntimeSnapshot{
+		emulators:         make(map[string]*portalis.Emulator),
+		familiarEmulators: make(map[string]*portalis.Emulator),
+		activeSessions:    make(map[string]struct{}),
+		runningSessions:   make(map[string]struct{}),
+	}
+	for id := range ids {
+		if em, ok := a.emulatorCache[id]; ok {
+			snapshot.emulators[id] = em
+		}
+		if em, ok := a.familiarEmulatorCache[id]; ok {
+			snapshot.familiarEmulators[id] = em
+		}
+		if _, ok := a.activeSessions[id]; ok {
+			snapshot.activeSessions[id] = struct{}{}
+		}
+		if _, ok := a.runningSessions[id]; ok {
+			snapshot.runningSessions[id] = struct{}{}
+		}
+	}
+	if _, ok := ids[a.currentSessionID]; ok {
+		snapshot.currentSessionID = a.currentSessionID
+		snapshot.currentSessionCaptured = true
+	}
+	return snapshot
+}
+
+func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot) error {
+	if a.emulatorCache == nil {
+		a.emulatorCache = make(map[string]*portalis.Emulator)
+	}
+	if a.familiarEmulatorCache == nil {
+		a.familiarEmulatorCache = make(map[string]*portalis.Emulator)
+	}
+	if a.activeSessions == nil {
+		a.activeSessions = make(map[string]struct{})
+	}
+	if a.runningSessions == nil {
+		a.runningSessions = make(map[string]struct{})
+	}
+	for id, em := range snapshot.emulators {
+		a.emulatorCache[id] = em
+	}
+	for id, em := range snapshot.familiarEmulators {
+		a.familiarEmulatorCache[id] = em
+	}
+	for id := range snapshot.activeSessions {
+		a.activeSessions[id] = struct{}{}
+	}
+	for id := range snapshot.runningSessions {
+		em := snapshot.emulators[id]
+		if em == nil {
+			em = snapshot.familiarEmulators[id]
+		}
+		if em == nil {
+			continue
+		}
+		if err := a.startEmulatorSync(em, nil); err != nil {
+			return fmt.Errorf("restore emulator %s: %w", id, err)
+		}
+		a.runningSessions[id] = struct{}{}
+		if cmd := em.Update(portalis.PtyReadyMsg{SessionID: id}); cmd != nil {
+			a.pendingRuntimeCmds = append(a.pendingRuntimeCmds, cmd)
+		}
+	}
+	if snapshot.currentSessionCaptured {
+		a.currentSessionID = snapshot.currentSessionID
+	}
+	if a.tree != nil {
+		a.tree.SetActiveSessions(a.activeSessions)
+	}
+	return nil
+}
+
+func (a *App) stopRenameSessions(plan *renamePlan) (renameRuntimeSnapshot, error) {
+	snapshot := a.captureRenameRuntime(plan)
+	ids := renamePlanSessionIDs(plan)
 	for id := range ids {
 		if em, ok := a.emulatorCache[id]; ok {
 			em.Stop()
@@ -371,15 +460,16 @@ func (a *App) stopRenameSessions(plan *renamePlan) error {
 				}
 			}
 		}
-		if err := akjobs.KillSession(id); err != nil {
-			return fmt.Errorf("stop jobs for %s: %w", id, err)
+		if err := akjobs.KillSessionForProfile(a.profile, id); err != nil {
+			return snapshot, fmt.Errorf("stop jobs for %s: %w", id, err)
 		}
 		delete(a.activeSessions, id)
+		delete(a.runningSessions, id)
 	}
 	if a.tree != nil {
 		a.tree.SetActiveSessions(a.activeSessions)
 	}
-	return nil
+	return snapshot, nil
 }
 
 func moveRenameDirectory(oldPath, newPath string, moves *[]renameDirectoryMove) error {
@@ -436,7 +526,11 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	if err := a.prepareRenamePlan(plan); err != nil {
 		return nil, err
 	}
-	if err := a.stopRenameSessions(plan); err != nil {
+	runtimeSnapshot, err := a.stopRenameSessions(plan)
+	if err != nil {
+		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot); restoreErr != nil {
+			return nil, fmt.Errorf("%w; restore runtime: %v", err, restoreErr)
+		}
 		return nil, err
 	}
 
@@ -446,6 +540,9 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	var assignmentMoves []renameAssignmentMove
 	fail := func(err error) (func() error, error) {
 		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves)
+		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot); restoreErr != nil {
+			return nil, fmt.Errorf("%w; restore runtime: %v", err, restoreErr)
+		}
 		return nil, err
 	}
 
@@ -474,20 +571,18 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 		if session.oldID == session.newID {
 			continue
 		}
-		for _, domain := range plan.domains {
-			tasks, err := kanban.ReadAll(domain.newDomain, a.profile)
-			if err != nil {
-				return fail(fmt.Errorf("read Kanban %s: %w", domain.newDomain, err))
+		tasks, err := kanban.ReadAll(session.taskDomain, a.profile)
+		if err != nil {
+			return fail(fmt.Errorf("read Kanban %s: %w", session.taskDomain, err))
+		}
+		for _, task := range tasks {
+			if task.AssignedTo != session.oldID {
+				continue
 			}
-			for _, task := range tasks {
-				if task.AssignedTo != session.oldID {
-					continue
-				}
-				if _, err := kanban.AssignTask(task.Path, session.newID); err != nil {
-					return fail(fmt.Errorf("migrate Kanban assignment %s: %w", task.Path, err))
-				}
-				assignmentMoves = append(assignmentMoves, renameAssignmentMove{path: task.Path, old: session.oldID})
+			if _, err := kanban.AssignTask(task.Path, session.newID); err != nil {
+				return fail(fmt.Errorf("migrate Kanban assignment %s: %w", task.Path, err))
 			}
+			assignmentMoves = append(assignmentMoves, renameAssignmentMove{path: task.Path, old: session.oldID})
 		}
 	}
 
@@ -538,7 +633,7 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 		}
 		rolledBack = true
 		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves)
-		return nil
+		return a.restoreRenameRuntime(runtimeSnapshot)
 	}, nil
 }
 

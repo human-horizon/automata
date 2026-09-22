@@ -753,6 +753,8 @@ func TestAppCloseStopsWatchersAndEmulators(t *testing.T) {
 	app.familiarEmulatorCache = map[string]*portalis.Emulator{
 		key + "__expert": portalis.NewEmulator(key+"__expert", "expert", "/bin/sh", nil),
 	}
+	app.activeSessions = map[string]struct{}{key: {}}
+	app.tree.SetActiveSessions(app.activeSessions)
 
 	app.Close()
 
@@ -765,8 +767,18 @@ func TestAppCloseStopsWatchersAndEmulators(t *testing.T) {
 	if len(app.emulatorCache) != 0 || len(app.familiarEmulatorCache) != 0 {
 		t.Fatal("emulator caches remained after Close")
 	}
-	if len(app.activeSessions) != 0 {
-		t.Fatal("active sessions remained after Close")
+	if _, ok := app.activeSessions[key]; !ok {
+		t.Fatal("Close erased active session needed for restore")
+	}
+	found := false
+	for _, activeID := range app.tree.ActiveSessionIDs() {
+		if activeID == key {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("Close erased persisted tree active session needed for restore")
 	}
 }
 

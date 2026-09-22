@@ -80,17 +80,19 @@ type KanbanPanel struct {
 	// lastRefresh tracks the last time tasks were reloaded from disk
 	lastRefresh time.Time
 
-	// watcher observes the kanban directory for file changes and triggers
-	// immediate reloads so external edits show up in the UI without waiting
-	// for the periodic poll.
-	watcher *fsnotify.Watcher
+	// watcher observes the kanban directory (or its parent until the
+	// directory is created) for file changes without polling.
+	watcher     *fsnotify.Watcher
+	watcherPath string
 
 	// watchPending is true while a watchKanbanCmd is already in flight — it
 	// blocks on watcher.Events and is re-armed after every event.
 	watchPending bool
 
-	// onTaskAssigned is called when a task is assigned to a chat
-	onTaskAssigned func(sessionID, taskTitle string)
+	// onTaskAssigned is called when a task is assigned to a chat and may
+	// return a Bubble Tea command (for example, the emulator Listen command).
+	onTaskAssigned func(sessionID, taskTitle string) tea.Cmd
+	assignmentErr  string
 
 	width  int
 	height int
@@ -137,6 +139,7 @@ func (k *KanbanPanel) SetTheme(palette apptheme.Theme) {
 // SetDomain reloads tasks for the given domain.
 func (k *KanbanPanel) SetDomain(domain string) {
 	if k.domain == domain {
+		k.setupWatcher()
 		return
 	}
 	k.domain = domain
@@ -149,26 +152,34 @@ func (k *KanbanPanel) SetDomain(domain string) {
 }
 
 // setupWatcher attaches an fsnotify.Watcher to the domain's kanban
-// directory so any external edit to a task .md file is reflected in the UI
-// without waiting for the next periodic poll. The actual drain happens in
-// Update via kanbanChangedMsg.
+// directory. If the directory does not exist yet, it watches the domain
+// directory and switches to kanban/ as soon as that directory is created.
 func (k *KanbanPanel) setupWatcher() {
 	if k.domain == "" {
 		return
 	}
 	dir := kanban.KanbanDir(k.domain, k.profile)
-	if _, err := os.Stat(dir); err != nil {
-		return // directory may not exist yet; periodic tick will create it
+	watchPath := dir
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		watchPath = filepath.Dir(dir)
+		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+			return
+		}
 	}
+	if k.watcher != nil && k.watcherPath == watchPath {
+		return
+	}
+	k.closeWatcher()
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return
 	}
-	if err := w.Add(dir); err != nil {
+	if err := w.Add(watchPath); err != nil {
 		w.Close()
 		return
 	}
 	k.watcher = w
+	k.watcherPath = watchPath
 }
 
 // closeWatcher stops and releases the file watcher if one is attached.
@@ -177,6 +188,7 @@ func (k *KanbanPanel) closeWatcher() {
 		_ = k.watcher.Close()
 		k.watcher = nil
 	}
+	k.watcherPath = ""
 }
 
 // Close releases the Kanban filesystem watcher.
@@ -223,7 +235,7 @@ func (k *KanbanPanel) SetChats(chats []ChatInfo) {
 }
 
 // SetOnTaskAssigned sets a callback that fires when a task is assigned to a chat.
-func (k *KanbanPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string)) {
+func (k *KanbanPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string) tea.Cmd) {
 	k.onTaskAssigned = fn
 }
 
@@ -307,8 +319,11 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 		}
 		baseCmd = k.tab.Update(msg)
 	case kanbanChangedMsg:
-		// fsnotify reported a change — reload and re-arm the watcher.
+		// fsnotify reported a change — a missing kanban directory may have
+		// just been created, so switch the parent watcher to it before
+		// re-arming the command.
 		k.watchPending = false
+		k.setupWatcher()
 		k.reload()
 		k.lastRefresh = time.Now()
 		baseCmd = nil
@@ -340,11 +355,9 @@ func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 				// Check if click is on a chat item
 				idx := k.pickerHitTest(msg.Y)
 				if idx >= 0 && idx < len(k.chats) {
-					// Assign task to selected chat — сразу в PROGRESS
+					// Assign task to selected chat — сразу в PROGRESS, or queue it
+					// when that chat already has a task in progress.
 					chat := k.chats[idx]
-					kanban.AssignTask(k.pendingTask.Path, chat.SessionID)
-
-					// Check if chat already has a task in progress
 					hasProgress := false
 					for _, t := range k.tasks {
 						if t.AssignedTo == chat.SessionID && t.Status == "progress" {
@@ -352,20 +365,21 @@ func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 							break
 						}
 					}
-
 					status := "progress"
 					if hasProgress {
 						status = "pending" // queue if already busy
 					}
-					kanban.UpdateStatus(k.pendingTask.Path, status)
-					// Write to chat's status.json so the agent picks it up
-					writeTaskToChatStatus(k.profile, chat.SessionID, k.pendingTask.Title, k.pendingTask.Path)
-					// Notify the chat directly via callback
-					if k.onTaskAssigned != nil {
-						k.onTaskAssigned(chat.SessionID, k.pendingTask.Title)
+
+					assignedTask := *k.pendingTask
+					cmd, err := k.assignTaskToChat(assignedTask, chat, status)
+					if err != nil {
+						k.assignmentErr = err.Error()
+						return nil
 					}
+					k.assignmentErr = ""
 					k.pendingTask = nil
 					k.reload()
+					return cmd
 				} else if msg.Y >= k.pickerOffset() {
 					// Click outside chat list — close picker
 					k.pendingTask = nil
@@ -583,6 +597,14 @@ func (k *KanbanPanel) renderPicker(width, height int) string {
 	b.WriteString("\n")
 	b.WriteString(strings.Repeat("─", width))
 	b.WriteString("\n")
+	if k.assignmentErr != "" {
+		errLine := " Ошибка: " + k.assignmentErr
+		if lipgloss.Width(errLine) > width {
+			errLine = errLine[:width]
+		}
+		b.WriteString(errLine)
+		b.WriteString("\n")
+	}
 
 	// Chat list
 	for i, chat := range k.chats {
@@ -963,8 +985,14 @@ func (c *kanbanColPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			if row >= 0 && row < len(c.tasks) {
 				switch btn {
 				case "delete":
-					os.Remove(c.tasks[row].Path)
+					if err := os.Remove(c.tasks[row].Path); err != nil {
+						if c.parent != nil {
+							c.parent.assignmentErr = fmt.Sprintf("delete task: %v", err)
+						}
+						return nil
+					}
 					if c.parent != nil {
+						c.parent.assignmentErr = ""
 						c.parent.reload()
 					}
 				case "reassign":
@@ -983,15 +1011,47 @@ func (c *kanbanColPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 					}
 				case "todo", "progress", "done":
 					task := c.tasks[row]
-					// If moving from progress to todo, notify the chat
-					if task.Status == "progress" && btn == "todo" && task.AssignedTo != "" {
-						writeTaskRemovedFromChat(c.parent.profile, task.AssignedTo, task.Title)
+					_, err := kanban.ReadTask(task.Path)
+					if err != nil {
+						if c.parent != nil {
+							c.parent.assignmentErr = fmt.Sprintf("read task: %v", err)
+						}
+						return nil
 					}
-					kanban.UpdateStatus(task.Path, btn)
+					statusPath := ""
+					var statusSnapshot statusSnapshot
+					if c.parent != nil && task.Status == "progress" && btn == "todo" && task.AssignedTo != "" {
+						statusPath = filepath.Join(paths.SessionDir(c.parent.profile, task.AssignedTo), "status.json")
+						statusSnapshot, err = readStatusSnapshot(statusPath)
+						if err == nil {
+							err = writeTaskRemovedFromChat(c.parent.profile, task.AssignedTo, task.Title)
+						}
+						if err != nil {
+							if c.parent != nil {
+								c.parent.assignmentErr = fmt.Sprintf("notify task removal: %v", err)
+							}
+							return nil
+						}
+					}
+
 					if btn == "todo" {
-						kanban.AssignTask(task.Path, "") // clear assignment
+						_, _, err = kanban.AssignTaskAndStatus(task.Path, "", btn)
+					} else {
+						_, err = kanban.UpdateStatus(task.Path, btn)
+					}
+					if err != nil {
+						if statusPath != "" {
+							if rollbackErr := restoreStatusSnapshot(statusPath, statusSnapshot); rollbackErr != nil {
+								err = fmt.Errorf("%w; restore chat status: %v", err, rollbackErr)
+							}
+						}
+						if c.parent != nil {
+							c.parent.assignmentErr = fmt.Sprintf("update task: %v", err)
+						}
+						return nil
 					}
 					if c.parent != nil {
+						c.parent.assignmentErr = ""
 						c.parent.reload()
 					}
 				default:
@@ -1129,15 +1189,100 @@ func (c *kanbanColPanel) hitTest(y, x int) (int, string) {
 
 // --- Helpers ---
 
+type statusSnapshot struct {
+	data   []byte
+	exists bool
+}
+
+func readStatusSnapshot(path string) (statusSnapshot, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return statusSnapshot{}, nil
+		}
+		return statusSnapshot{}, err
+	}
+	var status map[string]interface{}
+	if err := json.Unmarshal(data, &status); err != nil {
+		return statusSnapshot{}, err
+	}
+	return statusSnapshot{data: data, exists: true}, nil
+}
+
+func restoreStatusSnapshot(path string, snapshot statusSnapshot) error {
+	if !snapshot.exists {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return writeAtomicFile(path, snapshot.data, 0o644)
+}
+
+func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".automata-write-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func (k *KanbanPanel) assignTaskToChat(task kanban.Task, chat ChatInfo, status string) (tea.Cmd, error) {
+	statusPath := filepath.Join(paths.SessionDir(k.profile, chat.SessionID), "status.json")
+	snapshot, err := readStatusSnapshot(statusPath)
+	if err != nil {
+		return nil, fmt.Errorf("read chat status: %w", err)
+	}
+	previous, _, err := kanban.AssignTaskAndStatus(task.Path, chat.SessionID, status)
+	if err != nil {
+		return nil, fmt.Errorf("assign Kanban task %s: %w", task.Path, err)
+	}
+	if err := writeTaskToChatStatus(k.profile, chat.SessionID, task.Title, task.Path); err != nil {
+		rollbackErr := kanban.WriteTask(previous.Path, previous)
+		statusRollbackErr := restoreStatusSnapshot(statusPath, snapshot)
+		if rollbackErr != nil || statusRollbackErr != nil {
+			return nil, fmt.Errorf("write chat status: %w; rollback Kanban=%v status=%v", err, rollbackErr, statusRollbackErr)
+		}
+		return nil, fmt.Errorf("write chat status: %w", err)
+	}
+	if k.onTaskAssigned == nil {
+		return nil, nil
+	}
+	return k.onTaskAssigned(chat.SessionID, task.Title), nil
+}
+
 // writeTaskToChatStatus writes a task assignment to the chat's status.json
 // so the just-pi extension can pick it up on agent_end.
-func writeTaskToChatStatus(profile, sessionID, taskTitle, taskPath string) {
+func writeTaskToChatStatus(profile, sessionID, taskTitle, taskPath string) error {
 	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 
-	// Read existing status
 	var status map[string]interface{}
 	if data, err := os.ReadFile(statusPath); err == nil {
-		json.Unmarshal(data, &status)
+		if err := json.Unmarshal(data, &status); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	if status == nil {
 		status = make(map[string]interface{})
@@ -1148,18 +1293,24 @@ func writeTaskToChatStatus(profile, sessionID, taskTitle, taskPath string) {
 	status["substatus"] = ""
 	status["updatedAt"] = time.Now().Format(time.RFC3339)
 
-	os.MkdirAll(filepath.Dir(statusPath), 0755)
-	data, _ := json.MarshalIndent(status, "", "  ")
-	os.WriteFile(statusPath, data, 0644)
+	data, err := json.MarshalIndent(status, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomicFile(statusPath, data, 0o644)
 }
 
 // writeTaskRemovedFromChat notifies the chat that a task was removed from progress.
-func writeTaskRemovedFromChat(profile, sessionID, taskTitle string) {
+func writeTaskRemovedFromChat(profile, sessionID, taskTitle string) error {
 	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 
 	var status map[string]interface{}
 	if data, err := os.ReadFile(statusPath); err == nil {
-		json.Unmarshal(data, &status)
+		if err := json.Unmarshal(data, &status); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	if status == nil {
 		status = make(map[string]interface{})
@@ -1169,9 +1320,11 @@ func writeTaskRemovedFromChat(profile, sessionID, taskTitle string) {
 	status["substatus"] = ""
 	status["updatedAt"] = time.Now().Format(time.RFC3339)
 
-	os.MkdirAll(filepath.Dir(statusPath), 0755)
-	data, _ := json.MarshalIndent(status, "", "  ")
-	os.WriteFile(statusPath, data, 0644)
+	data, err := json.MarshalIndent(status, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomicFile(statusPath, data, 0o644)
 }
 
 type voidPanel struct{}

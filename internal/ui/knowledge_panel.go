@@ -45,6 +45,7 @@ func sessionDataPath(profile, sessionID string) string {
 type KnowledgePanel struct {
 	profile   string
 	sessionID string
+	domain    string
 	palette   apptheme.Theme
 
 	width        int
@@ -70,11 +71,13 @@ type KnowledgePanel struct {
 	// knowledgeWatcher observes status.json, plans.json and settings.json
 	// for the current session. The knowledge panel reacts to its events
 	// directly without relying on a periodic poll.
-	knowledgeWatcher *fsnotify.Watcher
+	knowledgeWatcher     *fsnotify.Watcher
+	knowledgeWatcherPath string
 
 	// jobsWatcher observes the per-session jobs/ directory so newly
 	// spawned or finished jobs surface in the right panel immediately.
-	jobsWatcher *fsnotify.Watcher
+	jobsWatcher     *fsnotify.Watcher
+	jobsWatcherPath string
 
 	// knowledgeWatchPending and jobsWatchPending guard against stacking
 	// multiple blocking watchJobsCmd/watchKnowledgeCmd Cmds.
@@ -112,6 +115,18 @@ func (k *KnowledgePanel) SetTheme(palette apptheme.Theme) {
 	k.palette = palette
 }
 
+// SetDomain sets the canonical tree-derived domain used for Kanban lookup.
+// Domain identity is never inferred from the session ID.
+func (k *KnowledgePanel) SetDomain(domain string) {
+	if k.domain == domain {
+		return
+	}
+	k.domain = domain
+	k.currentTask = ""
+	k.lastTaskRefresh = time.Time{}
+	k.refreshCurrentTask()
+}
+
 // SetSession switches the panel to a different session. Forces a refresh on
 // the next tick.
 func (k *KnowledgePanel) SetSession(sessionID string) {
@@ -140,6 +155,8 @@ func (k *KnowledgePanel) closeWatchers() {
 		_ = k.jobsWatcher.Close()
 		k.jobsWatcher = nil
 	}
+	k.knowledgeWatcherPath = ""
+	k.jobsWatcherPath = ""
 	k.knowledgeWatchPending = false
 	k.jobsWatchPending = false
 }
@@ -150,25 +167,48 @@ func (k *KnowledgePanel) Close() {
 }
 
 // setupWatchers attaches fsnotify watchers to the session directory (for
-// status/plans/settings) and to the jobs/ subdirectory. If either path is
-// missing we silently skip — knowledge or jobs may not exist yet for a
-// brand-new session, and the next relevant event from the watcher that did
-// attach will recreate the missing one (see attachJobsWatcherIfMissing).
+// status/plans/settings) and to the jobs/ subdirectory. Missing directories
+// are watched through their nearest existing parent, so creation is handled
+// by an event instead of a polling tick.
 func (k *KnowledgePanel) setupWatchers() {
-	sessionDir := sessionDataPath(k.profile, k.sessionID)
-	if sessionDir == "" {
+	if k.sessionID == "" {
 		return
 	}
-	if _, err := os.Stat(sessionDir); err == nil {
-		if w, err := fsnotify.NewWatcher(); err == nil {
-			if err := w.Add(sessionDir); err == nil {
-				k.knowledgeWatcher = w
-			} else {
-				w.Close()
-			}
+	k.attachKnowledgeWatcherIfMissing()
+	k.attachJobsWatcherIfMissing()
+}
+
+// attachKnowledgeWatcherIfMissing watches the session directory directly, or
+// the profile sessions directory until a new session directory appears.
+func (k *KnowledgePanel) attachKnowledgeWatcherIfMissing() {
+	if k.sessionID == "" {
+		return
+	}
+	sessionDir := sessionDataPath(k.profile, k.sessionID)
+	watchPath := sessionDir
+	if info, err := os.Stat(sessionDir); err != nil || !info.IsDir() {
+		watchPath = paths.SessionsDir(k.profile)
+		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+			return
 		}
 	}
-	k.attachJobsWatcherIfMissing()
+	if k.knowledgeWatcher != nil && k.knowledgeWatcherPath == watchPath {
+		return
+	}
+	if k.knowledgeWatcher != nil {
+		_ = k.knowledgeWatcher.Close()
+		k.knowledgeWatcher = nil
+	}
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return
+	}
+	if err := w.Add(watchPath); err != nil {
+		w.Close()
+		return
+	}
+	k.knowledgeWatcher = w
+	k.knowledgeWatcherPath = watchPath
 }
 
 // readSettings loads autoContinue and dual from settings.json.
@@ -261,8 +301,9 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 		// The session-level watcher fires both for status/plans/settings
 		// changes AND for the creation of the jobs/ subdirectory (which
 		// happens when a new chat boots before its first job). When that
-		// happens we must (re)attach the jobs watcher so subsequent job
-		// events reach the panel. Both reloads are cheap and idempotent.
+		// happens we must (re)attach both watchers so subsequent session and
+		// job events reach the panel. Both operations are idempotent.
+		k.attachKnowledgeWatcherIfMissing()
 		k.attachJobsWatcherIfMissing()
 		if d, err := k.contextReader.ReadForProfile(k.profile, k.sessionID); err == nil {
 			k.data = d
@@ -275,6 +316,8 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 		k.lastRefresh = time.Now()
 	case jobsChangedMsg:
 		k.jobsWatchPending = false
+		k.attachKnowledgeWatcherIfMissing()
+		k.attachJobsWatcherIfMissing()
 		// PruneStaleSession is the only place that flips running→exited in
 		// job.json. We deliberately do it before re-reading the list so the
 		// updated metadata is what the user sees.
@@ -298,26 +341,37 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 }
 
 // attachJobsWatcherIfMissing ensures the per-session jobs/ subdirectory has
-// an active fsnotify watcher. It is a no-op when the watcher is already
-// attached, when the session is unknown, or when the directory does not
-// exist yet (the next knowledgeChangedMsg will retry).
+// an active fsnotify watcher. Until jobs/ exists, the session directory is
+// watched so its creation is handled by the next event.
 func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
-	if k.sessionID == "" || k.jobsWatcher != nil {
+	if k.sessionID == "" {
 		return
 	}
 	jobsDir := filepath.Join(sessionDataPath(k.profile, k.sessionID), "jobs")
-	if _, err := os.Stat(jobsDir); err != nil {
+	watchPath := jobsDir
+	if info, err := os.Stat(jobsDir); err != nil || !info.IsDir() {
+		if _, err := os.Stat(sessionDataPath(k.profile, k.sessionID)); err != nil {
+			return
+		}
+		watchPath = sessionDataPath(k.profile, k.sessionID)
+	}
+	if k.jobsWatcher != nil && k.jobsWatcherPath == watchPath {
 		return
+	}
+	if k.jobsWatcher != nil {
+		_ = k.jobsWatcher.Close()
+		k.jobsWatcher = nil
 	}
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return
 	}
-	if err := w.Add(jobsDir); err != nil {
+	if err := w.Add(watchPath); err != nil {
 		w.Close()
 		return
 	}
 	k.jobsWatcher = w
+	k.jobsWatcherPath = watchPath
 }
 
 // watchKnowledgeCmd blocks on the session-level fsnotify watcher and
@@ -360,8 +414,7 @@ func (k *KnowledgePanel) refreshCurrentTask() {
 		return
 	}
 	k.lastTaskRefresh = time.Now()
-	// Derive domain from sessionID (remove last segment after last dot)
-	domain := domainOf(k.sessionID)
+	domain := k.domain
 	if domain == "" {
 		k.currentTask = ""
 		return
@@ -494,15 +547,4 @@ func (k *KnowledgePanel) View(width, height int) string {
 		lines = append(lines, strings.Repeat(" ", k.width))
 	}
 	return header + "\n" + strings.Join(lines, "\n")
-}
-
-// domainOf derives the same "domain" string that ai-knowledge uses to scope
-// notes. The domain is the session id without the trailing chat segment.
-func domainOf(sessionID string) string {
-	for i := len(sessionID) - 1; i >= 0; i-- {
-		if sessionID[i] == '.' {
-			return sessionID[:i]
-		}
-	}
-	return sessionID
 }

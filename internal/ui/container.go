@@ -37,8 +37,10 @@ type Container struct {
 	contextPanel   *ContextPanel
 
 	// State.
-	profile   string
-	planWidth int // fixed knowledge panel width in characters
+	profile        string
+	planWidth      int // fixed knowledge panel width in characters
+	chats          []ChatInfo
+	onTaskAssigned func(sessionID, taskTitle string) tea.Cmd
 
 	// Cached dimensions for border calculations.
 	width  int
@@ -117,6 +119,14 @@ func (c *Container) SetChat(terminal warp.Panel, sessionID string) {
 	c.innerTab.SetFocus(terminal)
 }
 
+// SetChatDomain sets the canonical tree-derived domain used by the
+// knowledge panel's Kanban lookup.
+func (c *Container) SetChatDomain(domain string) {
+	if c.knowledgePanel != nil {
+		c.knowledgePanel.SetDomain(domain)
+	}
+}
+
 // RenameSessionIDs updates the currently displayed chat and knowledge
 // panels after a tree rename. The caller has already stopped the emulators.
 func (c *Container) RenameSessionIDs(mapping map[string]string) {
@@ -133,11 +143,26 @@ func (c *Container) RenameSessionIDs(mapping map[string]string) {
 // RenameDomains updates the currently displayed folder context after a tree
 // rename. The caller has already moved the domain directories.
 func (c *Container) RenameDomains(mapping map[string]string) {
-	if c.contextPanel == nil {
+	if c.contextPanel != nil {
+		if newDomain, ok := mapping[c.contextPanel.domain]; ok {
+			c.contextPanel.SetDomain(newDomain)
+		}
+	}
+	if c.knowledgePanel != nil {
+		if newDomain, ok := mapping[c.knowledgePanel.domain]; ok {
+			c.knowledgePanel.SetDomain(newDomain)
+		}
+	}
+}
+
+// RenameSessionDomains applies per-session canonical domains after a rename
+// or cross-folder move. The map is keyed by the post-migration session ID.
+func (c *Container) RenameSessionDomains(domains map[string]string) {
+	if c.knowledgePanel == nil {
 		return
 	}
-	if newDomain, ok := mapping[c.contextPanel.domain]; ok {
-		c.contextPanel.SetDomain(newDomain)
+	if domain, ok := domains[c.knowledgePanel.sessionID]; ok {
+		c.knowledgePanel.SetDomain(domain)
 	}
 }
 
@@ -146,6 +171,8 @@ func (c *Container) SetFolder(folder *tree.Item) {
 	c.mode = FolderMode
 	if c.contextPanel == nil {
 		c.contextPanel = NewContextPanel(c.profile)
+		c.contextPanel.SetChats(c.chats)
+		c.contextPanel.SetOnTaskAssigned(c.onTaskAssigned)
 	}
 	c.contextPanel.SetTheme(c.palette)
 	c.contextPanel.SetDomain(folder.Domain(c.profile))
@@ -169,13 +196,15 @@ func (c *Container) SetTheme(palette apptheme.Theme) {
 
 // SetChats forwards the chat list to the context panel for the kanban picker.
 func (c *Container) SetChats(chats []ChatInfo) {
+	c.chats = append([]ChatInfo(nil), chats...)
 	if c.contextPanel != nil {
-		c.contextPanel.SetChats(chats)
+		c.contextPanel.SetChats(c.chats)
 	}
 }
 
 // SetOnTaskAssigned sets a callback for when a task is assigned to a chat.
-func (c *Container) SetOnTaskAssigned(fn func(sessionID, taskTitle string)) {
+func (c *Container) SetOnTaskAssigned(fn func(sessionID, taskTitle string) tea.Cmd) {
+	c.onTaskAssigned = fn
 	if c.contextPanel != nil {
 		c.contextPanel.SetOnTaskAssigned(fn)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/slug"
 	"github.com/HumanHorizon/automata/internal/status"
@@ -43,6 +45,11 @@ type App struct {
 	// inside ChatPanel tabs. Familiars are not part of Tree.ActiveSessions, but
 	// they still must be stopped before their owner session is migrated.
 	familiarEmulatorCache map[string]*portalis.Emulator
+
+	// runningSessions records emulators that reached PtyReady. It lets a
+	// failed tree move restore real PTYs without starting test-only cached
+	// emulator values that were never running.
+	runningSessions map[string]struct{}
 
 	// startEmulatorSync is injectable so Clear can be tested without
 	// starting a real pi process.
@@ -88,6 +95,10 @@ type App struct {
 	// tree callbacks. The plan is consumed after the state snapshot succeeds.
 	pendingMovePlans map[*tree.Item]*renamePlan
 
+	// pendingRuntimeCmds carries PTY restart/listen commands from a move
+	// rollback into Bubble Tea's command pipeline.
+	pendingRuntimeCmds []tea.Cmd
+
 	// Root overlays are rendered by App.View so Help and Settings cover the
 	// complete Automata viewport instead of only the Tree panel.
 	appModal   *warp.Modal
@@ -108,26 +119,29 @@ func newApp(profile, piAgentDir string) (a *App) {
 
 	container := ui.NewContainer(tp)
 	container.SetProfile(profile)
-	container.SetOnTaskAssigned(func(sessionID, taskTitle string) {
-		// Ensure emulator is running for this chat
-		if _, ok := a.emulatorCache[sessionID]; !ok {
-			em := a.createChatEmulator(sessionID)
-			if em == nil {
-				return
-			}
-			// Start synchronously so the PTY is ready immediately. The env is
-			// already recorded on the emulator via SetStartEnv.
-			if err := em.StartSync(nil); err != nil {
-				return
-			}
-			a.emulatorCache[sessionID] = em
-			a.activeSessions[sessionID] = struct{}{}
-			a.tree.SetActiveSessions(a.activeSessions)
-			// Start listening for output
-			if cmd := em.Listen(); cmd != nil {
-				_ = cmd
-			}
+	container.SetOnTaskAssigned(func(sessionID, taskTitle string) tea.Cmd {
+		// Ensure the emulator is running for this chat. The returned Listen
+		// command must reach Bubble Tea; dropping it leaves the PTY silent.
+		if _, ok := a.emulatorCache[sessionID]; ok {
+			return nil
 		}
+		em := a.createChatEmulator(sessionID)
+		if em == nil {
+			return nil
+		}
+		// Start synchronously so the PTY is ready immediately. The env is
+		// already recorded on the emulator via SetStartEnv.
+		if err := em.StartSync(nil); err != nil {
+			return nil
+		}
+		a.emulatorCache[sessionID] = em
+		if a.runningSessions == nil {
+			a.runningSessions = make(map[string]struct{})
+		}
+		a.runningSessions[sessionID] = struct{}{}
+		a.activeSessions[sessionID] = struct{}{}
+		a.tree.SetActiveSessions(a.activeSessions)
+		return em.Listen()
 	})
 
 	w.SetTabPosition(warp.TabNone)
@@ -181,6 +195,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 			return a.createFamiliarEmulator(familiarID)
 		})
 		container.SetChat(cp, sessionID)
+		container.SetChatDomain(item.Domain(profile))
 	})
 
 	t.SetOnSelectFolder(func(item *tree.Item) {
@@ -239,6 +254,10 @@ func newApp(profile, piAgentDir string) (a *App) {
 		}
 	})
 
+	t.SetOnBeforeDelete(func(item *tree.Item) error {
+		return a.cleanupDeletedTreeItem(item)
+	})
+
 	container.SetOnPlanWidthChange(func(w int) {
 		t.SetPlanWidth(w)
 		t.SaveState()
@@ -254,6 +273,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 		activeSessions:        make(map[string]struct{}),
 		emulatorCache:         make(map[string]*portalis.Emulator),
 		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		runningSessions:       make(map[string]struct{}),
 		profile:               profile,
 		piAgentDir:            piAgentDir,
 		statusReader:          status.NewCachedReader(profile),
@@ -322,7 +342,21 @@ func (a *App) updateChatList(folder *tree.Item) {
 	a.container.SetChats(chats)
 }
 
-func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
+	defer func() {
+		if len(a.pendingRuntimeCmds) == 0 {
+			return
+		}
+		pending := append([]tea.Cmd(nil), a.pendingRuntimeCmds...)
+		a.pendingRuntimeCmds = nil
+		commands := make([]tea.Cmd, 0, len(pending)+1)
+		commands = append(commands, pending...)
+		if command != nil {
+			commands = append(commands, command)
+		}
+		command = tea.Batch(commands...)
+	}()
+
 	// PTY output must return to the emulator that started the listen command,
 	// even when its chat is no longer part of the visible Warp tree. Otherwise
 	// the pull-based Listen chain stops and the PTY output queue eventually
@@ -712,6 +746,7 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 	if _, isExit := msg.(portalis.PtyExitMsg); isExit {
 		if _, isFamiliar := a.familiarEmulatorCache[sessionID]; isFamiliar {
 			delete(a.familiarEmulatorCache, sessionID)
+			delete(a.runningSessions, sessionID)
 			delete(a.activeSessions, sessionID)
 			if a.tree != nil {
 				a.tree.SetActiveSessions(a.activeSessions)
@@ -721,6 +756,7 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 		}
 		if _, isCached := a.emulatorCache[sessionID]; isCached {
 			delete(a.emulatorCache, sessionID)
+			delete(a.runningSessions, sessionID)
 			delete(a.activeSessions, sessionID)
 			if a.tree != nil {
 				a.tree.SetActiveSessions(a.activeSessions)
@@ -742,6 +778,12 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 		return nil, false
 	}
 
+	if _, isReady := msg.(portalis.PtyReadyMsg); isReady {
+		if a.runningSessions == nil {
+			a.runningSessions = make(map[string]struct{})
+		}
+		a.runningSessions[sessionID] = struct{}{}
+	}
 	if _, isReady := msg.(portalis.PtyReadyMsg); isReady && !isFamiliar {
 		if a.activeSessions == nil {
 			a.activeSessions = make(map[string]struct{})
@@ -857,6 +899,93 @@ func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.
 		}
 		return nil
 	}
+}
+
+func deletedSessionIDs(t *tree.Tree, item *tree.Item) map[string]struct{} {
+	ids := make(map[string]struct{})
+	var visit func(*tree.Item)
+	visit = func(current *tree.Item) {
+		if current == nil {
+			return
+		}
+		if !current.IsFolder {
+			ids[t.SessionKeyOf(current)] = struct{}{}
+		}
+		for _, child := range current.Children {
+			visit(child)
+		}
+	}
+	visit(item)
+	return ids
+}
+
+// cleanupDeletedTreeItem stops every runtime owned by a deleted chat or folder
+// subtree before the tree state is persisted. Any failure aborts deletion so
+// the tree cannot claim a runtime that was not safely cleaned up.
+func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
+	if a.tree == nil || item == nil {
+		return nil
+	}
+	ids := deletedSessionIDs(a.tree, item)
+	var firstErr error
+	for ownerID := range ids {
+		if em, ok := a.emulatorCache[ownerID]; ok {
+			if em != nil {
+				em.Stop()
+			}
+			delete(a.emulatorCache, ownerID)
+		}
+		if w, ok := a.sessionWatchers[ownerID]; ok {
+			_ = w.Close()
+			delete(a.sessionWatchers, ownerID)
+		}
+		delete(a.sessionWatchPending, ownerID)
+		if err := akjobs.KillSessionForProfile(a.profile, ownerID); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("stop jobs for %s: %w", ownerID, err)
+		}
+		for sessionID := range a.activeSessions {
+			if sessionID == ownerID || strings.HasPrefix(sessionID, ownerID+"__") {
+				delete(a.activeSessions, sessionID)
+			}
+		}
+		for sessionID, em := range a.familiarEmulatorCache {
+			if sessionID != ownerID && !strings.HasPrefix(sessionID, ownerID+"__") {
+				continue
+			}
+			if em != nil {
+				em.Stop()
+			}
+			delete(a.familiarEmulatorCache, sessionID)
+		}
+	}
+	if a.container != nil {
+		if panel := a.container.Active(); panel != nil {
+			if cp, ok := panel.(*ui.ChatPanel); ok {
+				for _, session := range cp.Sessions() {
+					em := session.Em()
+					if em == nil {
+						continue
+					}
+					for ownerID := range ids {
+						if em.SessionID == ownerID || strings.HasPrefix(em.SessionID, ownerID+"__") {
+							em.Stop()
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	if a.currentSessionID != "" {
+		for ownerID := range ids {
+			if a.currentSessionID == ownerID || strings.HasPrefix(a.currentSessionID, ownerID+"__") {
+				a.currentSessionID = ""
+				break
+			}
+		}
+	}
+	a.tree.SetActiveSessions(a.activeSessions)
+	return firstErr
 }
 
 // closeFamiliarCmd cleans up after the user confirms closing a familiar:
@@ -1148,10 +1277,10 @@ func (a *App) Close() {
 		}
 		delete(a.familiarEmulatorCache, key)
 	}
-	a.activeSessions = make(map[string]struct{})
-	if a.tree != nil {
-		a.tree.SetActiveSessions(a.activeSessions)
-	}
+	a.runningSessions = make(map[string]struct{})
+	// Keep activeSessions persisted: restoreSessions uses this snapshot on
+	// the next launch. Runtime emulators are stopped above, but shutdown must
+	// not erase the restore contract.
 	if a.container != nil {
 		a.container.Close()
 	}

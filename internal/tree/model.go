@@ -180,6 +180,10 @@ type Tree struct {
 	// Callback when the user requests to stop an active session
 	onStopSession func(*Item)
 
+	// Callback before an item (or folder subtree) is deleted. Returning an
+	// error aborts the tree mutation so runtime cleanup can fail closed.
+	onBeforeDelete func(*Item) error
+
 	// Callback fired after the active theme changes.
 	onThemeChange func(string)
 
@@ -711,26 +715,11 @@ func (f *Item) Path() []string {
 //	profile "human-horizon", root chat "chat1" → "human-horizon"
 //	no profile, folder "Projects" → "projects"
 func (f *Item) Domain(profile string) string {
-	var parts []string
-	p := f
-	for p != nil {
-		if p.IsFolder {
-			parts = append([]string{slug.Slug(p.Name)}, parts...)
-		}
-		p = p.parent
+	folders := f.Path()
+	if f.IsFolder {
+		folders = append(folders, f.Name)
 	}
-	profilePart := ""
-	if profile != "" {
-		profilePart = paths.ProfileSlug(profile)
-	}
-	if len(parts) == 0 {
-		return profilePart
-	}
-	folderPart := strings.Join(parts, ".")
-	if profilePart == "" {
-		return folderPart
-	}
-	return profilePart + "__" + folderPart
+	return paths.DomainID(profile, folders)
 }
 
 // Icon returns the display icon for the item.
@@ -989,6 +978,15 @@ func (t *Tree) siblings(item *Item) []*Item {
 }
 
 func (t *Tree) deleteItem(item *Item) {
+	if item == nil {
+		return
+	}
+	if t.onBeforeDelete != nil {
+		if err := t.onBeforeDelete(item); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "Failed to delete tree item:", err)
+			return
+		}
+	}
 	if item.parent != nil {
 		parent := item.parent
 		for i, child := range parent.Children {
@@ -1541,6 +1539,12 @@ func (t *Tree) SetOnSelectFolder(fn func(*Item)) {
 // SetOnStopSession sets the callback invoked when the user stops a session.
 func (t *Tree) SetOnStopSession(fn func(*Item)) {
 	t.onStopSession = fn
+}
+
+// SetOnBeforeDelete sets the callback invoked before deleting an item or
+// folder subtree. Returning an error keeps the tree unchanged.
+func (t *Tree) SetOnBeforeDelete(fn func(*Item) error) {
+	t.onBeforeDelete = fn
 }
 
 // SetOnThemeChange registers a callback invoked after a theme is selected.

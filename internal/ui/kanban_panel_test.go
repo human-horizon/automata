@@ -12,6 +12,110 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+func TestAssignTaskToChatReturnsListenCommandAndWritesBothRecords(t *testing.T) {
+	profile := "Assignment Profile"
+	domain := "assignment-domain"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	taskDir := kanban.KanbanDir(domain, profile)
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	taskPath := filepath.Join(taskDir, "task.md")
+	if err := os.WriteFile(taskPath, []byte("---\ntitle: Build\nstatus: todo\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "assignment-profile__chat"
+	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statusPath, []byte(`{"existing":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	k := NewKanbanPanel(profile)
+	k.onTaskAssigned = func(gotSessionID, gotTitle string) tea.Cmd {
+		if gotSessionID != sessionID || gotTitle != "Build" {
+			t.Errorf("callback payload = %q/%q", gotSessionID, gotTitle)
+		}
+		return func() tea.Msg { return "listen" }
+	}
+	task, err := kanban.ReadTask(taskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := k.assignTaskToChat(task, ChatInfo{SessionID: sessionID}, "progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd == nil {
+		t.Fatal("assignment dropped the callback command")
+	}
+	if got := cmd(); got != "listen" {
+		t.Fatalf("callback command result = %v, want listen", got)
+	}
+	updated, err := kanban.ReadTask(taskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AssignedTo != sessionID || updated.Status != "progress" {
+		t.Fatalf("updated task = %+v", updated)
+	}
+	statusData, err := os.ReadFile(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(statusData), `"task_title": "Build"`) {
+		t.Fatalf("status.json did not contain assignment: %s", statusData)
+	}
+}
+
+func TestAssignTaskToChatFailsBeforeCallbackOnInvalidStatus(t *testing.T) {
+	profile := "Assignment Failure Profile"
+	domain := "assignment-failure"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	taskDir := kanban.KanbanDir(domain, profile)
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	taskPath := filepath.Join(taskDir, "task.md")
+	if err := os.WriteFile(taskPath, []byte("---\ntitle: Build\nstatus: todo\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "assignment-failure-profile__chat"
+	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statusPath, []byte("not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	k := NewKanbanPanel(profile)
+	k.onTaskAssigned = func(string, string) tea.Cmd {
+		called = true
+		return nil
+	}
+	task, err := kanban.ReadTask(taskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.assignTaskToChat(task, ChatInfo{SessionID: sessionID}, "progress"); err == nil {
+		t.Fatal("invalid status.json did not fail assignment")
+	}
+	if called {
+		t.Fatal("assignment callback ran after failed durable status write")
+	}
+	unchanged, err := kanban.ReadTask(taskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.AssignedTo != "" || unchanged.Status != "todo" {
+		t.Fatalf("Kanban task mutated after failed assignment: %+v", unchanged)
+	}
+}
+
 func TestTaskStatusWritesUseExplicitProfilePath(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	profile := "Profile Ω"
@@ -34,6 +138,50 @@ func TestTaskStatusWritesUseExplicitProfilePath(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"action": "task_removed"`) {
 		t.Fatalf("removed status = %s", data)
+	}
+}
+
+func TestKanbanPanelLateAttachesWatcherWhenDirectoryAppears(t *testing.T) {
+	profile := "kanban-late-watch"
+	domain := "late-domain"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	k := NewKanbanPanel(profile)
+	defer k.Close()
+	k.SetDomain(domain)
+
+	kanbanDir := kanban.KanbanDir(domain, profile)
+	if k.watcher == nil || k.watcherPath != filepath.Dir(kanbanDir) {
+		t.Fatalf("missing-kanban watcher = %q, want domain parent %q", k.watcherPath, filepath.Dir(kanbanDir))
+	}
+	cmd := k.watchKanbanCmd()
+	if cmd == nil {
+		t.Fatal("missing-kanban watch command is nil")
+	}
+	messages := make(chan tea.Msg, 1)
+	go func() { messages <- cmd() }()
+	if err := os.MkdirAll(kanbanDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-messages:
+		if _, ok := msg.(kanbanChangedMsg); !ok {
+			t.Fatalf("kanban creation message = %T", msg)
+		}
+		k.Update(msg)
+	case <-time.After(2 * time.Second):
+		t.Fatal("domain watcher did not observe late kanban creation")
+	}
+	if k.watcherPath != kanbanDir {
+		t.Fatalf("late watcher path = %q, want %q", k.watcherPath, kanbanDir)
+	}
+
+	taskPath := filepath.Join(kanbanDir, "late.md")
+	if err := os.WriteFile(taskPath, []byte("---\ntitle: Late\nstatus: todo\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	k.Update(kanbanChangedMsg{})
+	if len(k.tasks) != 1 || k.tasks[0].Title != "Late" {
+		t.Fatalf("tasks after late watcher attach = %+v", k.tasks)
 	}
 }
 
