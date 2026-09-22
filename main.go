@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -11,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/slug"
 	"github.com/HumanHorizon/automata/internal/status"
@@ -54,6 +52,10 @@ type App struct {
 	// startEmulatorSync is injectable so Clear can be tested without
 	// starting a real pi process.
 	startEmulatorSyncFn func(*portalis.Emulator, []string) error
+
+	// killSessionFn is injectable so lifecycle tests can force job-stop
+	// failures without touching real job processes.
+	killSessionFn func(profile, sessionID string) error
 
 	// mouseEnabled toggles mouse capture. When disabled, mouse events are
 	// not captured, allowing text selection in the terminal. Toggle with F8.
@@ -230,6 +232,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 		delete(a.pendingMovePlans, item)
 		if plan != nil {
 			a.applyRenameMappings(plan)
+			a.finalizeRenamePlan(plan)
 		}
 	})
 
@@ -242,15 +245,12 @@ func newApp(profile, piAgentDir string) (a *App) {
 		if profile != "" {
 			sessionID = slug.Slug(profile) + "__" + sessionID
 		}
-		if em, ok := a.emulatorCache[sessionID]; ok {
-			em.Stop()
-		}
-		delete(a.activeSessions, sessionID)
-		a.tree.SetActiveSessions(a.activeSessions)
-
-		// Kill all running jobs for this session.
-		if path, err := exec.LookPath("ai-knowledge"); err == nil {
-			exec.Command(path, "kill-session", sessionID).Run()
+		if err := a.stopSessionRuntime(sessionID, stopSessionOptions{
+			stopJobs:        true,
+			stopFamiliars:   true,
+			persistInactive: true,
+		}); err != nil {
+			log.Printf("automata: stop session %s: %v", sessionID, err)
 		}
 	})
 
@@ -744,25 +744,11 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 	}
 
 	if _, isExit := msg.(portalis.PtyExitMsg); isExit {
-		if _, isFamiliar := a.familiarEmulatorCache[sessionID]; isFamiliar {
-			delete(a.familiarEmulatorCache, sessionID)
-			delete(a.runningSessions, sessionID)
-			delete(a.activeSessions, sessionID)
-			if a.tree != nil {
-				a.tree.SetActiveSessions(a.activeSessions)
-			}
+		_, cachedChat := a.emulatorCache[sessionID]
+		_, cachedFamiliar := a.familiarEmulatorCache[sessionID]
+		if cachedChat || cachedFamiliar {
+			_ = a.stopSessionRuntime(sessionID, stopSessionOptions{persistInactive: true})
 			// Let the active ChatPanel remove the dead tab and keep polling.
-			return nil, false
-		}
-		if _, isCached := a.emulatorCache[sessionID]; isCached {
-			delete(a.emulatorCache, sessionID)
-			delete(a.runningSessions, sessionID)
-			delete(a.activeSessions, sessionID)
-			if a.tree != nil {
-				a.tree.SetActiveSessions(a.activeSessions)
-			}
-			// The active panel still owns the exit message and can render its
-			// stopped state; the cache must not retain the dead emulator.
 			return nil, false
 		}
 	}
@@ -830,20 +816,16 @@ func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.
 			return nil
 		}
 
-		// 0. Kill this session's familiars (stop emulators + delete their JSONL).
-		// Order: stop emulators first, then delete JSONL, then clear familiars.json
-		// so that a still-running familiar cannot rewrite familiars.json after we
-		// cleared it.
-		for _, sid := range familiarSIDs {
-			if em, ok := a.emulatorCache[sid]; ok {
-				em.Stop()
-				delete(a.emulatorCache, sid)
-			}
-			if em, ok := a.familiarEmulatorCache[sid]; ok {
-				em.Stop()
-				delete(a.familiarEmulatorCache, sid)
-			}
-			delete(a.activeSessions, sid)
+		// Stop the owner, its familiars, jobs, caches, watchers, and runtime
+		// state through the canonical lifecycle kernel before deleting JSONL.
+		if err := a.stopSessionRuntime(sessionID, stopSessionOptions{
+			stopJobs:           true,
+			stopFamiliars:      true,
+			persistInactive:    true,
+			familiarSessionIDs: familiarSIDs,
+		}); err != nil {
+			log.Printf("clearSession: %v", err)
+			return nil
 		}
 		for _, sid := range familiarSIDs {
 			if deleted, err := paths.DeleteSessionJSONL(sid, cwd, agentDir); err != nil {
@@ -856,14 +838,7 @@ func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.
 			log.Printf("clearSession: clear familiars.json: %v", err)
 		}
 
-		// 1. Stop and dispose the running emulator
-		if em, ok := a.emulatorCache[sessionID]; ok {
-			em.Stop()
-			delete(a.emulatorCache, sessionID)
-		}
-		delete(a.activeSessions, sessionID)
-
-		// 2. Delete the .jsonl file for this session (scoped to agentDir)
+		// Delete the .jsonl file for this session (scoped to agentDir)
 		deleted, err := paths.DeleteSessionJSONL(sessionID, cwd, agentDir)
 		if err != nil {
 			log.Printf("clearSession: %v", err)
@@ -871,7 +846,7 @@ func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.
 			log.Printf("clearSession: deleted %s", deleted)
 		}
 
-		// 3. Recreate the emulator with the same session id so pi starts fresh
+		// Recreate the emulator with the same session id so pi starts fresh
 		newEm := a.createChatEmulator(sessionID)
 		if newEm != nil {
 			if err := a.startEmulatorSync(newEm, nil); err != nil {
@@ -920,72 +895,32 @@ func deletedSessionIDs(t *tree.Tree, item *tree.Item) map[string]struct{} {
 }
 
 // cleanupDeletedTreeItem stops every runtime owned by a deleted chat or folder
-// subtree before the tree state is persisted. Any failure aborts deletion so
-// the tree cannot claim a runtime that was not safely cleaned up.
+// subtree before the tree state is persisted. Job-stop failures are returned
+// before any emulator/cache mutation, so Tree deletion cannot leave a
+// half-cleaned runtime behind.
 func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
 	if a.tree == nil || item == nil {
 		return nil
 	}
 	ids := deletedSessionIDs(a.tree, item)
-	var firstErr error
-	for ownerID := range ids {
-		if em, ok := a.emulatorCache[ownerID]; ok {
-			if em != nil {
-				em.Stop()
-			}
-			delete(a.emulatorCache, ownerID)
-		}
-		if w, ok := a.sessionWatchers[ownerID]; ok {
-			_ = w.Close()
-			delete(a.sessionWatchers, ownerID)
-		}
-		delete(a.sessionWatchPending, ownerID)
-		if err := akjobs.KillSessionForProfile(a.profile, ownerID); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("stop jobs for %s: %w", ownerID, err)
-		}
-		for sessionID := range a.activeSessions {
-			if sessionID == ownerID || strings.HasPrefix(sessionID, ownerID+"__") {
-				delete(a.activeSessions, sessionID)
-			}
-		}
-		for sessionID, em := range a.familiarEmulatorCache {
-			if sessionID != ownerID && !strings.HasPrefix(sessionID, ownerID+"__") {
-				continue
-			}
-			if em != nil {
-				em.Stop()
-			}
-			delete(a.familiarEmulatorCache, sessionID)
+	owners := make([]string, 0, len(ids))
+	for sessionID := range ids {
+		owners = append(owners, sessionID)
+	}
+	if err := a.stopSessionRuntimeIDs(owners, stopSessionOptions{
+		stopJobs:        true,
+		stopFamiliars:   true,
+		persistInactive: true,
+	}); err != nil {
+		return err
+	}
+	for _, ownerID := range owners {
+		if a.currentSessionID == ownerID || strings.HasPrefix(a.currentSessionID, ownerID+"__") {
+			a.currentSessionID = ""
+			break
 		}
 	}
-	if a.container != nil {
-		if panel := a.container.Active(); panel != nil {
-			if cp, ok := panel.(*ui.ChatPanel); ok {
-				for _, session := range cp.Sessions() {
-					em := session.Em()
-					if em == nil {
-						continue
-					}
-					for ownerID := range ids {
-						if em.SessionID == ownerID || strings.HasPrefix(em.SessionID, ownerID+"__") {
-							em.Stop()
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-	if a.currentSessionID != "" {
-		for ownerID := range ids {
-			if a.currentSessionID == ownerID || strings.HasPrefix(a.currentSessionID, ownerID+"__") {
-				a.currentSessionID = ""
-				break
-			}
-		}
-	}
-	a.tree.SetActiveSessions(a.activeSessions)
-	return firstErr
+	return nil
 }
 
 // closeFamiliarCmd cleans up after the user confirms closing a familiar:
@@ -995,19 +930,20 @@ func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
 func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) {
 	log.Printf("closeFamiliar: start familiarID=%q em=%v profile=%q activeChat=%q",
 		familiarID, em != nil, a.profile, a.activeChatSessionID())
-	// 1. Stop the emulator. ChatPanel may have already stopped it,
-	// but Stop is safe to call twice.
+	// Stop the familiar and its jobs through the canonical lifecycle kernel.
+	// A failed destructive job check leaves the runtime intact.
+	if err := a.stopSessionRuntime(familiarID, stopSessionOptions{
+		stopJobs:        true,
+		persistInactive: true,
+	}); err != nil {
+		log.Printf("closeFamiliar: stop runtime %q: %v", familiarID, err)
+		return
+	}
 	if em != nil {
 		em.Stop()
 	}
-	delete(a.emulatorCache, familiarID)
-	delete(a.familiarEmulatorCache, familiarID)
-	delete(a.activeSessions, familiarID)
-	if a.tree != nil {
-		a.tree.SetActiveSessions(a.activeSessions)
-	}
 
-	// 2. Drop the familiar's JSONL. If it doesn't exist (or pi never
+	// Drop the familiar's JSONL. If it doesn't exist (or pi never
 	// wrote one), we log but don't fail the close.
 	if em != nil {
 		cwd := em.CWD()
@@ -1016,7 +952,7 @@ func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) {
 		}
 	}
 
-	// 3. Strip the entry from familiars.json so the next poll doesn't
+	// Strip the entry from familiars.json so the next poll doesn't
 	// resurrect it.
 	if err := paths.RemoveFamiliar(a.profile, a.activeChatSessionID(), familiarID); err != nil {
 		log.Printf("closeFamiliar: remove from familiars.json: %v", err)
@@ -1265,19 +1201,7 @@ func (a *App) Close() {
 		delete(a.sessionWatchers, key)
 	}
 	a.statusWatchPending = false
-	for key, em := range a.emulatorCache {
-		if em != nil {
-			em.Stop()
-		}
-		delete(a.emulatorCache, key)
-	}
-	for key, em := range a.familiarEmulatorCache {
-		if em != nil {
-			em.Stop()
-		}
-		delete(a.familiarEmulatorCache, key)
-	}
-	a.runningSessions = make(map[string]struct{})
+	a.stopAllRuntimeSessions(false)
 	// Keep activeSessions persisted: restoreSessions uses this snapshot on
 	// the next launch. Runtime emulators are stopped above, but shutdown must
 	// not erase the restore contract.

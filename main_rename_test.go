@@ -399,8 +399,21 @@ func TestMoveChatReusesRenameMigrationWithoutMovingDomain(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	targetTaskPath := filepath.Join(paths.DomainDir(profile, targetDomain), "kanban", "task-for-a.md")
+	jobStops := make([]string, 0, 2)
+	app.killSessionFn = func(_, sessionID string) error {
+		if _, err := os.Stat(targetTaskPath); err != nil {
+			t.Errorf("job stop for %s happened before task migration: %v", sessionID, err)
+		}
+		jobStops = append(jobStops, sessionID)
+		return nil
+	}
+
 	app.tree.MoveItem(chatA, target)
 
+	if len(jobStops) != 2 {
+		t.Fatalf("job stops = %v, want chat and familiar after filesystem commit", jobStops)
+	}
 	if got := app.tree.SessionKeyOf(chatA); got != newAID {
 		t.Fatalf("chat-a session ID = %q, want %q", got, newAID)
 	}
@@ -417,17 +430,16 @@ func TestMoveChatReusesRenameMigrationWithoutMovingDomain(t *testing.T) {
 	if err != nil || string(gotNotes) != "source notes" {
 		t.Fatalf("source notes disappeared: err=%v notes=%q", err, gotNotes)
 	}
-	if _, err := os.Stat(paths.DomainDir(profile, targetDomain)); !os.IsNotExist(err) {
-		t.Fatalf("single-chat move created or moved a whole target domain: %v", err)
+	gotTargetTask, err := os.ReadFile(targetTaskPath)
+	if err != nil || !strings.Contains(string(gotTargetTask), "assigned_to: "+newAID) {
+		t.Fatalf("assigned task was not migrated to target domain: err=%v data=%q", err, gotTargetTask)
 	}
-	for name, want := range map[string]string{
-		"task-for-a.md": "assigned_to: " + newAID,
-		"task-for-b.md": "assigned_to: " + oldBID,
-	} {
-		data, readErr := os.ReadFile(filepath.Join(paths.DomainDir(profile, sourceDomain), "kanban", name))
-		if readErr != nil || !strings.Contains(string(data), want) {
-			t.Fatalf("task %s assignment changed incorrectly: err=%v data=%q", name, readErr, data)
-		}
+	if _, err := os.Stat(filepath.Join(paths.DomainDir(profile, sourceDomain), "kanban", "task-for-a.md")); !os.IsNotExist(err) {
+		t.Fatalf("assigned task remains in source domain: %v", err)
+	}
+	remainingTask, err := os.ReadFile(filepath.Join(paths.DomainDir(profile, sourceDomain), "kanban", "task-for-b.md"))
+	if err != nil || !strings.Contains(string(remainingTask), "assigned_to: "+oldBID) {
+		t.Fatalf("unrelated task assignment changed: err=%v data=%q", err, remainingTask)
 	}
 	gotJSONL, err := os.ReadFile(jsonlPath)
 	if err != nil || !strings.Contains(string(gotJSONL), newAID) {

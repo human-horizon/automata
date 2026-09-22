@@ -11,8 +11,8 @@
 ### P0 — целостность и потеря работоспособности
 
 1. **Циклы дерева.** `moveItem` и все клавиатурные/мышиные пути перемещения отклоняют перемещение элемента в себя или в любого потомка. При отказе дерево, выделение и `state.json` не меняются; рекурсивный обход не может уйти в бесконечность.
-2. **Жизненный цикл процесса.** Эмулятор и сессия считаются активными только после успешного запуска/`PtyReadyMsg`. Ошибка запуска, остановка и `PtyExitMsg` очищают соответствующий cache и `activeSessions`; завершившийся эмулятор никогда не переиспользуется. Для familiar сохраняется передача exit-события в `ChatPanel`, чтобы вкладка удалилась штатно.
-3. **Пути rename/move.** Перемещение между родителями меняет session ID/domain ID и переносит те же session directories, domain data, JSONL, familiars и Kanban assignments, что и rename. Используется существующая миграция из `main_rename.go`; ручной небезопасный `os.Rename` не дублируется. Проверка/миграция выполняются до фиксации изменения дерева либо имеют проверяемый rollback: ошибка не оставляет дерево и данные в разных состояниях. Перемещение наружу (`MoveSelectedOut`) проходит тот же путь.
+2. **Жизненный цикл процесса.** Эмулятор и сессия считаются активными только после успешного запуска/`PtyReadyMsg`. Ошибка запуска, остановка и `PtyExitMsg` очищают соответствующий cache, `runningSessions` и `activeSessions`; завершившийся эмулятор никогда не переиспользуется. Остановка, clear, close familiar, удаление и rename/move используют единое runtime-stop ядро; job records останавливаются через внутренний профильный API, а неизвестная PID-идентичность блокирует сигнал и запись `exited`. Для familiar сохраняется передача exit-события в `ChatPanel`, чтобы вкладка удалилась штатно.
+3. **Пути rename/move.** Перемещение между родителями меняет session ID/domain ID и переносит те же session directories, domain data, JSONL, familiars и Kanban assignments, что и rename. Назначенные Kanban-файлы при переносе одного чата физически переходят в `target-domain/kanban`, а collision проверяется до первой мутации; чужие задачи остаются на месте. Используется существующая миграция из `main_rename.go`; ручной небезопасный `os.Rename` не дублируется. Проверка/миграция выполняются до фиксации изменения дерева либо имеют проверяемый rollback: ошибка не оставляет дерево и данные в разных состояниях. Job SIGTERM не выполняется до filesystem commit; после успешного commit остановка jobs не откатывает уже зафиксированное дерево. Перемещение наружу (`MoveSelectedOut`) проходит тот же путь.
 4. **Lifecycle Bubble Tea.** Не добавлять собственные signal handlers и `os.Exit`/`log.Fatal` для завершения приложения. `Ctrl+C` и штатное завершение используют Bubble Tea (`tea.Quit`/возврат из `Run`); все PTY и fsnotify-ресурсы закрываются через явный lifecycle cleanup после `Run` и при замене владельца.
 
 ### P1 — устойчивость и корректность данных
@@ -25,7 +25,7 @@
 
 ### P2 — воспроизводимость и контроль регрессий
 
-10. **CI и воспроизводимая сборка.** Удалить зависимость `go.mod` от локальных `../../Starframe/...` путей. Внешние `portalis`, `cue-tty` и `warp` фиксируются immutable-версиями/commit-псевдоверсиями; чистый checkout не зависит от `/Users/a/Space`. CI выполняет форматирование, vet, тесты, сборку и `go mod verify`. Две сборки одинакового исходного checkout с `-trimpath -buildvcs=false` и одинаковым Go toolchain дают одинаковый SHA-256.
+10. **CI и воспроизводимая сборка.** Удалить зависимость `go.mod` от локальных `../../Starframe/...` путей. Внешние `portalis`, `cue-tty` и `warp` фиксируются immutable-версиями/commit-псевдоверсиями; чистый checkout не зависит от `/Users/a/Space`. CI выполняет форматирование, vet, тесты, сборку и `go mod verify`, собирает тестовый бинарник в `$RUNNER_TEMP`, направляет диагностические E2E artifacts в `$RUNNER_TEMP` и завершается только на чистом checkout. Две сборки одинакового исходного checkout с `-trimpath -buildvcs=false` и одинаковым Go toolchain дают одинаковый SHA-256 в каталоге runner temp.
 11. **Документация и бинарник.** После каждой ошибки обновляется `CONTEXT.md` строкой формата `[ДАТА] Проблема: X → Решение: Y`. Коммиты не создаются. После полной проверки бинарник собирается в проекте, его тип/hash проверяются, а уже запущенные Automata/zellij-процессы перезапускаются штатным способом; содержимое пользовательского tracked-бинарника до этого сохраняется.
 
 ## 3. Технические ограничения
@@ -42,8 +42,8 @@
 Минимальный набор:
 
 - `internal/tree`: self-move, move-into-descendant, move-out migration callback, отказ без autosave и сохранение acyclic invariant.
-- `main`/lifecycle: start failure не активирует сессию; ready активирует ровно один раз; normal и familiar exit удаляют cache; следующий launch создаёт новый emulator; stop/clear/rename не оставляют stale IDs.
-- `main_rename`/`paths`: cross-parent chat, terminal, folder subtree и `MoveSelectedOut` переносят все данные; collision/failure оставляют исходные данные; Unicode/default profile paths совпадают.
+- `main`/lifecycle: start failure не активирует сессию; ready активирует ровно один раз; normal и familiar exit удаляют cache; следующий launch создаёт новый emulator; единый stop helper очищает `runningSessions`, `activeSessions`, cache и watchers; ошибка job-stop оставляет runtime/tree нетронутыми.
+- `main_rename`/`paths`: cross-parent chat, terminal, folder subtree и `MoveSelectedOut` переносят все данные; assigned Kanban task переезжает в target-domain, collision/failure оставляют исходные данные, job-stop не вызывается до filesystem commit; Unicode/default profile paths совпадают.
 - status/knowledge/context watchers: close при смене session, close при удалении, close после app shutdown, один pending command на watcher и bounded re-arm без leak.
 - state: успешная atomic replacement, ошибка temp/write/rename оставляет старый JSON читаемым и не оставляет мусор.
 - domain/chat list: nested chats, root chat, Unicode profile и canonical domain/session IDs.
@@ -66,7 +66,7 @@
 gofmt -l .                         # пустой вывод
 go vet ./...                       # exit 0
 go test ./... -count=1 -p 1        # exit 0
-go build -trimpath -buildvcs=false -o automata .  # exit 0
+go build -trimpath -buildvcs=false -o /tmp/automata-audit .  # exit 0; tracked automata не изменяется
 go mod verify                      # exit 0
 git diff --check                   # пустой вывод
 ```

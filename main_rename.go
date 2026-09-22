@@ -7,12 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/slug"
 	"github.com/HumanHorizon/automata/internal/tree"
-	"github.com/HumanHorizon/automata/internal/ui"
 	"github.com/Starframe/portalis"
 )
 
@@ -37,10 +35,21 @@ type renameFamiliarPlan struct {
 	cwd        string
 }
 
+type renameTaskMove struct {
+	oldPath           string
+	newPath           string
+	oldAssigned       string
+	newAssigned       string
+	moved             bool
+	assignmentUpdated bool
+	createdTargetDir  bool
+}
+
 type renamePlan struct {
 	sessions  []renameSessionPlan
 	domains   []renameDomainPlan
 	familiars []renameFamiliarPlan
+	taskMoves []renameTaskMove
 }
 
 type renameRuntimeSnapshot struct {
@@ -270,6 +279,8 @@ func checkRenamePath(oldPath, newPath, label string) error {
 
 func (a *App) prepareRenamePlan(plan *renamePlan) error {
 	agentDir := a.renameAgentDir()
+	plan.taskMoves = nil
+	seenTaskTargets := make(map[string]struct{})
 	seenSessionTargets := make(map[string]struct{}, len(plan.sessions))
 	for _, session := range plan.sessions {
 		if session.oldID == session.newID {
@@ -289,6 +300,36 @@ func (a *App) prepareRenamePlan(plan *renamePlan) error {
 		newJSONL := paths.FindSessionJSONL(session.newID, session.cwd, agentDir)
 		if newJSONL != "" && newJSONL != oldJSONL {
 			return fmt.Errorf("session JSONL target already exists: %s", newJSONL)
+		}
+
+		if session.taskDomain != session.newDomain {
+			tasks, err := kanban.ReadAll(session.taskDomain, a.profile)
+			if err != nil {
+				return fmt.Errorf("read Kanban %s: %w", session.taskDomain, err)
+			}
+			for _, task := range tasks {
+				if task.AssignedTo != session.oldID {
+					continue
+				}
+				newPath := filepath.Join(kanban.KanbanDir(session.newDomain, a.profile), filepath.Base(task.Path))
+				if _, exists := seenTaskTargets[newPath]; exists {
+					return fmt.Errorf("Kanban task target collision: %s", newPath)
+				}
+				seenTaskTargets[newPath] = struct{}{}
+				exists, err := pathExists(newPath)
+				if err != nil {
+					return fmt.Errorf("check Kanban task target %q: %w", newPath, err)
+				}
+				if exists {
+					return fmt.Errorf("Kanban task target already exists: %s", newPath)
+				}
+				plan.taskMoves = append(plan.taskMoves, renameTaskMove{
+					oldPath:     task.Path,
+					newPath:     newPath,
+					oldAssigned: session.oldID,
+					newAssigned: session.newID,
+				})
+			}
 		}
 
 		entries, err := paths.ReadFamiliars(a.profile, session.oldID)
@@ -433,6 +474,7 @@ func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot) error {
 	}
 	if a.tree != nil {
 		a.tree.SetActiveSessions(a.activeSessions)
+		a.pendingRuntimeCmds = append(a.pendingRuntimeCmds, a.syncSessionWatchers()...)
 	}
 	return nil
 }
@@ -440,36 +482,25 @@ func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot) error {
 func (a *App) stopRenameSessions(plan *renamePlan) (renameRuntimeSnapshot, error) {
 	snapshot := a.captureRenameRuntime(plan)
 	ids := renamePlanSessionIDs(plan)
+	owners := make([]string, 0, len(ids))
 	for id := range ids {
-		if em, ok := a.emulatorCache[id]; ok {
-			em.Stop()
-			delete(a.emulatorCache, id)
-		}
-		if em, ok := a.familiarEmulatorCache[id]; ok {
-			em.Stop()
-			delete(a.familiarEmulatorCache, id)
-		}
-		if a.container != nil {
-			if panel := a.container.Active(); panel != nil {
-				if cp, ok := panel.(*ui.ChatPanel); ok {
-					for _, session := range cp.Sessions() {
-						if session.Em() != nil && session.Em().SessionID == id {
-							session.Em().Stop()
-						}
-					}
-				}
-			}
-		}
-		if err := akjobs.KillSessionForProfile(a.profile, id); err != nil {
-			return snapshot, fmt.Errorf("stop jobs for %s: %w", id, err)
-		}
-		delete(a.activeSessions, id)
-		delete(a.runningSessions, id)
+		owners = append(owners, id)
 	}
-	if a.tree != nil {
-		a.tree.SetActiveSessions(a.activeSessions)
+	if err := a.stopSessionRuntimeIDs(owners, stopSessionOptions{
+		stopFamiliars:   true,
+		persistInactive: true,
+	}); err != nil {
+		return snapshot, err
 	}
 	return snapshot, nil
+}
+
+func (a *App) finalizeRenamePlan(plan *renamePlan) {
+	for sessionID := range renamePlanSessionIDs(plan) {
+		if err := a.killSessionForProfile(sessionID); err != nil {
+			log.Printf("automata: stop jobs for renamed session %s: %v", sessionID, err)
+		}
+	}
 }
 
 func moveRenameDirectory(oldPath, newPath string, moves *[]renameDirectoryMove) error {
@@ -487,14 +518,58 @@ func moveRenameDirectory(oldPath, newPath string, moves *[]renameDirectoryMove) 
 	return nil
 }
 
+func moveRenameTask(move *renameTaskMove) error {
+	targetDir := filepath.Dir(move.newPath)
+	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
+		move.createdTargetDir = true
+	} else if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(move.oldPath, move.newPath); err != nil {
+		return err
+	}
+	move.moved = true
+	if _, err := kanban.AssignTask(move.newPath, move.newAssigned); err != nil {
+		return err
+	}
+	move.assignmentUpdated = true
+	return nil
+}
+
+func rollbackRenameTask(move *renameTaskMove) {
+	if !move.moved {
+		return
+	}
+	if move.assignmentUpdated {
+		if _, err := kanban.AssignTask(move.newPath, move.oldAssigned); err != nil {
+			log.Printf("automata: rollback Kanban task assignment %s: %v", move.newPath, err)
+		}
+	}
+	if err := os.Rename(move.newPath, move.oldPath); err != nil {
+		log.Printf("automata: rollback Kanban task %s -> %s: %v", move.newPath, move.oldPath, err)
+	}
+	if move.createdTargetDir {
+		if err := os.Remove(filepath.Dir(move.newPath)); err != nil && !os.IsNotExist(err) {
+			log.Printf("automata: rollback empty Kanban directory %s: %v", filepath.Dir(move.newPath), err)
+		}
+	}
+}
+
 func rollbackRename(
 	a *App,
 	directoryMoves []renameDirectoryMove,
 	jsonlMoves []renameJSONLMove,
 	familiarFiles []renameFamiliarFileMove,
 	assignmentMoves []renameAssignmentMove,
+	taskMoves []renameTaskMove,
 ) {
 	agentDir := a.renameAgentDir()
+	for i := len(taskMoves) - 1; i >= 0; i-- {
+		rollbackRenameTask(&taskMoves[i])
+	}
 	for i := len(assignmentMoves) - 1; i >= 0; i-- {
 		move := assignmentMoves[i]
 		if _, err := kanban.AssignTask(move.path, move.old); err != nil {
@@ -539,7 +614,7 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	var familiarFiles []renameFamiliarFileMove
 	var assignmentMoves []renameAssignmentMove
 	fail := func(err error) (func() error, error) {
-		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves)
+		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves, plan.taskMoves)
 		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot); restoreErr != nil {
 			return nil, fmt.Errorf("%w; restore runtime: %v", err, restoreErr)
 		}
@@ -567,8 +642,14 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 		}
 	}
 
+	for i := range plan.taskMoves {
+		if err := moveRenameTask(&plan.taskMoves[i]); err != nil {
+			return fail(fmt.Errorf("move Kanban task %s: %w", plan.taskMoves[i].oldPath, err))
+		}
+	}
+
 	for _, session := range plan.sessions {
-		if session.oldID == session.newID {
+		if session.oldID == session.newID || session.taskDomain != session.newDomain {
 			continue
 		}
 		tasks, err := kanban.ReadAll(session.taskDomain, a.profile)
@@ -632,7 +713,7 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 			return nil
 		}
 		rolledBack = true
-		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves)
+		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves, plan.taskMoves)
 		return a.restoreRenameRuntime(runtimeSnapshot)
 	}, nil
 }
@@ -646,5 +727,6 @@ func (a *App) renameTreeItem(item *tree.Item, newName string) error {
 		return err
 	}
 	a.applyRenameMappings(plan)
+	a.finalizeRenamePlan(plan)
 	return nil
 }

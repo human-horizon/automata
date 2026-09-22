@@ -1,0 +1,185 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+
+	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
+	"github.com/HumanHorizon/automata/internal/ui"
+)
+
+type stopSessionOptions struct {
+	stopJobs           bool
+	stopFamiliars      bool
+	persistInactive    bool
+	familiarSessionIDs []string
+}
+
+func (a *App) killSessionForProfile(sessionID string) error {
+	if a.killSessionFn != nil {
+		return a.killSessionFn(a.profile, sessionID)
+	}
+	return akjobs.KillSessionForProfile(a.profile, sessionID)
+}
+
+func (a *App) stopSessionRuntime(sessionID string, opts stopSessionOptions) error {
+	return a.stopSessionRuntimeIDs([]string{sessionID}, opts)
+}
+
+func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) error {
+	ids := a.expandRuntimeSessionIDs(ownerIDs, opts)
+	if opts.stopJobs {
+		for _, sessionID := range ids {
+			if err := a.killSessionForProfile(sessionID); err != nil {
+				return fmt.Errorf("stop jobs for %s: %w", sessionID, err)
+			}
+		}
+	}
+
+	for _, sessionID := range ids {
+		a.stopCachedEmulator(sessionID)
+		a.closeSessionWatcher(sessionID)
+		delete(a.runningSessions, sessionID)
+		if opts.persistInactive {
+			delete(a.activeSessions, sessionID)
+		}
+	}
+	if opts.persistInactive && a.tree != nil {
+		a.tree.SetActiveSessions(a.activeSessions)
+	}
+	return nil
+}
+
+func (a *App) expandRuntimeSessionIDs(ownerIDs []string, opts stopSessionOptions) []string {
+	seen := make(map[string]struct{}, len(ownerIDs)+len(opts.familiarSessionIDs))
+	ids := make([]string, 0, len(ownerIDs)+len(opts.familiarSessionIDs))
+	add := func(sessionID string) {
+		if sessionID == "" {
+			return
+		}
+		if _, exists := seen[sessionID]; exists {
+			return
+		}
+		seen[sessionID] = struct{}{}
+		ids = append(ids, sessionID)
+	}
+	for _, sessionID := range ownerIDs {
+		add(sessionID)
+	}
+	if !opts.stopFamiliars {
+		return ids
+	}
+	for _, sessionID := range opts.familiarSessionIDs {
+		for _, ownerID := range ownerIDs {
+			if strings.HasPrefix(sessionID, ownerID+"__") {
+				add(sessionID)
+				break
+			}
+		}
+	}
+	for _, ownerID := range ownerIDs {
+		prefix := ownerID + "__"
+		for sessionID := range a.emulatorCache {
+			if strings.HasPrefix(sessionID, prefix) {
+				add(sessionID)
+			}
+		}
+		for sessionID := range a.familiarEmulatorCache {
+			if strings.HasPrefix(sessionID, prefix) {
+				add(sessionID)
+			}
+		}
+		for sessionID := range a.activeSessions {
+			if strings.HasPrefix(sessionID, prefix) {
+				add(sessionID)
+			}
+		}
+		for sessionID := range a.runningSessions {
+			if strings.HasPrefix(sessionID, prefix) {
+				add(sessionID)
+			}
+		}
+	}
+	if a.container == nil {
+		return ids
+	}
+	panel := a.container.Active()
+	cp, ok := panel.(*ui.ChatPanel)
+	if !ok || cp == nil {
+		return ids
+	}
+	for _, sessionID := range cp.FamiliarSessionIDs() {
+		for _, ownerID := range ownerIDs {
+			if strings.HasPrefix(sessionID, ownerID+"__") {
+				add(sessionID)
+				break
+			}
+		}
+	}
+	return ids
+}
+
+func (a *App) stopCachedEmulator(sessionID string) {
+	if em, ok := a.emulatorCache[sessionID]; ok {
+		if em != nil {
+			em.Stop()
+		}
+		delete(a.emulatorCache, sessionID)
+	}
+	if em, ok := a.familiarEmulatorCache[sessionID]; ok {
+		if em != nil {
+			em.Stop()
+		}
+		delete(a.familiarEmulatorCache, sessionID)
+	}
+	if a.container == nil {
+		return
+	}
+	panel := a.container.Active()
+	cp, ok := panel.(*ui.ChatPanel)
+	if !ok || cp == nil {
+		return
+	}
+	for _, session := range cp.Sessions() {
+		em := session.Em()
+		if em != nil && em.SessionID == sessionID {
+			em.Stop()
+		}
+	}
+}
+
+func (a *App) closeSessionWatcher(sessionID string) {
+	if watcher, ok := a.sessionWatchers[sessionID]; ok {
+		_ = watcher.Close()
+		delete(a.sessionWatchers, sessionID)
+	}
+	delete(a.sessionWatchPending, sessionID)
+}
+
+func (a *App) stopAllRuntimeSessions(persistInactive bool) {
+	ids := make([]string, 0, len(a.emulatorCache)+len(a.familiarEmulatorCache)+len(a.runningSessions)+len(a.sessionWatchers))
+	seen := make(map[string]struct{})
+	add := func(sessionID string) {
+		if sessionID == "" {
+			return
+		}
+		if _, ok := seen[sessionID]; ok {
+			return
+		}
+		seen[sessionID] = struct{}{}
+		ids = append(ids, sessionID)
+	}
+	for sessionID := range a.emulatorCache {
+		add(sessionID)
+	}
+	for sessionID := range a.familiarEmulatorCache {
+		add(sessionID)
+	}
+	for sessionID := range a.runningSessions {
+		add(sessionID)
+	}
+	for sessionID := range a.sessionWatchers {
+		add(sessionID)
+	}
+	_ = a.stopSessionRuntimeIDs(ids, stopSessionOptions{persistInactive: persistInactive})
+}

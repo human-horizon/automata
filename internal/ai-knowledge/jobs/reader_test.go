@@ -126,9 +126,8 @@ func TestPidIsSameProcessDeadPIDReturnsFalse(t *testing.T) {
 	}
 }
 
-// TestPidIsSameProcessKeepsLiveJobEvenWhenPSMissing: when ps is unreachable
-// (exec failure) the kill(0) signal is the source of truth. Losing a live
-// job to the panel because /bin/ps is broken would be the worse failure.
+// TestPidIsSameProcessKeepsLiveJobEvenWhenPSMissing preserves the
+// read-only behavior: an inconclusive identity remains visible in the panel.
 func TestPidIsSameProcessKeepsLiveJobEvenWhenPSMissing(t *testing.T) {
 	pid := os.Getpid()
 	runner := func(int) (string, error) { return "", errFakePS }
@@ -315,6 +314,98 @@ func TestKillSessionDoesNotSignalDeadPIDAndCleansStaleRecord(t *testing.T) {
 	}
 }
 
+func TestKillSessionFailsClosedForUnknownPIDIdentity(t *testing.T) {
+	tests := []struct {
+		name       string
+		startedAt  string
+		psResponse func(int) (string, error)
+	}{
+		{
+			name:       "ps unavailable",
+			startedAt:  time.Now().UTC().Format(time.RFC3339),
+			psResponse: func(int) (string, error) { return "", errFakePS },
+		},
+		{
+			name:       "malformed ps output",
+			startedAt:  time.Now().UTC().Format(time.RFC3339),
+			psResponse: func(int) (string, error) { return "not a date", nil },
+		},
+		{
+			name:       "malformed startedAt",
+			startedAt:  "not a timestamp",
+			psResponse: matchingPSRunner(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AI_DATA_HOME", t.TempDir())
+			t.Setenv("AI_PROFILE", "test")
+			const sessionID = "test__kill-unknown"
+
+			called := 0
+			previousSignal := processSignal
+			previousPS := psRunnerOverride
+			t.Cleanup(func() {
+				processSignal = previousSignal
+				psRunnerOverride = previousPS
+			})
+			processSignal = func(int, syscall.Signal) error {
+				called++
+				return nil
+			}
+			psRunnerOverride = tt.psResponse
+
+			_, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), tt.startedAt)
+			if err := KillSession(sessionID); err == nil {
+				t.Fatal("KillSession succeeded with unknown PID identity")
+			}
+			if called != 0 {
+				t.Fatalf("unknown PID identity received a signal: %d calls", called)
+			}
+			var record JobRecord
+			if err := readJSON(metaPath, &record); err != nil {
+				t.Fatal(err)
+			}
+			if record.Status != "running" {
+				t.Fatalf("unknown PID status = %q, want running", record.Status)
+			}
+		})
+	}
+}
+
+func TestKillSessionLeavesMetadataRunningWhenProcessSurvivesSIGTERM(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__kill-still-running"
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+	})
+	processSignal = func(int, syscall.Signal) error { return nil }
+	psRunnerOverride = matchingPSRunner()
+	processProbeFn = func(int) bool { return true }
+
+	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+	if err := KillSession(sessionID); err == nil || !strings.Contains(err.Error(), "still running") {
+		t.Fatalf("KillSession error = %v, want still-running error", err)
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "running" {
+		t.Fatalf("surviving process status = %q, want running", record.Status)
+	}
+	if _, err := os.Stat(jobDir); err != nil {
+		t.Fatalf("job metadata disappeared: %v", err)
+	}
+}
+
 func TestKillSessionSignalsMatchingLivePIDAndWritesExitedMetadata(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("AI_DATA_HOME", dataHome)
@@ -324,14 +415,22 @@ func TestKillSessionSignalsMatchingLivePIDAndWritesExitedMetadata(t *testing.T) 
 	var signaledPID int
 	var signaledSignal syscall.Signal
 	previousSignal := processSignal
-	t.Cleanup(func() { processSignal = previousSignal })
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+	})
 	processSignal = func(pid int, signal syscall.Signal) error {
 		signaledPID = pid
 		signaledSignal = signal
 		return nil
 	}
+	psRunnerOverride = matchingPSRunner()
+	processProbeFn = func(int) bool { return false }
 
-	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), "")
+	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	if err := KillSession(sessionID); err != nil {
 		t.Fatal(err)
 	}
@@ -358,10 +457,15 @@ func TestKillSessionReturnsSignalErrorAndPreservesLiveMetadata(t *testing.T) {
 
 	signalErr := errString("signal denied")
 	previousSignal := processSignal
-	t.Cleanup(func() { processSignal = previousSignal })
+	previousPS := psRunnerOverride
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+	})
 	processSignal = func(int, syscall.Signal) error { return signalErr }
+	psRunnerOverride = matchingPSRunner()
 
-	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), "")
+	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	if err := KillSession(sessionID); err == nil || !strings.Contains(err.Error(), "signal denied") {
 		t.Fatalf("KillSession error = %v, want signal error", err)
 	}
@@ -415,9 +519,16 @@ func TestCleanupStaleUsesExplicitProfileScope(t *testing.T) {
 	}
 }
 
+// matchingPSRunner returns the current process start time in the format
+// emitted by macOS ps.
+func matchingPSRunner() psRunner {
+	return func(int) (string, error) {
+		return time.Now().Local().Format("Mon Jan 2 15:04:05 2006"), nil
+	}
+}
+
 // errFakePS is returned by the stubbed ps runner in tests to simulate a
-// missing or broken `ps` binary. The detection logic must fall back to
-// trusting kill(0) instead of dropping the job.
+// missing or broken `ps` binary.
 var errFakePS = errString("ps unavailable")
 
 type errString string

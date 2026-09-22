@@ -41,7 +41,9 @@ func TestChatOpensWithPlanPane(t *testing.T) {
 
 	t.Cleanup(func() {
 		if t.Failed() {
-			page.SaveArtifact("test-artifacts", "ChatPlanPane")
+			if err := saveTestArtifact(page, "ChatPlanPane"); err != nil {
+				t.Logf("save ChatPlanPane artifact: %v", err)
+			}
 		}
 	})
 

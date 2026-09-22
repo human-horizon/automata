@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -68,6 +69,17 @@ func sessionDir(sessionID string) string {
 // risking false negatives for legitimately recycled PIDs.
 const pidStartSkewTolerance = 5 * time.Second
 
+// PIDIdentity describes how confidently a job record can be associated with
+// the process currently occupying its PID.
+type PIDIdentity int
+
+const (
+	PIDDead PIDIdentity = iota
+	PIDSame
+	PIDDifferent
+	PIDUnknown
+)
+
 // psRunner abstracts exec.Command so tests can swap it for a fake `ps` to
 // simulate absence, garbage output, or skewed start times.
 type psRunner func(pid int) (string, error)
@@ -85,59 +97,45 @@ func defaultPsRunner(pid int) (string, error) {
 
 var psRunnerOverride psRunner
 
-// pidIsSameProcess reports whether `pid` is still the same process the job
-// record was started for. The decision order is intentional:
-//
-//  1. A dead PID (kill(0) errors) is never the same process, no matter what
-//     startedAt or ps claims — recycled PIDs must NOT count as live jobs.
-//  2. When ps is missing/garbled we trust kill(0) and return true. Losing a
-//     stale row to the panel is a worse UX than briefly holding one extra.
-//  3. When ps is healthy we still require the start time to line up with
-//     startedAt within `pidStartSkewTolerance`. A recycled PID is a different
-//     process regardless of whether it is currently running.
-func pidIsSameProcess(pid int, startedAt string) bool {
+// inspectPIDIdentity distinguishes a dead PID, a definitely different
+// process, a matching process, and an inconclusive identity check. The last
+// state is intentionally separate: read-only callers may keep showing a job,
+// while destructive callers must refuse to signal it.
+func inspectPIDIdentity(pid int, startedAt string) PIDIdentity {
 	runner := psRunnerOverride
 	if runner == nil {
 		runner = defaultPsRunner
 	}
-	return pidIsSameProcessWithRunner(pid, startedAt, runner)
+	return inspectPIDIdentityWithRunner(pid, startedAt, runner)
 }
 
-func pidIsSameProcessWithRunner(pid int, startedAt string, runner psRunner) bool {
+func inspectPIDIdentityWithRunner(pid int, startedAt string, runner psRunner) PIDIdentity {
 	if pid <= 0 {
-		return false
+		return PIDDead
 	}
 
-	// kill(0) is the source of truth for "process exists". On Linux this only
-	// succeeds if the PID is alive and we have permission to signal it; on
-	// macOS the same check is also the cheapest race-free probe.
 	if err := syscall.Kill(pid, 0); err != nil {
-		return false
+		if errors.Is(err, syscall.ESRCH) {
+			return PIDDead
+		}
+		return PIDUnknown
 	}
 
 	psStart, err := runPs(runner, pid)
 	if err != nil || psStart == "" {
-		// kill(0) just told us the process is alive. If we cannot reach ps
-		// (e.g. PATH stripped, container without /bin/ps) we still consider
-		// the job live — losing the row to the panel would be worse than
-		// briefly showing a recycled PID, and PruneStaleSession will fix
-		// any real mismatch on the next event.
-		return true
+		return PIDUnknown
 	}
-
 	if startedAt == "" {
-		// Legacy record without a start time: trust kill(0).
-		return true
+		return PIDUnknown
 	}
 
 	jobTime, err := time.Parse(time.RFC3339, startedAt)
 	if err != nil {
-		return true
+		return PIDUnknown
 	}
-
 	psTime, err := time.ParseInLocation("Mon Jan 2 15:04:05 2006", psStart, time.Local)
 	if err != nil {
-		return true
+		return PIDUnknown
 	}
 	psTime = psTime.UTC()
 
@@ -145,7 +143,24 @@ func pidIsSameProcessWithRunner(pid int, startedAt string, runner psRunner) bool
 	if diff < 0 {
 		diff = -diff
 	}
-	return diff <= pidStartSkewTolerance
+	if diff <= pidStartSkewTolerance {
+		return PIDSame
+	}
+	return PIDDifferent
+}
+
+// pidIsSameProcess preserves the conservative read-only behavior used by the
+// job list and stale-prune paths: an unknown identity remains visible rather
+// than being treated as stale. KillSessionForProfile uses the full identity
+// value and therefore fails closed for PIDUnknown.
+func pidIsSameProcess(pid int, startedAt string) bool {
+	identity := inspectPIDIdentity(pid, startedAt)
+	return identity == PIDSame || identity == PIDUnknown
+}
+
+func pidIsSameProcessWithRunner(pid int, startedAt string, runner psRunner) bool {
+	identity := inspectPIDIdentityWithRunner(pid, startedAt, runner)
+	return identity == PIDSame || identity == PIDUnknown
 }
 
 func runPs(runner psRunner, pid int) (string, error) {
@@ -328,6 +343,32 @@ var processSignal = func(pid int, signal syscall.Signal) error {
 	return process.Signal(signal)
 }
 
+// processProbe is injectable so KillSessionForProfile can distinguish a
+// delivered SIGTERM from a confirmed process exit without making tests sleep
+// on real processes.
+type processProbe func(pid int) bool
+
+var processProbeFn processProbe = func(pid int) bool {
+	return pid > 0 && syscall.Kill(pid, 0) == nil
+}
+
+const (
+	processExitProbeAttempts = 5
+	processExitProbeInterval = 20 * time.Millisecond
+)
+
+func waitForProcessExit(pid int) bool {
+	for attempt := 0; attempt < processExitProbeAttempts; attempt++ {
+		if !processProbeFn(pid) {
+			return true
+		}
+		if attempt+1 < processExitProbeAttempts {
+			time.Sleep(processExitProbeInterval)
+		}
+	}
+	return false
+}
+
 func materializeStaleJob(jobDir, metaPath string, rec *JobRecord) error {
 	rec.Status = "exited"
 	rec.StoppedAt = time.Now().UTC().Format(time.RFC3339)
@@ -343,10 +384,19 @@ func KillSession(sessionID string) error {
 	return KillSessionForProfile(profileFromSessionID(sessionID), sessionID)
 }
 
+type killCandidate struct {
+	jobDir   string
+	metaPath string
+	record   JobRecord
+	identity PIDIdentity
+}
+
 // KillSessionForProfile terminates jobs under an explicit canonical profile.
 // Dead or recycled records are materialized as stale without sending a
-// signal. A failed signal leaves the running metadata untouched and returns
-// the error to the caller.
+// signal. Unknown identity is a destructive-action error: no signal is sent
+// until every running record has a known identity. A successful SIGTERM is
+// recorded as exited only after a bounded liveness probe confirms the process
+// is gone.
 func KillSessionForProfile(profile, sessionID string) error {
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
@@ -357,6 +407,7 @@ func KillSessionForProfile(profile, sessionID string) error {
 		return err
 	}
 
+	candidates := make([]killCandidate, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -371,19 +422,37 @@ func KillSessionForProfile(profile, sessionID string) error {
 			continue
 		}
 
-		if !pidIsSameProcess(rec.PID, rec.StartedAt) {
-			if err := materializeStaleJob(jobDir, metaPath, &rec); err != nil {
+		identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
+		if identity == PIDUnknown {
+			return fmt.Errorf("cannot verify process identity for job %s", rec.ID)
+		}
+		candidates = append(candidates, killCandidate{
+			jobDir:   jobDir,
+			metaPath: metaPath,
+			record:   rec,
+			identity: identity,
+		})
+	}
+
+	for _, candidate := range candidates {
+		rec := candidate.record
+		if candidate.identity == PIDDead || candidate.identity == PIDDifferent {
+			if err := materializeStaleJob(candidate.jobDir, candidate.metaPath, &rec); err != nil {
 				return fmt.Errorf("materialize stale job %s: %w", rec.ID, err)
 			}
 			continue
 		}
+
 		if err := processSignal(rec.PID, syscall.SIGTERM); err != nil {
 			return fmt.Errorf("signal job %s: %w", rec.ID, err)
+		}
+		if !waitForProcessExit(rec.PID) {
+			return fmt.Errorf("job %s is still running after SIGTERM", rec.ID)
 		}
 
 		rec.Status = "exited"
 		rec.StoppedAt = time.Now().UTC().Format(time.RFC3339)
-		if err := writeJSON(metaPath, &rec); err != nil {
+		if err := writeJSON(candidate.metaPath, &rec); err != nil {
 			return fmt.Errorf("write stopped job %s: %w", rec.ID, err)
 		}
 	}

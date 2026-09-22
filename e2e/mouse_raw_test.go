@@ -110,5 +110,7 @@ func TestMouseRawDebug(t *testing.T) {
 	}
 
 	// Save artifacts for debugging
-	page.SaveArtifact("test-artifacts", "MouseRawDebug")
+	if err := saveTestArtifact(page, "MouseRawDebug"); err != nil {
+		t.Logf("save MouseRawDebug artifact: %v", err)
+	}
 }

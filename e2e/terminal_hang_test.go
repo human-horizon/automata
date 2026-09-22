@@ -50,7 +50,9 @@ func TestTerminalDoesNotHang(t *testing.T) {
 
 	t.Cleanup(func() {
 		if t.Failed() {
-			page.SaveArtifact("test-artifacts", "TerminalHang")
+			if err := saveTestArtifact(page, "TerminalHang"); err != nil {
+				t.Logf("save TerminalHang artifact: %v", err)
+			}
 		}
 	})
 
@@ -131,7 +133,9 @@ func TestTerminalRestoresCWD(t *testing.T) {
 
 	t.Cleanup(func() {
 		if t.Failed() {
-			page.SaveArtifact("test-artifacts", "TerminalCWD")
+			if err := saveTestArtifact(page, "TerminalCWD"); err != nil {
+				t.Logf("save TerminalCWD artifact: %v", err)
+			}
 		}
 	})
 
