@@ -24,6 +24,17 @@ import (
 	warp "github.com/starframe-dev/warp"
 )
 
+func installFakePi(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pi")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	return path
+}
+
 func TestAppViewModal(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	app := newApp("", "")
@@ -48,6 +59,7 @@ func TestAppViewModal(t *testing.T) {
 func TestClearRestartsChatWithConfiguredPiAgentDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	installFakePi(t)
 
 	const sessionID = "profile__chat"
 	piAgentDir := filepath.Join(home, ".ai", "just", "pi")
@@ -94,14 +106,15 @@ func TestPiLaunchSetsAgentDirAndProfile(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	geticDir := filepath.Join(home, ".ai", "getic", "pi")
+	fakePi := installFakePi(t)
 	app := &App{profile: "Getic", piAgentDir: geticDir}
 
 	t.Log("Когда: резолвер запуска pi вызывается для профиля Getic с --pi getic")
 	cmd, args, env := app.piLaunch("getic__chat")
 
 	t.Log("Тогда: запускается /usr/local/bin/pi с --session-id")
-	if cmd != "/usr/local/bin/pi" {
-		t.Fatalf("cmd = %q, want /usr/local/bin/pi", cmd)
+	if cmd != fakePi {
+		t.Fatalf("cmd = %q, want %q", cmd, fakePi)
 	}
 	if len(args) != 2 || args[0] != "--session-id" || args[1] != "getic__chat" {
 		t.Fatalf("args = %#v, want [--session-id getic__chat]", args)
@@ -409,6 +422,7 @@ func TestWindowResizeDoesNotForkBlinkChain(t *testing.T) {
 func TestClearKillsFamiliarsOfThisSession(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	installFakePi(t)
 
 	const (
 		mainSID = "humanhorizon__chat"
@@ -581,6 +595,7 @@ func TestCloseFamiliarCleansHostState(t *testing.T) {
 func TestClearKillsFamiliarsRespectsProfile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	installFakePi(t)
 
 	const (
 		profile = "humanhorizon"

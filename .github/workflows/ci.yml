@@ -34,6 +34,9 @@ jobs:
       - name: Run vet
         run: go vet ./...
 
+      - name: Build test binary
+        run: go build -trimpath -buildvcs=false -o automata .
+
       - name: Run tests
         run: go test ./... -count=1 -p 1
 
