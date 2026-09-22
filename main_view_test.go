@@ -199,10 +199,68 @@ func TestRouteCachedEmulatorMessageHandlesAllPTYMessages(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, handled := app.routeCachedEmulatorMessage(test.msg)
+			if test.name == "exit" {
+				if handled {
+					t.Fatal("exit must remain available for Warp after cache eviction")
+				}
+				if _, ok := app.emulatorCache[sessionID]; ok {
+					t.Fatal("exited emulator remained cached")
+				}
+				return
+			}
 			if !handled {
 				t.Fatalf("cached PTY message %q was not handled", test.name)
 			}
 		})
+	}
+}
+
+func TestPtyReadyActivatesSessionOnlyAfterReady(t *testing.T) {
+	const sessionID = "ready-gated"
+	app := &App{
+		activeSessions: make(map[string]struct{}),
+		emulatorCache: map[string]*portalis.Emulator{
+			sessionID: portalis.NewEmulator(sessionID, "Ready", "/bin/sh", nil),
+		},
+		tree: tree.New(),
+	}
+
+	if _, handled := app.routeCachedEmulatorMessage(portalis.PtyOutputMsg{SessionID: sessionID}); !handled {
+		t.Fatal("output was not routed to cached emulator")
+	}
+	if _, active := app.activeSessions[sessionID]; active {
+		t.Fatal("session became active before PtyReadyMsg")
+	}
+
+	if _, handled := app.routeCachedEmulatorMessage(portalis.PtyReadyMsg{SessionID: sessionID}); !handled {
+		t.Fatal("ready was not routed to cached emulator")
+	}
+	if _, active := app.activeSessions[sessionID]; !active {
+		t.Fatal("session did not become active after PtyReadyMsg")
+	}
+}
+
+func TestClearRestartFailureDoesNotRestoreActiveSession(t *testing.T) {
+	t.Setenv("PI_CMD", "/bin/sh")
+	const sessionID = "restart-failure"
+	app := &App{
+		tree:           tree.New(),
+		activeSessions: map[string]struct{}{sessionID: {}},
+		emulatorCache:  map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "Old", "/bin/sh", nil)},
+		piAgentDir:     t.TempDir(),
+	}
+	app.startEmulatorSyncFn = func(*portalis.Emulator, []string) error {
+		return fmt.Errorf("injected start failure")
+	}
+
+	if msg := app.clearSessionCmd(sessionID, "", nil)(); msg != nil {
+		t.Fatalf("failed restart returned %T, want nil", msg)
+	}
+	if _, ok := app.emulatorCache[sessionID]; ok {
+		t.Fatal("failed restart remained in emulator cache")
+	}
+	if _, ok := app.activeSessions[sessionID]; ok {
+		t.Fatal("failed restart remained active")
 	}
 }
 
@@ -364,7 +422,7 @@ func TestClearKillsFamiliarsOfThisSession(t *testing.T) {
 	fam2JSONL := writeJSONLFixture(t, home, cwd, fam2SID, time.Now())
 
 	// 2. Lay down familiars.json for the main session.
-	famDir := filepath.Join(home, ".ai", "automata", "sessions", mainSID)
+	famDir := filepath.Dir(paths.FamiliarsJSONLPath("", mainSID))
 	if err := os.MkdirAll(famDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -422,12 +480,19 @@ func TestClearKillsFamiliarsOfThisSession(t *testing.T) {
 		t.Errorf("familiars.json = %q, want %q", got, "[]")
 	}
 
-	// 8. Main session restarted and remains in activeSessions; familiars do not.
+	// 8. Main session is cached but becomes active only when Bubble Tea routes
+	// the ready message returned by the restart command.
 	if _, ok := app.emulatorCache[mainSID]; !ok {
 		t.Error("main emulator missing from emulatorCache after restart")
 	}
+	if _, ok := app.activeSessions[mainSID]; ok {
+		t.Error("main became active before PtyReadyMsg was routed")
+	}
+	if _, handled := app.routeCachedEmulatorMessage(msg); !handled {
+		t.Fatal("restart PtyReadyMsg was not routed to the cached emulator")
+	}
 	if _, ok := app.activeSessions[mainSID]; !ok {
-		t.Error("main not in activeSessions after restart")
+		t.Error("main not in activeSessions after PtyReadyMsg")
 	}
 	if _, ok := app.activeSessions[fam1SID]; ok {
 		t.Errorf("familiar %q still in activeSessions", fam1SID)
@@ -670,6 +735,41 @@ func TestClearReplacesPanelEmulator(t *testing.T) {
 // user's real ~/.ai/automata. The Tree, status reader and per-session
 // watcher map are initialised; everything else is left nil because the
 // watcher code under test never touches warp/container/emulator.
+func TestAppCloseStopsWatchersAndEmulators(t *testing.T) {
+	app := newTestApp(t, "")
+	it := app.tree.AllItems()[0]
+	key := app.tree.SessionKeyOf(it)
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app.setupStatusWatcher()
+	if cmds := app.syncSessionWatchers(); len(cmds) == 0 {
+		t.Fatal("expected a session watcher before Close")
+	}
+	app.emulatorCache = map[string]*portalis.Emulator{
+		key: portalis.NewEmulator(key, "chat", "/bin/sh", nil),
+	}
+	app.familiarEmulatorCache = map[string]*portalis.Emulator{
+		key + "__expert": portalis.NewEmulator(key+"__expert", "expert", "/bin/sh", nil),
+	}
+
+	app.Close()
+
+	if app.statusWatcher != nil {
+		t.Fatal("status watcher remained after Close")
+	}
+	if len(app.sessionWatchers) != 0 {
+		t.Fatalf("session watchers remained after Close: %d", len(app.sessionWatchers))
+	}
+	if len(app.emulatorCache) != 0 || len(app.familiarEmulatorCache) != 0 {
+		t.Fatal("emulator caches remained after Close")
+	}
+	if len(app.activeSessions) != 0 {
+		t.Fatal("active sessions remained after Close")
+	}
+}
+
 func newTestApp(t *testing.T, profile string) *App {
 	t.Helper()
 	home := t.TempDir()
@@ -866,7 +966,7 @@ func TestTreeStatusChangedMsgTriggersRefresh(t *testing.T) {
 			w.Close()
 		}
 	})
-	app.statusWatchPending = true // so the first re-arm is allowed
+	app.statusWatchPending = false // allow the first re-arm
 
 	_, cmd := app.Update(treeStatusChangedMsg{})
 
@@ -945,7 +1045,10 @@ func TestPerSessionWatcherCmdChainReceivesEvents(t *testing.T) {
 	}
 
 	app.setupStatusWatcher()
-	_ = app.syncSessionWatchers()
+	watchCmds := app.syncSessionWatchers()
+	if len(watchCmds) == 0 {
+		t.Fatal("expected a session watcher command")
+	}
 	t.Cleanup(func() {
 		app.statusWatcher.Close()
 		for _, w := range app.sessionWatchers {
@@ -953,7 +1056,7 @@ func TestPerSessionWatcherCmdChainReceivesEvents(t *testing.T) {
 		}
 	})
 
-	cmd := app.watchSessionCmd(key)
+	cmd := watchCmds[0]
 	if cmd == nil {
 		t.Fatal("expected cmd for mounted watcher")
 	}
@@ -999,7 +1102,10 @@ func TestPerSessionWatcherRearmsAfterEvent(t *testing.T) {
 	}
 
 	app.setupStatusWatcher()
-	_ = app.syncSessionWatchers()
+	watchCmds := app.syncSessionWatchers()
+	if len(watchCmds) == 0 {
+		t.Fatal("expected a session watcher command")
+	}
 	t.Cleanup(func() {
 		app.statusWatcher.Close()
 		for _, w := range app.sessionWatchers {
@@ -1008,7 +1114,7 @@ func TestPerSessionWatcherRearmsAfterEvent(t *testing.T) {
 	})
 
 	// Drain the first event to confirm the chain works once.
-	first := app.watchSessionCmd(key)
+	first := watchCmds[0]
 	if first == nil {
 		t.Fatal("expected first cmd")
 	}
@@ -1033,6 +1139,7 @@ func TestPerSessionWatcherRearmsAfterEvent(t *testing.T) {
 	// The Update path returns tea.Batch(allCmds...), but rearmSessionWatchers
 	// is the relevant slice; if any of its entries fires on a fresh event,
 	// the chain is correctly re-armed.
+	app.sessionWatchPending[key] = false
 	rearm := app.rearmSessionWatchers()
 	if len(rearm) == 0 {
 		t.Fatal("expected rearmSessionWatchers to return at least one cmd")
@@ -1044,7 +1151,7 @@ func TestPerSessionWatcherRearmsAfterEvent(t *testing.T) {
 	}
 
 	// Pick the cmd for our specific key and verify it can fire on a new event.
-	target := app.watchSessionCmd(key)
+	target := rearm[0]
 	if target == nil {
 		t.Fatal("expected re-arm cmd for target key")
 	}

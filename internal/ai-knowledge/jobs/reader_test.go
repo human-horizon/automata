@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/HumanHorizon/automata/internal/paths"
 )
 
 func TestCachedReaderNoticesNestedJobMetadataChange(t *testing.T) {
@@ -50,6 +52,37 @@ func TestCachedReaderNoticesNestedJobMetadataChange(t *testing.T) {
 	}
 	if calls != 2 || updated[0].ID != "call_2" {
 		t.Fatalf("nested job.json change must invalidate cache: calls=%d updated=%q", calls, updated[0].ID)
+	}
+}
+
+func TestRunningCountForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "wrong-profile")
+
+	profile := "Explicit Profile"
+	sessionID := "explicit-profile__chat"
+	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", "job_active")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(`{"id":"job_active","status":"running"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := RunningCountForProfile(profile, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("explicit profile running count = %d, want 1", count)
+	}
+	legacy, err := RunningCount(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy != 0 {
+		t.Fatalf("legacy running count leaked explicit profile: %d", legacy)
 	}
 }
 

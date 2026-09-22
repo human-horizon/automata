@@ -8,8 +8,34 @@ import (
 	"time"
 
 	"github.com/HumanHorizon/automata/internal/kanban"
+	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+func TestTaskStatusWritesUseExplicitProfilePath(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	profile := "Profile Ω"
+	sessionID := "profile-ω__chat"
+
+	writeTaskToChatStatus(profile, sessionID, "Build", "/tmp/build.md")
+	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"action": "task_assigned"`) {
+		t.Fatalf("assigned status = %s", data)
+	}
+
+	writeTaskRemovedFromChat(profile, sessionID, "Build")
+	data, err = os.ReadFile(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"action": "task_removed"`) {
+		t.Fatalf("removed status = %s", data)
+	}
+}
 
 // TestKanbanPanelSetupWatcherAttaches verifies SetDomain attaches an fsnotify
 // watcher when the kanban directory exists, so external edits trigger reloads.

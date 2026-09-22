@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fsnotify/fsnotify"
@@ -33,20 +34,8 @@ type jobsChangedMsg struct{}
 // plans.json, settings.json and the jobs/ subdirectory. Notes live one level
 // up under the domain directory, so they have their own watcher set up by
 // the ContextPanel.
-func sessionDataPath(sessionID string) string {
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	base := os.Getenv("AI_DATA_HOME")
-	if base == "" {
-		base = filepath.Join(home, ".ai", "automata")
-	}
-	profile := "default"
-	if idx := strings.Index(sessionID, "__"); idx > 0 {
-		profile = slugify(sessionID[:idx])
-	}
-	return filepath.Join(base, "profiles", profile, "sessions", sessionID)
+func sessionDataPath(profile, sessionID string) string {
+	return paths.SessionDir(profile, sessionID)
 }
 
 // KnowledgePanel renders ai-knowledge data for a single session. The data
@@ -54,6 +43,7 @@ func sessionDataPath(sessionID string) string {
 // just read on a tick and hand the resulting structures to the ai-knowledge
 // reusable renderer.
 type KnowledgePanel struct {
+	profile   string
 	sessionID string
 	palette   apptheme.Theme
 
@@ -101,6 +91,22 @@ func NewKnowledgePanel() *KnowledgePanel {
 	}
 }
 
+// SetProfile updates the canonical profile used by all session readers and
+// re-arms watchers for the active session when the profile changes.
+func (k *KnowledgePanel) SetProfile(profile string) {
+	if k.profile == profile {
+		return
+	}
+	k.closeWatchers()
+	k.profile = profile
+	k.data = nil
+	k.jobs = nil
+	if k.sessionID != "" {
+		k.readSettings()
+		k.setupWatchers()
+	}
+}
+
 // SetTheme updates the palette used by the knowledge panel.
 func (k *KnowledgePanel) SetTheme(palette apptheme.Theme) {
 	k.palette = palette
@@ -127,15 +133,20 @@ func (k *KnowledgePanel) SetSession(sessionID string) {
 // never leak fsnotify descriptors.
 func (k *KnowledgePanel) closeWatchers() {
 	if k.knowledgeWatcher != nil {
-		k.knowledgeWatcher.Close()
+		_ = k.knowledgeWatcher.Close()
 		k.knowledgeWatcher = nil
 	}
 	if k.jobsWatcher != nil {
-		k.jobsWatcher.Close()
+		_ = k.jobsWatcher.Close()
 		k.jobsWatcher = nil
 	}
 	k.knowledgeWatchPending = false
 	k.jobsWatchPending = false
+}
+
+// Close releases all filesystem watchers owned by the panel.
+func (k *KnowledgePanel) Close() {
+	k.closeWatchers()
 }
 
 // setupWatchers attaches fsnotify watchers to the session directory (for
@@ -144,7 +155,7 @@ func (k *KnowledgePanel) closeWatchers() {
 // brand-new session, and the next relevant event from the watcher that did
 // attach will recreate the missing one (see attachJobsWatcherIfMissing).
 func (k *KnowledgePanel) setupWatchers() {
-	sessionDir := sessionDataPath(k.sessionID)
+	sessionDir := sessionDataPath(k.profile, k.sessionID)
 	if sessionDir == "" {
 		return
 	}
@@ -204,37 +215,7 @@ func (k *KnowledgePanel) writeSettings() {
 
 // settingsPath returns the path to settings.json for the current session.
 func (k *KnowledgePanel) settingsPath() string {
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	base := os.Getenv("AI_DATA_HOME")
-	if base == "" {
-		base = filepath.Join(home, ".ai", "automata")
-	}
-	profile := "default"
-	if idx := strings.Index(k.sessionID, "__"); idx > 0 {
-		profile = slugify(k.sessionID[:idx])
-	}
-	return filepath.Join(base, "profiles", profile, "sessions", k.sessionID, "settings.json")
-}
-
-func slugify(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		default:
-			if b.Len() > 0 && b.String()[b.Len()-1] != '-' {
-				b.WriteRune('-')
-			}
-		}
-	}
-	return strings.Trim(b.String(), "-")
+	return filepath.Join(sessionDataPath(k.profile, k.sessionID), "settings.json")
 }
 
 // Refresh re-reads the data files for the current session. The UI is now
@@ -244,10 +225,10 @@ func (k *KnowledgePanel) Refresh() {
 	if k.sessionID == "" {
 		return
 	}
-	if d, err := k.contextReader.Read(k.sessionID); err == nil {
+	if d, err := k.contextReader.ReadForProfile(k.profile, k.sessionID); err == nil {
 		k.data = d
 	}
-	if j, err := k.jobsReader.List(k.sessionID); err == nil {
+	if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
 		k.jobs = j
 	}
 	k.refreshCurrentTask()
@@ -283,10 +264,10 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 		// happens we must (re)attach the jobs watcher so subsequent job
 		// events reach the panel. Both reloads are cheap and idempotent.
 		k.attachJobsWatcherIfMissing()
-		if d, err := k.contextReader.Read(k.sessionID); err == nil {
+		if d, err := k.contextReader.ReadForProfile(k.profile, k.sessionID); err == nil {
 			k.data = d
 		}
-		if j, err := k.jobsReader.List(k.sessionID); err == nil {
+		if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
 			k.jobs = j
 		}
 		k.readSettings()
@@ -297,8 +278,8 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 		// PruneStaleSession is the only place that flips running→exited in
 		// job.json. We deliberately do it before re-reading the list so the
 		// updated metadata is what the user sees.
-		if err := akjobs.PruneStaleSession(k.sessionID); err == nil {
-			if j, err := k.jobsReader.List(k.sessionID); err == nil {
+		if err := akjobs.PruneStaleSessionForProfile(k.profile, k.sessionID); err == nil {
+			if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
 				k.jobs = j
 			}
 		}
@@ -324,7 +305,7 @@ func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
 	if k.sessionID == "" || k.jobsWatcher != nil {
 		return
 	}
-	jobsDir := filepath.Join(sessionDataPath(k.sessionID), "jobs")
+	jobsDir := filepath.Join(sessionDataPath(k.profile, k.sessionID), "jobs")
 	if _, err := os.Stat(jobsDir); err != nil {
 		return
 	}
@@ -385,12 +366,7 @@ func (k *KnowledgePanel) refreshCurrentTask() {
 		k.currentTask = ""
 		return
 	}
-	// Profile is the first segment before __
-	profile := ""
-	if idx := strings.Index(k.sessionID, "__"); idx > 0 {
-		profile = slugify(k.sessionID[:idx])
-	}
-	tasks, err := kanban.ReadAll(domain, profile)
+	tasks, err := kanban.ReadAll(domain, k.profile)
 	if err != nil {
 		k.currentTask = ""
 		return

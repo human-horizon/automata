@@ -7,72 +7,30 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/HumanHorizon/automata/internal/paths"
 )
 
-// dataHome returns the base directory for ai-knowledge data.
-// Data is stored under ~/.ai/automata/profiles/<profile> so that ai-knowledge
-// integrates with Automata.
-func dataHome() string {
-	if v := os.Getenv("AI_DATA_HOME"); v != "" {
-		return v
-	}
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	return filepath.Join(home, ".ai", "automata")
-}
-
-func homeDir() string {
-	return dataHome()
-}
-
-// profileFromSessionID extracts the profile slug from the leading `profile__`
-// prefix that Automata bakes into session IDs. Returns "" if the session ID has
-// no profile prefix.
+// profileFromSessionID extracts the already canonical profile slug from the
+// leading `profile__` prefix baked into session IDs.
 func profileFromSessionID(sessionID string) string {
 	const sep = "__"
 	idx := strings.Index(sessionID, sep)
 	if idx <= 0 {
 		return ""
 	}
-	return slugify(sessionID[:idx])
+	return sessionID[:idx]
 }
 
-// profileSlug returns the profile directory name. Empty profile maps to "default".
-func profileSlug() string {
-	profile := os.Getenv("AI_PROFILE")
+func sessionDirForProfile(profile, sessionID string) string {
 	if profile == "" {
-		return "default"
+		profile = os.Getenv("AI_PROFILE")
 	}
-	return slugify(profile)
+	return paths.SessionDir(profile, sessionID)
 }
 
 func sessionDir(sessionID string) string {
-	profile := profileFromSessionID(sessionID)
-	if profile == "" {
-		profile = profileSlug()
-	}
-	return filepath.Join(dataHome(), "profiles", profile, "sessions", sessionID)
-}
-
-// slugify is a minimal slug used only for profile directory names.
-func slugify(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		default:
-			if b.Len() > 0 && b.String()[b.Len()-1] != '-' {
-				b.WriteRune('-')
-			}
-		}
-	}
-	return strings.Trim(b.String(), "-")
+	return sessionDirForProfile(profileFromSessionID(sessionID), sessionID)
 }
 
 type IntentionState struct {
@@ -151,12 +109,12 @@ func readJSON(path string, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-func Read(sessionID string) (*Data, error) {
+func readForProfile(profile, sessionID string) (*Data, error) {
 	data := &Data{
 		Plans: make(map[string][]PlanStep),
 	}
 
-	ctxPath := sessionDir(sessionID)
+	ctxPath := sessionDirForProfile(profile, sessionID)
 
 	// Read plans — support both old ([]string) and new ([]PlanStep) formats
 	var rawPlans []map[string]interface{}
@@ -204,6 +162,17 @@ func Read(sessionID string) (*Data, error) {
 	return data, nil
 }
 
+// Read returns context data using the profile encoded in the session ID or
+// AI_PROFILE for legacy unprefixed IDs.
+func Read(sessionID string) (*Data, error) {
+	return readForProfile("", sessionID)
+}
+
+// ReadForProfile returns context data using the explicit canonical profile.
+func ReadForProfile(profile, sessionID string) (*Data, error) {
+	return readForProfile(profile, sessionID)
+}
+
 // CachedReader caches session context (plans/status/settings) by the max mtime
 // of the relevant files. Safe for concurrent use (single reader locks).
 type CachedReader struct {
@@ -224,14 +193,24 @@ func NewCachedReader() *CachedReader {
 // Read returns the context data for a session, cached by the max mtime of
 // plans.json, status.json and settings.json.
 func (r *CachedReader) Read(sessionID string) (*Data, error) {
+	return r.ReadForProfile("", sessionID)
+}
+
+// ReadForProfile reads and caches context data under an explicit profile.
+func (r *CachedReader) ReadForProfile(profile, sessionID string) (*Data, error) {
 	if sessionID == "" {
 		return &Data{Plans: map[string][]PlanStep{}}, nil
 	}
-	dir := sessionDir(sessionID)
+	dir := sessionDirForProfile(profile, sessionID)
+	cacheKey := filepath.Join(dir, "plans.json")
 	// Compute max mtime of the three files we care about.
 	var maxMtime time.Time
 	for _, name := range []string{"plans.json", "status.json", "settings.json"} {
-		fi, err := os.Stat(filepath.Join(dir, name))
+		filePath := filepath.Join(dir, name)
+		if name != "plans.json" {
+			cacheKey += "|" + filePath
+		}
+		fi, err := os.Stat(filePath)
 		if err != nil {
 			continue
 		}
@@ -243,14 +222,14 @@ func (r *CachedReader) Read(sessionID string) (*Data, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if entry, ok := r.cache[sessionID]; ok && entry.maxMtime.Equal(maxMtime) && !maxMtime.IsZero() {
+	if entry, ok := r.cache[cacheKey]; ok && entry.maxMtime.Equal(maxMtime) && !maxMtime.IsZero() {
 		return entry.data, nil
 	}
 
-	data, err := Read(sessionID)
+	data, err := readForProfile(profile, sessionID)
 	if err != nil {
 		return data, err
 	}
-	r.cache[sessionID] = cachedCtxEntry{data: data, maxMtime: maxMtime}
+	r.cache[cacheKey] = cachedCtxEntry{data: data, maxMtime: maxMtime}
 	return data, nil
 }

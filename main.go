@@ -5,10 +5,9 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime/pprof"
-	"syscall"
+	"strings"
 	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
@@ -82,6 +81,13 @@ type App struct {
 	// re-arm.
 	statusWatchPending bool
 
+	// sessionWatchPending guarantees one blocking command per session watcher.
+	sessionWatchPending map[string]bool
+
+	// movePlans stores external migrations between the pre-move and post-move
+	// tree callbacks. The plan is consumed after the state snapshot succeeds.
+	pendingMovePlans map[*tree.Item]*renamePlan
+
 	// Root overlays are rendered by App.View so Help and Settings cover the
 	// complete Automata viewport instead of only the Tree panel.
 	appModal   *warp.Modal
@@ -109,14 +115,14 @@ func newApp(profile, piAgentDir string) (a *App) {
 			if em == nil {
 				return
 			}
-			a.emulatorCache[sessionID] = em
-			a.activeSessions[sessionID] = struct{}{}
-			a.tree.SetActiveSessions(a.activeSessions)
 			// Start synchronously so the PTY is ready immediately. The env is
 			// already recorded on the emulator via SetStartEnv.
 			if err := em.StartSync(nil); err != nil {
 				return
 			}
+			a.emulatorCache[sessionID] = em
+			a.activeSessions[sessionID] = struct{}{}
+			a.tree.SetActiveSessions(a.activeSessions)
 			// Start listening for output
 			if cmd := em.Listen(); cmd != nil {
 				_ = cmd
@@ -182,50 +188,34 @@ func newApp(profile, piAgentDir string) (a *App) {
 		a.updateChatList(item)
 	})
 
-	// Profile + cross-parent move handling: when an item is moved between
-	// parents (its just-pi session id changes), rename the session directory,
-	// invalidate any running emulator, and update the active session set.
+	// Profile + cross-parent move handling reuses the complete rename
+	// migration. External data is moved before the tree mutates; the returned
+	// rollback is used if the atomic tree snapshot cannot be committed.
 	t.SetProfile(profile)
-	t.SetOnItemMoved(func(item *tree.Item, oldID, newID string) {
-		prefix := ""
-		if profile != "" {
-			prefix = slug.Slug(profile) + "__"
+	t.SetOnBeforeItemMoved(func(item, newParent *tree.Item) (func() error, error) {
+		plan, err := buildMovePlan(item, newParent, a.profile)
+		if err != nil {
+			return nil, err
 		}
-		fullOld := prefix + oldID
-		fullNew := prefix + newID
-		if fullOld == fullNew {
-			return
+		rollback, err := a.applyRenamePlan(plan)
+		if err != nil {
+			return nil, err
 		}
-
-		// Stop the running emulator for the old session id (if any). The next
-		// time the user clicks the chat we will create a fresh emulator under
-		// the new session id.
-		if em, ok := a.emulatorCache[fullOld]; ok {
-			em.Stop()
-			delete(a.emulatorCache, fullOld)
+		if a.pendingMovePlans == nil {
+			a.pendingMovePlans = make(map[*tree.Item]*renamePlan)
 		}
-
-		// Move the on-disk session directory. This is what just-pi and the
-		// pi extensions use to store history, plans, jobs, etc.
-		oldDir := paths.SessionDir(a.profile, fullOld)
-		newDir := paths.SessionDir(a.profile, fullNew)
-		if _, err := os.Stat(oldDir); err == nil {
-			if _, err := os.Stat(newDir); err == nil {
-				log.Printf("automata: cannot rename session %s -> %s: target already exists", fullOld, fullNew)
-			} else if err := os.Rename(oldDir, newDir); err != nil {
-				log.Printf("automata: rename session dir %s -> %s: %v", oldDir, newDir, err)
-			}
+		a.pendingMovePlans[item] = plan
+		return func() error {
+			delete(a.pendingMovePlans, item)
+			return rollback()
+		}, nil
+	})
+	t.SetOnItemMoved(func(item *tree.Item, _, _ string) {
+		plan := a.pendingMovePlans[item]
+		delete(a.pendingMovePlans, item)
+		if plan != nil {
+			a.applyRenameMappings(plan)
 		}
-
-		// Update the active sessions set and the current session id.
-		if _, ok := a.activeSessions[fullOld]; ok {
-			delete(a.activeSessions, fullOld)
-			a.activeSessions[fullNew] = struct{}{}
-		}
-		if a.currentSessionID == fullOld {
-			a.currentSessionID = fullNew
-		}
-		a.tree.SetActiveSessions(a.activeSessions)
 	})
 
 	t.SetOnRename(func(item *tree.Item, newName string) error {
@@ -268,6 +258,8 @@ func newApp(profile, piAgentDir string) (a *App) {
 		piAgentDir:            piAgentDir,
 		statusReader:          status.NewCachedReader(profile),
 		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchPending:   make(map[string]bool),
+		pendingMovePlans:      make(map[*tree.Item]*renamePlan),
 	}
 	t.SetOnOpenHelp(a.openHelpOverlay)
 	t.SetOnOpenSettings(a.openSettingsOverlay)
@@ -303,20 +295,29 @@ func (a *App) updateChatList(folder *tree.Item) {
 		return
 	}
 	var chats []ui.ChatInfo
-	items := a.tree.AllItems()
-	if folder != nil {
-		// Only include children of the folder
-		items = folder.Children
-	}
-	for _, item := range items {
-		if item == nil || item.IsFolder || item.IsTerminal {
-			continue
+	var collect func([]*tree.Item)
+	collect = func(items []*tree.Item) {
+		for _, item := range items {
+			if item == nil {
+				continue
+			}
+			if item.IsFolder {
+				collect(item.Children)
+				continue
+			}
+			if item.IsTerminal {
+				continue
+			}
+			chats = append(chats, ui.ChatInfo{
+				Name:      item.Name,
+				SessionID: a.tree.SessionKeyOf(item),
+			})
 		}
-		sessionID := a.tree.SessionKeyOf(item)
-		chats = append(chats, ui.ChatInfo{
-			Name:      item.Name,
-			SessionID: sessionID,
-		})
+	}
+	if folder != nil {
+		collect(folder.Children)
+	} else {
+		collect(a.tree.Root())
 	}
 	a.container.SetChats(chats)
 }
@@ -419,21 +420,34 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.container.ApplyKnowledgeRefresh(msg)
 		return a, nil
 
+	case statusWatcherClosedMsg:
+		// A closed watcher must never be re-armed.
+		a.statusWatchPending = false
+		a.statusWatcher = nil
+		return a, nil
+
+	case sessionWatcherClosedMsg:
+		if w, ok := a.sessionWatchers[msg.sessionID]; ok {
+			_ = w.Close()
+			delete(a.sessionWatchers, msg.sessionID)
+		}
+		delete(a.sessionWatchPending, msg.sessionID)
+		return a, nil
+
 	case treeStatusChangedMsg:
 		// The status watcher fired — either sessionBaseDir() saw a new
-		// session directory appear or one of the per-session watchers saw
-		// status.json change. Re-sync the per-session watcher set against
-		// the current Tree items (handles CREATE/REMOVE/RENAME), arm
-		// cmd-chains for any newly attached watchers, re-arm every existing
-		// per-session cmd-chain (the blocking read is one-shot), and
-		// recompute badges from disk.
+		// session directory appear or one per-session watcher saw status.json
+		// change. Only the command that delivered this event becomes free;
+		// re-arming every other watcher would create a second reader.
 		a.statusWatchPending = false
+		if msg.sessionID != "" {
+			a.sessionWatchPending[msg.sessionID] = false
+		}
 		newCmds := a.syncSessionWatchers()
 		a.recomputeTreeStatusBadges()
 		allCmds := append([]tea.Cmd(nil), newCmds...)
 		allCmds = append(allCmds, a.rearmSessionWatchers()...)
 		if cmd := a.watchTreeStatusCmd(); cmd != nil {
-			a.statusWatchPending = true
 			allCmds = append(allCmds, cmd)
 		}
 		if len(allCmds) > 0 {
@@ -478,11 +492,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				a.container.SetFocus(cp)
 				a.sm.tab.SetFocus(a.container)
-			}
-			// Mark session as active for the stop button.
-			if a.currentSessionID != "" {
-				a.activeSessions[a.currentSessionID] = struct{}{}
-				a.tree.SetActiveSessions(a.activeSessions)
 			}
 			w, h := a.warp.Width(), a.warp.Height()
 			if w > 0 && h > 0 {
@@ -534,6 +543,11 @@ func (a *App) restoreSessions() tea.Cmd {
 		return nil
 	}
 
+	// Persist only sessions that reach PtyReadyMsg. A failed restore must not
+	// leave stale IDs marked active in state.json.
+	a.activeSessions = make(map[string]struct{})
+	a.tree.SetActiveSessions(a.activeSessions)
+
 	var cmds []tea.Cmd
 	for _, sessionID := range ids {
 		if _, ok := a.emulatorCache[sessionID]; ok {
@@ -550,12 +564,10 @@ func (a *App) restoreSessions() tea.Cmd {
 		}
 
 		a.emulatorCache[sessionID] = em
-		a.activeSessions[sessionID] = struct{}{}
 		if cmd := em.StartWithEnv(nil); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	}
-	a.tree.SetActiveSessions(a.activeSessions)
 	if len(cmds) == 0 {
 		return nil
 	}
@@ -568,11 +580,9 @@ func (a *App) restoreSessions() tea.Cmd {
 // clear-restart, task assign, familiar) produces an identical result.
 //
 // Priority:
-//  1. PI_CMD env override (used by e2e tests).
-//  2. a.piAgentDir (set via --pi, default ~/.ai/<tag>/pi) — direct
-//     /usr/local/bin/pi with PI_CODING_AGENT_DIR exported.
-//  3. just-pi wrapper found on PATH (only when --pi "" was passed
-//     explicitly) — the wrapper exports PI_CODING_AGENT_DIR itself.
+//  1. PI_CMD env override, resolved as one executable without shell parsing.
+//  2. pi found on PATH.
+//  3. just-pi wrapper found on PATH for installations that expose the wrapper.
 //
 // Returns cmd == "" when nothing is available; callers must NOT fall back
 // to a shell for pi sessions.
@@ -580,15 +590,20 @@ func (a *App) piLaunch(sessionID string) (cmd string, args []string, env []strin
 	if a.profile != "" {
 		env = append(env, "AUTOMATA_PROFILE="+slug.Slug(a.profile))
 	}
-	if piCmd := os.Getenv("PI_CMD"); piCmd != "" {
-		return piCmd, nil, env
+	if configured := strings.TrimSpace(os.Getenv("PI_CMD")); configured != "" {
+		path, err := exec.LookPath(configured)
+		if err != nil {
+			return "", nil, nil
+		}
+		return path, []string{"--session-id", sessionID}, env
 	}
 	if a.piAgentDir != "" {
 		env = append(env, "PI_CODING_AGENT_DIR="+a.piAgentDir)
-		return "/usr/local/bin/pi", []string{"--session-id", sessionID}, env
 	}
-	if path, err := exec.LookPath("just-pi"); err == nil {
-		return path, []string{"--session-id", sessionID}, env
+	for _, candidate := range []string{"pi", "just-pi"} {
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, []string{"--session-id", sessionID}, env
+		}
 	}
 	return "", nil, nil
 }
@@ -697,26 +712,47 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 	if _, isExit := msg.(portalis.PtyExitMsg); isExit {
 		if _, isFamiliar := a.familiarEmulatorCache[sessionID]; isFamiliar {
 			delete(a.familiarEmulatorCache, sessionID)
-			if _, active := a.activeSessions[sessionID]; active {
-				delete(a.activeSessions, sessionID)
-				if a.tree != nil {
-					a.tree.SetActiveSessions(a.activeSessions)
-				}
+			delete(a.activeSessions, sessionID)
+			if a.tree != nil {
+				a.tree.SetActiveSessions(a.activeSessions)
 			}
 			// Let the active ChatPanel remove the dead tab and keep polling.
+			return nil, false
+		}
+		if _, isCached := a.emulatorCache[sessionID]; isCached {
+			delete(a.emulatorCache, sessionID)
+			delete(a.activeSessions, sessionID)
+			if a.tree != nil {
+				a.tree.SetActiveSessions(a.activeSessions)
+			}
+			// The active panel still owns the exit message and can render its
+			// stopped state; the cache must not retain the dead emulator.
 			return nil, false
 		}
 	}
 
 	em, ok := a.emulatorCache[sessionID]
+	isFamiliar := false
 	if !ok || em == nil {
 		em, ok = a.familiarEmulatorCache[sessionID]
+		isFamiliar = ok
 	}
 	if !ok || em == nil {
 		// Unknown session IDs fall through to Warp for regular routing.
 		return nil, false
 	}
 
+	if _, isReady := msg.(portalis.PtyReadyMsg); isReady && !isFamiliar {
+		if a.activeSessions == nil {
+			a.activeSessions = make(map[string]struct{})
+		}
+		if _, alreadyActive := a.activeSessions[sessionID]; !alreadyActive {
+			a.activeSessions[sessionID] = struct{}{}
+			if a.tree != nil {
+				a.tree.SetActiveSessions(a.activeSessions)
+			}
+		}
+	}
 	return em.Update(msg), true
 }
 
@@ -796,13 +832,12 @@ func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.
 		// 3. Recreate the emulator with the same session id so pi starts fresh
 		newEm := a.createChatEmulator(sessionID)
 		if newEm != nil {
-			a.emulatorCache[sessionID] = newEm
-			a.activeSessions[sessionID] = struct{}{}
-			a.tree.SetActiveSessions(a.activeSessions)
 			if err := a.startEmulatorSync(newEm, nil); err != nil {
+				newEm.Stop()
 				log.Printf("clearSession: restart %q: %v", sessionID, err)
 				return nil
 			}
+			a.emulatorCache[sessionID] = newEm
 			// 4. Point the active ChatPanel's chatSession at the new emulator.
 			// Without this, the UI keeps rendering the stopped (old) emulator
 			// and the user sees an empty screen instead of a fresh pi prompt.
@@ -880,7 +915,15 @@ func (a *App) activeChatSessionID() string {
 // watchers) whenever any file under sessionBaseDir() changes. Receiving it
 // in Update triggers a full re-read of status.json for every visible chat
 // and a sync of the per-session watcher set against the current Tree items.
-type treeStatusChangedMsg struct{}
+type treeStatusChangedMsg struct {
+	sessionID string
+}
+
+type statusWatcherClosedMsg struct{}
+
+type sessionWatcherClosedMsg struct {
+	sessionID string
+}
 
 // setupStatusWatcher attaches fsnotify watchers to sessionBaseDir() and to
 // every currently visible chat's subdirectory. Best-effort: a missing base
@@ -891,6 +934,11 @@ type treeStatusChangedMsg struct{}
 // on archived or hidden sessions. syncSessionWatchers (called from Update
 // on every treeStatusChangedMsg) keeps the set in step with Tree changes.
 func (a *App) setupStatusWatcher() {
+	if a.statusWatcher != nil {
+		_ = a.statusWatcher.Close()
+		a.statusWatcher = nil
+		a.statusWatchPending = false
+	}
 	base := a.sessionBaseDir()
 	if err := os.MkdirAll(base, 0755); err != nil {
 		log.Printf("automata: cannot create %s: %v", base, err)
@@ -923,6 +971,12 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 	if a.tree == nil {
 		return nil
 	}
+	if a.sessionWatchers == nil {
+		a.sessionWatchers = make(map[string]*fsnotify.Watcher)
+	}
+	if a.sessionWatchPending == nil {
+		a.sessionWatchPending = make(map[string]bool)
+	}
 	visible := make(map[string]struct{}, len(a.sessionWatchers))
 	var newCmds []tea.Cmd
 	for _, it := range a.tree.AllItems() {
@@ -954,14 +1008,18 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 			continue
 		}
 		a.sessionWatchers[key] = sw
-		newCmds = append(newCmds, a.watchSessionCmd(key))
+		a.sessionWatchPending[key] = false
+		if cmd := a.watchSessionCmd(key); cmd != nil {
+			newCmds = append(newCmds, cmd)
+		}
 	}
 	for key, sw := range a.sessionWatchers {
 		if _, ok := visible[key]; ok {
 			continue
 		}
-		sw.Close()
+		_ = sw.Close()
 		delete(a.sessionWatchers, key)
+		delete(a.sessionWatchPending, key)
 	}
 	return newCmds
 }
@@ -972,14 +1030,15 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 // We intentionally ignore the event's op and name — recomputing badges
 // and resyncing the per-session watcher set is cheap and idempotent.
 func (a *App) watchTreeStatusCmd() tea.Cmd {
-	if a.statusWatcher == nil {
+	if a.statusWatcher == nil || a.statusWatchPending {
 		return nil
 	}
+	a.statusWatchPending = true
 	w := a.statusWatcher
 	return func() tea.Msg {
 		_, ok := <-w.Events
 		if !ok {
-			return nil // watcher closed
+			return statusWatcherClosedMsg{}
 		}
 		return treeStatusChangedMsg{}
 	}
@@ -993,31 +1052,37 @@ func (a *App) watchTreeStatusCmd() tea.Cmd {
 // the chat was removed from the Tree), so callers can safely drop it.
 func (a *App) watchSessionCmd(key string) tea.Cmd {
 	sw, ok := a.sessionWatchers[key]
-	if !ok {
+	if !ok || sw == nil {
 		return nil
 	}
+	if a.sessionWatchPending == nil {
+		a.sessionWatchPending = make(map[string]bool)
+	}
+	if a.sessionWatchPending[key] {
+		return nil
+	}
+	a.sessionWatchPending[key] = true
 	return func() tea.Msg {
 		_, ok := <-sw.Events
 		if !ok {
-			return nil // watcher closed
+			return sessionWatcherClosedMsg{sessionID: key}
 		}
-		return treeStatusChangedMsg{}
+		return treeStatusChangedMsg{sessionID: key}
 	}
 }
 
-// rearmSessionWatchers returns one blocking cmd per currently mounted
-// per-session watcher. It is called from case treeStatusChangedMsg so the
-// cmd-chain keeps firing events: a single blocking read on sw.Events is
-// one-shot, so we have to re-subscribe after every event to catch the
-// next one. Existing watchers are re-armed here (not in syncSessionWatchers,
-// which only handles freshly attached ones).
+// rearmSessionWatchers returns commands only for mounted watchers whose
+// previous command delivered an event. Existing pending commands remain the
+// sole reader for their watcher, preventing duplicate channel consumers.
 func (a *App) rearmSessionWatchers() []tea.Cmd {
 	if len(a.sessionWatchers) == 0 {
 		return nil
 	}
 	cmds := make([]tea.Cmd, 0, len(a.sessionWatchers))
 	for key := range a.sessionWatchers {
-		cmds = append(cmds, a.watchSessionCmd(key))
+		if cmd := a.watchSessionCmd(key); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 	return cmds
 }
@@ -1054,6 +1119,42 @@ func (a *App) blinkCmd() tea.Cmd {
 	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
 		return blinkMsg{}
 	})
+}
+
+// Close releases all resources owned by the Bubble Tea application. It is
+// called after Program.Run returns, so no goroutine can schedule new UI work.
+func (a *App) Close() {
+	if a == nil {
+		return
+	}
+	if a.statusWatcher != nil {
+		_ = a.statusWatcher.Close()
+		a.statusWatcher = nil
+	}
+	for key, watcher := range a.sessionWatchers {
+		_ = watcher.Close()
+		delete(a.sessionWatchers, key)
+	}
+	a.statusWatchPending = false
+	for key, em := range a.emulatorCache {
+		if em != nil {
+			em.Stop()
+		}
+		delete(a.emulatorCache, key)
+	}
+	for key, em := range a.familiarEmulatorCache {
+		if em != nil {
+			em.Stop()
+		}
+		delete(a.familiarEmulatorCache, key)
+	}
+	a.activeSessions = make(map[string]struct{})
+	if a.tree != nil {
+		a.tree.SetActiveSessions(a.activeSessions)
+	}
+	if a.container != nil {
+		a.container.Close()
+	}
 }
 
 type stateManager struct {
@@ -1104,11 +1205,13 @@ func main() {
 	if *cpuProfile != "" {
 		f, err := os.Create(*cpuProfile)
 		if err != nil {
-			log.Fatalf("cannot create CPU profile: %v", err)
+			log.Printf("cannot create CPU profile: %v", err)
+			return
 		}
 		defer f.Close()
 		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatalf("cannot start CPU profile: %v", err)
+			log.Printf("cannot start CPU profile: %v", err)
+			return
 		}
 		defer pprof.StopCPUProfile()
 	}
@@ -1132,14 +1235,8 @@ func main() {
 	// (~30 FPS), so the update loop stays light while hover icons still
 	// appear promptly.
 	p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithMouseAllMotion())
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-		p.Quit()
-	}()
+	defer app.Close()
 	if _, err := p.Run(); err != nil {
 		log.Printf("[main] p.Run err: %v", err)
-		log.Fatal(err)
 	}
 }

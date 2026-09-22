@@ -64,11 +64,16 @@ func writeSessionFixture(t *testing.T, profile string, items []sessionStateItem)
 func launchAutomataForSession(t *testing.T, profile string) (*cue.App, *cue.Page) {
 	t.Helper()
 	root := projectRoot()
+	piCommand := filepath.Join(t.TempDir(), "fake-pi")
+	const piScript = "#!/bin/sh\nif [ \"$1\" = \"--session-id\" ]; then shift 2; fi\nexec /bin/bash \"$@\"\n"
+	if err := os.WriteFile(piCommand, []byte(piScript), 0o755); err != nil {
+		t.Fatalf("write fake pi command: %v", err)
+	}
 	app, err := cue.Launch(filepath.Join(root, "automata"),
 		cue.WithArgs("--profile", profile),
 		cue.WithDir(root),
 		cue.WithSize(120, 40),
-		cue.WithEnv("TERM=xterm-256color", "PI_SKIP_VERSION_CHECK=1", "PI_CMD=/bin/bash"),
+		cue.WithEnv("TERM=xterm-256color", "PI_SKIP_VERSION_CHECK=1", "PI_CMD="+piCommand),
 	)
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)

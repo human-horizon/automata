@@ -3,6 +3,7 @@ package memory
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/HumanHorizon/automata/internal/paths"
@@ -16,6 +17,50 @@ func writeNotesFixture(t *testing.T, _ string, profile, domain, content string) 
 	}
 	if err := os.WriteFile(filepath.Join(domainPath, "notes.json"), []byte(content), 0o644); err != nil {
 		t.Fatalf("write notes: %v", err)
+	}
+}
+
+func TestWriteNotesPreservesSectionsAndInvalidatesCache(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	profile := "write-profile"
+	domain := "write-domain"
+	first := []NoteSummary{{
+		Title:    "Project",
+		Sections: []NoteSection{{Title: "Decision", Content: "Keep this"}},
+	}}
+
+	if err := Write(profile, domain, first); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(paths.DomainDir(profile, domain), "notes.json"))
+	if err != nil {
+		t.Fatalf("read written notes: %v", err)
+	}
+	if !strings.HasSuffix(string(raw), "\n") {
+		t.Fatalf("written notes should end with newline, got %q", raw)
+	}
+
+	reader := NewCachedReader()
+	data, err := reader.Read(profile, domain)
+	if err != nil {
+		t.Fatalf("read first notes: %v", err)
+	}
+	if got := data.Notes[0].Sections[0].Content; got != "Keep this" {
+		t.Fatalf("first section content = %q, want Keep this", got)
+	}
+
+	second := []NoteSummary{{Title: "Updated", Sections: []NoteSection{{Content: "New content"}}}}
+	if err := Write(profile, domain, second); err != nil {
+		t.Fatalf("Write replacement returned error: %v", err)
+	}
+	reader.Invalidate(profile, domain)
+	data, err = reader.Read(profile, domain)
+	if err != nil {
+		t.Fatalf("read replacement notes: %v", err)
+	}
+	if len(data.Notes) != 1 || data.Notes[0].Title != "Updated" {
+		t.Fatalf("replacement notes = %+v", data.Notes)
 	}
 }
 

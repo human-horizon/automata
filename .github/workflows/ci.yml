@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Reject local module replacements
+        shell: bash
+        run: '! grep -Eq "=>[[:space:]]*\.\./" go.mod'
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Check formatting
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test ./... -count=1 -p 1
+
+      - name: Check whitespace
+        run: git diff --check
+
+      - name: Build reproducible artifacts
+        shell: bash
+        run: |
+          mkdir -p build
+          go build -trimpath -buildvcs=false -o build/automata-1 .
+          go build -trimpath -buildvcs=false -o build/automata-2 .
+          sha256sum build/automata-1 build/automata-2
+          test "$(sha256sum build/automata-1 | awk '{print $1}')" = "$(sha256sum build/automata-2 | awk '{print $1}')"

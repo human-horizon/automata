@@ -32,8 +32,8 @@ type chatSession struct {
 }
 
 // ChatPanel manages multiple terminal sessions (main + familiars) with a tab
-// bar at the bottom. It polls ~/.ai/automata/sessions/<sessionID>/familiars.json
-// to detect new familiars and creates TermPanel tabs (Portalis Emulator) for them.
+// bar at the bottom. It polls the active profile's canonical session directory
+// for familiars.json and creates TermPanel tabs (Portalis Emulator) for them.
 type ChatPanel struct {
 	sessions  []*chatSession
 	activeIdx int

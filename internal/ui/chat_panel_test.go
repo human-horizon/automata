@@ -119,16 +119,14 @@ func assertCompleteSGRSequences(t *testing.T, value string) {
 // ---- Familiar detection tests ----
 
 // writeFamiliarsJSON writes a familiars.json file in a temp directory and
-// returns the session ID. profile can be empty for no-profile path.
+// returns the session ID. profile can be empty for the canonical default path.
 func writeFamiliarsJSON(t *testing.T, dir, profile string, familiars []FamiliarState) string {
 	t.Helper()
 	sessionID := "test-session"
-	var sessionDir string
-	if profile != "" {
-		sessionDir = filepath.Join(dir, ".ai", "automata", "profiles", profile, "sessions", sessionID)
-	} else {
-		sessionDir = filepath.Join(dir, ".ai", "automata", "sessions", sessionID)
+	if profile == "" {
+		profile = "default"
 	}
+	sessionDir := filepath.Join(dir, ".ai", "automata", "profiles", profile, "sessions", sessionID)
 	if err := os.MkdirAll(sessionDir, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}

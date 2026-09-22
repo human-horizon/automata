@@ -155,6 +155,78 @@ func buildRenamePlan(item *tree.Item, newName, profile string) (*renamePlan, err
 	return plan, nil
 }
 
+func buildMovePlan(item, newParent *tree.Item, profile string) (*renamePlan, error) {
+	if item == nil {
+		return nil, fmt.Errorf("item is required")
+	}
+	if newParent != nil && !newParent.IsFolder {
+		return nil, fmt.Errorf("move target parent must be a folder")
+	}
+
+	oldFolders := item.Path()
+	newFolders := []string(nil)
+	if newParent != nil {
+		newFolders = appendRenamePath(newParent.Path(), newParent.Name)
+	}
+	plan := &renamePlan{}
+	if !item.IsFolder {
+		oldID := fullRenameSessionID(profile, oldFolders, item.Name)
+		newID := fullRenameSessionID(profile, newFolders, item.Name)
+		plan.domains = append(plan.domains, renameDomainPlan{
+			oldDomain: sessionDomainID(oldID),
+			newDomain: sessionDomainID(newID),
+		})
+		plan.sessions = append(plan.sessions, renameSessionPlan{oldID: oldID, newID: newID, cwd: item.CWD})
+		return plan, nil
+	}
+
+	var walk func(folder *tree.Item, oldParent, newParentPath []string)
+	walk = func(folder *tree.Item, oldParent, newParentPath []string) {
+		oldFolders := appendRenamePath(oldParent, folder.Name)
+		newFolders := appendRenamePath(newParentPath, folder.Name)
+		plan.domains = append(plan.domains, renameDomainPlan{
+			oldDomain: renameDomainID(profile, oldFolders),
+			newDomain: renameDomainID(profile, newFolders),
+		})
+		for _, child := range folder.Children {
+			if child.IsFolder {
+				walk(child, oldFolders, newFolders)
+				continue
+			}
+			plan.sessions = append(plan.sessions, renameSessionPlan{
+				oldID: fullRenameSessionID(profile, oldFolders, child.Name),
+				newID: fullRenameSessionID(profile, newFolders, child.Name),
+				cwd:   child.CWD,
+			})
+		}
+	}
+	walk(item, oldFolders[:len(oldFolders):len(oldFolders)], newFolders)
+	return plan, nil
+}
+
+func (a *App) applyRenameMappings(plan *renamePlan) {
+	oldToNew := make(map[string]string, len(plan.sessions)+len(plan.familiars))
+	for _, session := range plan.sessions {
+		oldToNew[session.oldID] = session.newID
+	}
+	for _, familiar := range plan.familiars {
+		oldToNew[familiar.oldID] = familiar.newID
+	}
+	if newID, ok := oldToNew[a.currentSessionID]; ok {
+		a.currentSessionID = newID
+	}
+	if a.container != nil {
+		a.container.RenameSessionIDs(oldToNew)
+		domainMap := make(map[string]string, len(plan.domains))
+		for _, domain := range plan.domains {
+			if domain.oldDomain != domain.newDomain {
+				domainMap[domain.oldDomain] = domain.newDomain
+			}
+		}
+		a.container.RenameDomains(domainMap)
+	}
+}
+
 func pathExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
@@ -359,22 +431,22 @@ func rollbackRename(
 	}
 }
 
-func (a *App) applyRenamePlan(plan *renamePlan) error {
+func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	agentDir := a.renameAgentDir()
 	if err := a.prepareRenamePlan(plan); err != nil {
-		return err
+		return nil, err
 	}
 	if err := a.stopRenameSessions(plan); err != nil {
-		return err
+		return nil, err
 	}
 
 	var directoryMoves []renameDirectoryMove
 	var jsonlMoves []renameJSONLMove
 	var familiarFiles []renameFamiliarFileMove
 	var assignmentMoves []renameAssignmentMove
-	fail := func(err error) error {
+	fail := func(err error) (func() error, error) {
 		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves)
-		return err
+		return nil, err
 	}
 
 	for _, session := range plan.sessions {
@@ -459,7 +531,15 @@ func (a *App) applyRenamePlan(plan *renamePlan) error {
 		}
 	}
 
-	return nil
+	rolledBack := false
+	return func() error {
+		if rolledBack {
+			return nil
+		}
+		rolledBack = true
+		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves)
+		return nil
+	}, nil
 }
 
 func (a *App) renameTreeItem(item *tree.Item, newName string) error {
@@ -467,29 +547,9 @@ func (a *App) renameTreeItem(item *tree.Item, newName string) error {
 	if err != nil {
 		return err
 	}
-	if err := a.applyRenamePlan(plan); err != nil {
+	if _, err := a.applyRenamePlan(plan); err != nil {
 		return err
 	}
-
-	oldToNew := make(map[string]string, len(plan.sessions))
-	for _, session := range plan.sessions {
-		oldToNew[session.oldID] = session.newID
-	}
-	for _, familiar := range plan.familiars {
-		oldToNew[familiar.oldID] = familiar.newID
-	}
-	if newID, ok := oldToNew[a.currentSessionID]; ok {
-		a.currentSessionID = newID
-	}
-	if a.container != nil {
-		a.container.RenameSessionIDs(oldToNew)
-		domainMap := make(map[string]string, len(plan.domains))
-		for _, domain := range plan.domains {
-			if domain.oldDomain != domain.newDomain {
-				domainMap[domain.oldDomain] = domain.newDomain
-			}
-		}
-		a.container.RenameDomains(domainMap)
-	}
+	a.applyRenameMappings(plan)
 	return nil
 }

@@ -10,6 +10,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/HumanHorizon/automata/internal/paths"
 )
 
 // JobRecord matches the structure written by the pi job extension.
@@ -32,60 +34,31 @@ type Job struct {
 	Agent     string
 }
 
-// dataHome returns the base directory for ai-knowledge data.
 func dataHome() string {
-	if v := os.Getenv("AI_DATA_HOME"); v != "" {
-		return v
-	}
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	return filepath.Join(home, ".ai", "automata")
+	return paths.BaseDir()
 }
 
-// profileFromSessionID extracts the profile slug from the leading `profile__`
-// prefix that Automata bakes into session IDs. Returns "" if the session ID has
-// no profile prefix.
+// profileFromSessionID extracts the already canonical profile slug from the
+// leading `profile__` prefix baked into session IDs.
 func profileFromSessionID(sessionID string) string {
 	const sep = "__"
 	idx := strings.Index(sessionID, sep)
 	if idx <= 0 {
 		return ""
 	}
-	return slugify(sessionID[:idx])
+	return sessionID[:idx]
 }
 
-// profileSlug returns the profile directory name. Empty profile maps to "default".
-func profileSlug() string {
-	profile := os.Getenv("AI_PROFILE")
+func sessionDirForProfile(profile, sessionID string) string {
 	if profile == "" {
-		return "default"
+		profile = os.Getenv("AI_PROFILE")
 	}
-	return slugify(profile)
-}
-
-func slugify(s string) string {
-	var out strings.Builder
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			out.WriteRune(r)
-		} else if r >= 'A' && r <= 'Z' {
-			out.WriteRune(r + 32) // tolower
-		} else if r == ' ' || r == '.' {
-			out.WriteRune('-')
-		}
-	}
-	return out.String()
+	return paths.SessionDir(profile, sessionID)
 }
 
 // sessionDir returns the session data directory.
 func sessionDir(sessionID string) string {
-	profile := profileFromSessionID(sessionID)
-	if profile == "" {
-		profile = profileSlug()
-	}
-	return filepath.Join(dataHome(), "profiles", profile, "sessions", sessionID)
+	return sessionDirForProfile(profileFromSessionID(sessionID), sessionID)
 }
 
 // pidStartSkewTolerance is the maximum allowed difference between the job's
@@ -191,8 +164,8 @@ func writeJSON(path string, rec *JobRecord) error {
 // "process is dead" decision must invoke PruneStaleSession explicitly. This
 // keeps panel reads cheap and prevents a transient `ps` hiccup from erasing
 // the metadata of a job that is still legitimately running.
-func List(sessionID string) ([]Job, error) {
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+func listForProfile(profile, sessionID string) ([]Job, error) {
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -238,12 +211,23 @@ func List(sessionID string) ([]Job, error) {
 	return jobs, nil
 }
 
+// List returns running jobs using the profile encoded in the session ID or
+// AI_PROFILE for legacy unprefixed IDs.
+func List(sessionID string) ([]Job, error) {
+	return listForProfile("", sessionID)
+}
+
+// ListForProfile returns running jobs under an explicit canonical profile.
+func ListForProfile(profile, sessionID string) ([]Job, error) {
+	return listForProfile(profile, sessionID)
+}
+
 // PruneStaleSession scans a session's jobs/ directory and, for every record
 // whose PID is no longer the same process, marks it `exited` and removes the
 // record directory. It is the only path that mutates running→exited in
 // job.json, which makes the cleanup behaviour easy to test in isolation.
-func PruneStaleSession(sessionID string) error {
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+func pruneStaleSessionForProfile(profile, sessionID string) error {
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -277,12 +261,23 @@ func PruneStaleSession(sessionID string) error {
 	return nil
 }
 
+// PruneStaleSession marks dead jobs using the profile encoded in the session
+// ID or AI_PROFILE for legacy unprefixed IDs.
+func PruneStaleSession(sessionID string) error {
+	return pruneStaleSessionForProfile("", sessionID)
+}
+
+// PruneStaleSessionForProfile marks dead jobs under an explicit profile.
+func PruneStaleSessionForProfile(profile, sessionID string) error {
+	return pruneStaleSessionForProfile(profile, sessionID)
+}
+
 // RunningCount returns the number of running job records on disk for the
 // given session, regardless of whether the process is still alive. It is a
 // cheap probe for callers that want to know "is there anything to look at?"
 // before doing the more expensive pidIsSameProcess sweep.
-func RunningCount(sessionID string) (int, error) {
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+func runningCountForProfile(profile, sessionID string) (int, error) {
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -304,6 +299,18 @@ func RunningCount(sessionID string) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+// RunningCount returns the number of running job records using the profile
+// encoded in the session ID or AI_PROFILE for legacy unprefixed IDs.
+func RunningCount(sessionID string) (int, error) {
+	return runningCountForProfile("", sessionID)
+}
+
+// RunningCountForProfile returns the number of running records under an
+// explicit canonical profile.
+func RunningCountForProfile(profile, sessionID string) (int, error) {
+	return runningCountForProfile(profile, sessionID)
 }
 
 // KillSession kills all running jobs for the given session and marks them as exited.
@@ -387,9 +394,10 @@ func readJSON(path string, v any) error {
 
 // CachedReader caches running jobs until the set of nested job.json files changes.
 type CachedReader struct {
-	mu     sync.Mutex
-	cache  map[string]cachedJobsEntry
-	listFn func(string) ([]Job, error)
+	mu            sync.Mutex
+	cache         map[string]cachedJobsEntry
+	listFn        func(string) ([]Job, error)
+	listProfileFn func(string, string) ([]Job, error)
 }
 
 type cachedJobsEntry struct {
@@ -398,13 +406,18 @@ type cachedJobsEntry struct {
 }
 
 func NewCachedReader() *CachedReader {
-	return newCachedReader(List)
+	return &CachedReader{
+		cache:         make(map[string]cachedJobsEntry),
+		listFn:        List,
+		listProfileFn: ListForProfile,
+	}
 }
 
 func newCachedReader(listFn func(string) ([]Job, error)) *CachedReader {
 	return &CachedReader{
-		cache:  make(map[string]cachedJobsEntry),
-		listFn: listFn,
+		cache:         make(map[string]cachedJobsEntry),
+		listFn:        listFn,
+		listProfileFn: func(_ string, sessionID string) ([]Job, error) { return listFn(sessionID) },
 	}
 }
 
@@ -439,23 +452,32 @@ func jobsSignature(jobsDir string) string {
 }
 
 func (r *CachedReader) List(sessionID string) ([]Job, error) {
+	return r.ListForProfile("", sessionID)
+}
+
+func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) {
 	if sessionID == "" {
 		return nil, nil
 	}
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	signature := jobsSignature(jobsDir)
+	cacheKey := profile + "\x00" + sessionID
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if entry, ok := r.cache[sessionID]; ok && entry.signature == signature {
+	if entry, ok := r.cache[cacheKey]; ok && entry.signature == signature {
 		return entry.jobs, nil
 	}
 
-	jobs, err := r.listFn(sessionID)
+	listFn := r.listProfileFn
+	if listFn == nil {
+		listFn = func(_ string, id string) ([]Job, error) { return r.listFn(id) }
+	}
+	jobs, err := listFn(profile, sessionID)
 	if err != nil {
 		return jobs, err
 	}
-	r.cache[sessionID] = cachedJobsEntry{jobs: jobs, signature: signature}
+	r.cache[cacheKey] = cachedJobsEntry{jobs: jobs, signature: signature}
 	return jobs, nil
 }

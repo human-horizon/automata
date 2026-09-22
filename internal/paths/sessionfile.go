@@ -183,21 +183,13 @@ func DeleteSessionJSONL(sessionID, cwd, agentDir string) (string, error) {
 }
 
 // FamiliarsJSONLPath returns the absolute path to familiars.json for the given
-// session. Profile-aware: when profile is non-empty the file lives under
-// ~/.ai/automata/profiles/<profile-slug>/sessions/<sessionID>/familiars.json.
+// session under the canonical profile-scoped sessions directory.
 //
-// IMPORTANT: profile names are case-preserved in memory (e.g. "HumanHorizon")
-// but the on-disk layout uses the lowercase slug ("humanhorizon"). We must
-// run the same ProfileSlug normalisation here as in paths.go, otherwise
-// ReadFile/WriteFile silently miss the directory and RemoveFamiliar becomes
-// a no-op — which leaves the familiar in familiars.json and the chat panel
-// resurrects it on the next poll. (See Anya's report 2026-08-25.)
+// Profile names are case-preserved in memory (e.g. "HumanHorizon") but the
+// on-disk layout uses the normalized slug ("humanhorizon"). Empty profiles use
+// the canonical "default" profile, just like SessionDir and StatePath.
 func FamiliarsJSONLPath(profile, sessionID string) string {
-	base := BaseDir()
-	if profile != "" {
-		base = ProfileDir(profile)
-	}
-	return filepath.Join(base, "sessions", sessionID, "familiars.json")
+	return filepath.Join(SessionDir(profile, sessionID), "familiars.json")
 }
 
 // ClearFamiliarsJSONL writes an empty list ("[]") to the session's

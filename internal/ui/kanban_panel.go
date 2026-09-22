@@ -174,9 +174,14 @@ func (k *KanbanPanel) setupWatcher() {
 // closeWatcher stops and releases the file watcher if one is attached.
 func (k *KanbanPanel) closeWatcher() {
 	if k.watcher != nil {
-		k.watcher.Close()
+		_ = k.watcher.Close()
 		k.watcher = nil
 	}
+}
+
+// Close releases the Kanban filesystem watcher.
+func (k *KanbanPanel) Close() {
+	k.closeWatcher()
 }
 
 // watchKanbanCmd blocks on the fsnotify event channel and returns a single
@@ -354,7 +359,7 @@ func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 					}
 					kanban.UpdateStatus(k.pendingTask.Path, status)
 					// Write to chat's status.json so the agent picks it up
-					writeTaskToChatStatus(chat.SessionID, k.pendingTask.Title, k.pendingTask.Path)
+					writeTaskToChatStatus(k.profile, chat.SessionID, k.pendingTask.Title, k.pendingTask.Path)
 					// Notify the chat directly via callback
 					if k.onTaskAssigned != nil {
 						k.onTaskAssigned(chat.SessionID, k.pendingTask.Title)
@@ -980,7 +985,7 @@ func (c *kanbanColPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 					task := c.tasks[row]
 					// If moving from progress to todo, notify the chat
 					if task.Status == "progress" && btn == "todo" && task.AssignedTo != "" {
-						writeTaskRemovedFromChat(task.AssignedTo, task.Title)
+						writeTaskRemovedFromChat(c.parent.profile, task.AssignedTo, task.Title)
 					}
 					kanban.UpdateStatus(task.Path, btn)
 					if btn == "todo" {
@@ -1126,30 +1131,8 @@ func (c *kanbanColPanel) hitTest(y, x int) (int, string) {
 
 // writeTaskToChatStatus writes a task assignment to the chat's status.json
 // so the just-pi extension can pick it up on agent_end.
-func writeTaskToChatStatus(sessionID, taskTitle, taskPath string) {
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	base := os.Getenv("AI_DATA_HOME")
-	if base == "" {
-		base = filepath.Join(home, ".ai", "automata")
-	}
-	// Extract profile from sessionID (before __)
-	profile := "default"
-	if idx := strings.Index(sessionID, "__"); idx > 0 {
-		p := strings.ToLower(strings.TrimSpace(sessionID[:idx]))
-		var b strings.Builder
-		for _, r := range p {
-			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-				b.WriteRune(r)
-			} else if b.Len() > 0 && b.String()[b.Len()-1] != '-' {
-				b.WriteRune('-')
-			}
-		}
-		profile = strings.Trim(b.String(), "-")
-	}
-	statusPath := filepath.Join(base, "profiles", profile, "sessions", sessionID, "status.json")
+func writeTaskToChatStatus(profile, sessionID, taskTitle, taskPath string) {
+	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 
 	// Read existing status
 	var status map[string]interface{}
@@ -1171,35 +1154,8 @@ func writeTaskToChatStatus(sessionID, taskTitle, taskPath string) {
 }
 
 // writeTaskRemovedFromChat notifies the chat that a task was removed from progress.
-func writeTaskRemovedFromChat(sessionID, taskTitle string) {
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	base := os.Getenv("AI_DATA_HOME")
-	if base == "" {
-		base = filepath.Join(home, ".ai", "automata")
-	}
-	profile := "default"
-	if idx := strings.Index(sessionID, "__"); idx > 0 {
-		p := strings.ToLower(strings.TrimSpace(sessionID[:idx]))
-		var b strings.Builder
-		for _, r := range p {
-			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-				b.WriteRune(r)
-			} else if b.Len() > 0 && b.String()[b.Len()-1] != '-' {
-				b.WriteRune('-')
-			}
-		}
-		profile = strings.Trim(b.String(), "-")
-	}
-	statusPath := filepath.Join(base, "profiles", profile, "sessions", sessionID, "status.json")
-
-	// Debug: log the path
-	logFile := filepath.Join(home, ".automata-debug.log")
-	logLine := fmt.Sprintf("[%s] writeTaskToChatStatus sessionID=%q profile=%q path=%q\n", time.Now().Format(time.RFC3339), sessionID, profile, statusPath)
-	os.MkdirAll(filepath.Dir(logFile), 0755)
-	os.WriteFile(logFile, []byte(logLine), 0644)
+func writeTaskRemovedFromChat(profile, sessionID, taskTitle string) {
+	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 
 	var status map[string]interface{}
 	if data, err := os.ReadFile(statusPath); err == nil {

@@ -7,10 +7,64 @@ import (
 	"testing"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/ai-knowledge/memory"
 	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 )
+
+type testNotesClipboard struct {
+	readText  string
+	readErr   error
+	readCount int
+	written   string
+	writeErr  error
+}
+
+func (c *testNotesClipboard) Read() (string, error) {
+	c.readCount++
+	return c.readText, c.readErr
+}
+
+func (c *testNotesClipboard) Write(text string) error {
+	c.written = text
+	return c.writeErr
+}
+
+func clickNotesToolbar(t *testing.T, cp *ContextPanel, action notesClipboardAction) {
+	t.Helper()
+	x := -1
+	for candidate := 0; candidate < 100; candidate++ {
+		if cp.notesToolbarActionAt(candidate) == action {
+			x = candidate
+			break
+		}
+	}
+	if x < 0 {
+		t.Fatalf("toolbar action %q is not hit-testable", action)
+	}
+	cmd := cp.handleMouse(tea.MouseMsg{
+		X:      x,
+		Y:      notesToolbarRow,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	if cmd != nil {
+		cp.Update(cmd())
+	}
+}
+
+func confirmNotesPaste(t *testing.T, cp *ContextPanel) {
+	t.Helper()
+	if cp.notesPasteModal == nil {
+		t.Fatal("expected paste confirmation modal")
+	}
+	cmd := cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmd == nil {
+		t.Fatal("confirmation did not start clipboard read")
+	}
+	cp.Update(cmd())
+}
 
 // TestContextPanelEmptyDomain verifies the placeholder for a missing domain.
 func TestContextPanelEmptyDomain(t *testing.T) {
@@ -32,6 +86,287 @@ func TestContextPanelNoNotes(t *testing.T) {
 	out := cp.View(40, 10)
 	if !strings.Contains(out, "No notes") {
 		t.Fatalf("expected 'No notes' placeholder, got:\n%s", out)
+	}
+}
+
+func TestContextPanelNotesToolbarFitsNarrowWidth(t *testing.T) {
+	cp := NewContextPanel("profile")
+	view := cp.View(15, 5)
+	lines := strings.Split(view, "\n")
+	if len(lines) != 5 {
+		t.Fatalf("expected five rendered lines, got %d:\n%s", len(lines), view)
+	}
+	if got := ansi.StringWidth(ansi.Strip(lines[notesToolbarRow])); got > 15 {
+		t.Fatalf("toolbar width = %d, want <= 15: %q", got, lines[notesToolbarRow])
+	}
+}
+
+func TestContextPanelNotesToolbarHasVerticalPadding(t *testing.T) {
+	cp := NewContextPanel("profile")
+	lines := strings.Split(ansi.Strip(cp.View(40, 8)), "\n")
+	if len(lines) != 8 {
+		t.Fatalf("expected eight rendered lines, got %d", len(lines))
+	}
+	if strings.TrimSpace(lines[notesToolbarRow-1]) != "" {
+		t.Fatalf("expected blank row above toolbar, got %q", lines[notesToolbarRow-1])
+	}
+	if !strings.Contains(lines[notesToolbarRow], "Copy") {
+		t.Fatalf("expected toolbar on row %d, got %q", notesToolbarRow, lines[notesToolbarRow])
+	}
+	if strings.TrimSpace(lines[notesToolbarRow+1]) != "" {
+		t.Fatalf("expected blank row below toolbar, got %q", lines[notesToolbarRow+1])
+	}
+}
+
+func TestContextPanelNotesToolbarRendersAndCopiesAllNotes(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	profile := "ctx-clipboard-copy-profile"
+	domain := "ctx-clipboard-copy-domain"
+	domainDir := paths.DomainDir(profile, domain)
+	if err := os.MkdirAll(domainDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	notes := `[{"title":"First","sections":[{"title":"Decision","content":"keep"}]},{"title":"Second","sections":[{"title":"Code","content":"copy me"}]}]`
+	if err := os.WriteFile(filepath.Join(domainDir, "notes.json"), []byte(notes), 0o644); err != nil {
+		t.Fatalf("write notes: %v", err)
+	}
+
+	cp := NewContextPanel(profile)
+	clipboard := &testNotesClipboard{}
+	cp.notesClipboard = clipboard
+	cp.SetDomain(domain)
+	t.Cleanup(func() { cp.closeNotesWatcher() })
+
+	plain := ansi.Strip(cp.View(80, 8))
+	for _, want := range []string{"Copy", "Paste +", "Paste replace"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("toolbar is missing %q:\n%s", want, plain)
+		}
+	}
+
+	clickNotesToolbar(t, cp, notesClipboardCopy)
+	if !strings.Contains(clipboard.written, `"First"`) || !strings.Contains(clipboard.written, `"Second"`) {
+		t.Fatalf("copy did not include all notes: %s", clipboard.written)
+	}
+	if !strings.Contains(clipboard.written, `"sections"`) || !strings.Contains(clipboard.written, `"Decision"`) {
+		t.Fatalf("copy did not preserve sections: %s", clipboard.written)
+	}
+	if cp.expandedNotes["note-0"] {
+		t.Fatal("clicking Copy unexpectedly expanded a note")
+	}
+	if cp.notesStatus != "✓ Copied" {
+		t.Fatalf("copy status = %q, want success status", cp.notesStatus)
+	}
+}
+
+func TestContextPanelPasteAddAndReplaceNotes(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	profile := "ctx-clipboard-paste-profile"
+	domain := "ctx-clipboard-paste-domain"
+	domainDir := paths.DomainDir(profile, domain)
+	if err := os.MkdirAll(domainDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initial := `[{"title":"Existing","sections":[{"content":"old"}]}]`
+	if err := os.WriteFile(filepath.Join(domainDir, "notes.json"), []byte(initial), 0o644); err != nil {
+		t.Fatalf("write notes: %v", err)
+	}
+
+	cp := NewContextPanel(profile)
+	clipboard := &testNotesClipboard{
+		readText: `[{"title":"Incoming","sections":[{"content":"new"}]}]`,
+	}
+	cp.notesClipboard = clipboard
+	cp.SetDomain(domain)
+	cp.closeNotesWatcher()
+	t.Cleanup(func() { cp.closeNotesWatcher() })
+
+	clickNotesToolbar(t, cp, notesClipboardAdd)
+	if clipboard.readCount != 0 {
+		t.Fatalf("paste add read clipboard before confirmation: %d", clipboard.readCount)
+	}
+	confirmNotesPaste(t, cp)
+	data, err := memory.Read(profile, domain)
+	if err != nil {
+		t.Fatalf("read after add: %v", err)
+	}
+	if len(data.Notes) != 2 || data.Notes[0].Title != "Existing" || data.Notes[1].Title != "Incoming" {
+		t.Fatalf("add result = %+v", data.Notes)
+	}
+
+	clipboard.readText = `[{"title":"Replacement","sections":[{"content":"replace"}]}]`
+	clickNotesToolbar(t, cp, notesClipboardReplace)
+	if clipboard.readCount != 1 {
+		t.Fatalf("replace read clipboard before confirmation: %d", clipboard.readCount)
+	}
+	confirmNotesPaste(t, cp)
+	data, err = memory.Read(profile, domain)
+	if err != nil {
+		t.Fatalf("read after replace: %v", err)
+	}
+	if len(data.Notes) != 1 || data.Notes[0].Title != "Replacement" {
+		t.Fatalf("replace result = %+v", data.Notes)
+	}
+	if cp.notesStatus != "✓ Replaced" {
+		t.Fatalf("replace status = %q, want success status", cp.notesStatus)
+	}
+}
+
+func TestContextPanelPasteConfirmationCancelsWithoutReading(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	profile := "ctx-clipboard-confirmation-profile"
+	domain := "ctx-clipboard-confirmation-domain"
+	domainDir := paths.DomainDir(profile, domain)
+	if err := os.MkdirAll(domainDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(domainDir, "notes.json")
+	initial := `[{"title":"Keep"}]`
+	if err := os.WriteFile(path, []byte(initial), 0o644); err != nil {
+		t.Fatalf("write notes: %v", err)
+	}
+
+	clipboard := &testNotesClipboard{readText: `[{"title":"Incoming"}]`}
+	cp := NewContextPanel(profile)
+	cp.notesClipboard = clipboard
+	cp.SetDomain(domain)
+	cp.closeNotesWatcher()
+	t.Cleanup(func() { cp.closeNotesWatcher() })
+
+	clickNotesToolbar(t, cp, notesClipboardAdd)
+	if cp.notesPasteModal == nil || !strings.Contains(cp.notesPasteModal.Content, "Add notes") {
+		t.Fatal("expected add confirmation")
+	}
+	modalView := ansi.Strip(cp.View(60, 10))
+	for _, want := range []string{"Add notes", "[Yes]", "[No]"} {
+		if !strings.Contains(modalView, want) {
+			t.Fatalf("confirmation view is missing %q:\n%s", want, modalView)
+		}
+	}
+	cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if cp.notesPasteModal != nil {
+		t.Fatal("N should close add confirmation")
+	}
+
+	clickNotesToolbar(t, cp, notesClipboardReplace)
+	if cp.notesPasteModal == nil || !strings.Contains(cp.notesPasteModal.Content, "Replace") {
+		t.Fatal("expected replace confirmation")
+	}
+	cp.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cp.notesPasteModal != nil {
+		t.Fatal("Esc should close replace confirmation")
+	}
+
+	clickNotesToolbar(t, cp, notesClipboardAdd)
+	if cp.notesPasteModal == nil {
+		t.Fatal("expected confirmation for No callback")
+	}
+	cp.notesPasteModal.Buttons[1].Action()
+	if cp.notesPasteModal != nil {
+		t.Fatal("No should close confirmation")
+	}
+
+	clickNotesToolbar(t, cp, notesClipboardReplace)
+	cp.View(80, 10)
+	cp.Update(tea.MouseMsg{X: 0, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if cp.notesPasteModal != nil {
+		t.Fatal("outside click should close confirmation")
+	}
+	if clipboard.readCount != 0 {
+		t.Fatalf("cancelled paste read clipboard %d times", clipboard.readCount)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read notes after cancellation: %v", err)
+	}
+	if string(got) != initial {
+		t.Fatalf("cancelled paste changed notes: %s", got)
+	}
+}
+
+func TestContextPanelClipboardErrorsAndEmptyReplace(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	profile := "ctx-clipboard-errors-profile"
+	domain := "ctx-clipboard-errors-domain"
+	domainDir := paths.DomainDir(profile, domain)
+	if err := os.MkdirAll(domainDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(domainDir, "notes.json")
+	if err := os.WriteFile(path, []byte(`[{"title":"Keep"}]`), 0o644); err != nil {
+		t.Fatalf("write notes: %v", err)
+	}
+
+	cp := NewContextPanel(profile)
+	cp.SetDomain(domain)
+	cp.closeNotesWatcher()
+	t.Cleanup(func() { cp.closeNotesWatcher() })
+
+	cp.notesClipboard = &testNotesClipboard{writeErr: os.ErrPermission}
+	clickNotesToolbar(t, cp, notesClipboardCopy)
+	if cp.notesStatus != "✗ Clipboard error" {
+		t.Fatalf("copy error status = %q", cp.notesStatus)
+	}
+
+	cp.notesClipboard = &testNotesClipboard{readErr: os.ErrPermission}
+	clickNotesToolbar(t, cp, notesClipboardAdd)
+	confirmNotesPaste(t, cp)
+	if cp.notesStatus != "✗ Clipboard error" {
+		t.Fatalf("paste error status = %q", cp.notesStatus)
+	}
+
+	cp.notesClipboard = &testNotesClipboard{readText: "[]"}
+	clickNotesToolbar(t, cp, notesClipboardReplace)
+	confirmNotesPaste(t, cp)
+	data, err := memory.Read(profile, domain)
+	if err != nil {
+		t.Fatalf("read after empty replace: %v", err)
+	}
+	if len(data.Notes) != 0 {
+		t.Fatalf("empty replace left notes: %+v", data.Notes)
+	}
+}
+
+func TestContextPanelInvalidPasteLeavesNotesUnchanged(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	profile := "ctx-clipboard-invalid-profile"
+	domain := "ctx-clipboard-invalid-domain"
+	domainDir := paths.DomainDir(profile, domain)
+	if err := os.MkdirAll(domainDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(domainDir, "notes.json")
+	initial := `[{"title":"Keep","sections":[{"content":"unchanged"}]}]`
+	if err := os.WriteFile(path, []byte(initial), 0o644); err != nil {
+		t.Fatalf("write notes: %v", err)
+	}
+
+	clipboard := &testNotesClipboard{readText: "not json"}
+	cp := NewContextPanel(profile)
+	cp.notesClipboard = clipboard
+	cp.SetDomain(domain)
+	cp.closeNotesWatcher()
+	t.Cleanup(func() { cp.closeNotesWatcher() })
+
+	clickNotesToolbar(t, cp, notesClipboardAdd)
+	if clipboard.readCount != 0 {
+		t.Fatalf("invalid paste read clipboard before confirmation: %d", clipboard.readCount)
+	}
+	confirmNotesPaste(t, cp)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read notes after invalid paste: %v", err)
+	}
+	if string(got) != initial {
+		t.Fatalf("invalid paste changed notes: %s", got)
+	}
+	if cp.notesStatus != "✗ Invalid notes" {
+		t.Fatalf("invalid paste status = %q", cp.notesStatus)
 	}
 }
 
@@ -194,7 +529,7 @@ func TestContextPanelNoteMouseToggle(t *testing.T) {
 		t.Fatalf("expected collapsed note, got:\n%s", out)
 	}
 
-	cp.handleMouse(tea.MouseMsg{Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	cp.handleMouse(tea.MouseMsg{Y: notesContentStartRow, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	out = cp.View(60, 10)
 	if !strings.Contains(out, "▾ Project") || !strings.Contains(out, "content") || !strings.Contains(out, "│") {
 		t.Fatalf("expected expanded note after mouse click, got:\n%s", out)

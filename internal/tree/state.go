@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/HumanHorizon/automata/internal/paths"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
@@ -44,7 +45,31 @@ func stateFilePath(profile string) (string, error) {
 }
 
 // SaveState serializes the tree and writes it to the unified profile state path.
+var (
+	createStateTemp = os.CreateTemp
+	writeStateTemp  = func(file *os.File, data []byte) error {
+		_, err := file.Write(data)
+		return err
+	}
+	syncStateTemp  = func(file *os.File) error { return file.Sync() }
+	closeStateTemp = func(file *os.File) error { return file.Close() }
+	renameState    = os.Rename
+	syncStateDir   = func(path string) error {
+		dir, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer dir.Close()
+		return dir.Sync()
+	}
+)
+
+// SaveState serializes the tree and atomically replaces the unified profile
+// state path. The temporary file lives beside state.json so Rename is atomic.
 func (t *Tree) SaveState() error {
+	t.saveMu.Lock()
+	defer t.saveMu.Unlock()
+
 	state := t.toState()
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -54,8 +79,34 @@ func (t *Tree) SaveState() error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+
+	tmp, err := createStateTemp(filepath.Dir(path), ".state-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary state: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temporary state: %w", err)
+	}
+	if err := writeStateTemp(tmp, data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary state: %w", err)
+	}
+	if err := syncStateTemp(tmp); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary state: %w", err)
+	}
+	if err := closeStateTemp(tmp); err != nil {
+		return fmt.Errorf("close temporary state: %w", err)
+	}
+	if err := renameState(tmpPath, path); err != nil {
+		return fmt.Errorf("replace %s: %w", path, err)
+	}
+	if err := syncStateDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync state directory: %w", err)
 	}
 	return nil
 }

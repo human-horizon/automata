@@ -181,6 +181,16 @@ func (c *Container) SetOnTaskAssigned(fn func(sessionID, taskTitle string)) {
 	}
 }
 
+// Close releases filesystem watchers owned by the container's panels.
+func (c *Container) Close() {
+	if c.knowledgePanel != nil {
+		c.knowledgePanel.Close()
+	}
+	if c.contextPanel != nil {
+		c.contextPanel.Close()
+	}
+}
+
 // RefreshKnowledge tells the knowledge and context panels to re-read data
 // from disk. Call from a tick.
 func (c *Container) RefreshKnowledge() {
@@ -210,7 +220,7 @@ type KnowledgeRefreshMsg struct {
 func (c *Container) RefreshKnowledgeCmd() tea.Cmd {
 	sessionID := ""
 	domain := ""
-	profile := ""
+	profile := c.profile
 	if c.knowledgePanel != nil {
 		sessionID = c.knowledgePanel.sessionID
 	}
@@ -225,10 +235,10 @@ func (c *Container) RefreshKnowledgeCmd() tea.Cmd {
 			Profile:   profile,
 		}
 		if sessionID != "" {
-			if d, err := akcontext.Read(sessionID); err == nil {
+			if d, err := akcontext.ReadForProfile(profile, sessionID); err == nil {
 				msg.Context = d
 			}
-			if j, err := akjobs.List(sessionID); err == nil {
+			if j, err := akjobs.ListForProfile(profile, sessionID); err == nil {
 				msg.Jobs = j
 			}
 		}
@@ -298,6 +308,12 @@ func (c *Container) SetFocus(panel warp.Panel) {
 // SetProfile sets the profile used to compute folder domains.
 func (c *Container) SetProfile(profile string) {
 	c.profile = profile
+	if c.knowledgePanel != nil {
+		c.knowledgePanel.SetProfile(profile)
+	}
+	if c.contextPanel != nil {
+		c.contextPanel.SetProfile(profile)
+	}
 }
 
 // PlanWidth returns the fixed knowledge panel width in characters.
