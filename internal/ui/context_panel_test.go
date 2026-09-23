@@ -1,15 +1,18 @@
 package ui
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/memory"
 	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -405,6 +408,104 @@ func TestContextPanelRendersNotes(t *testing.T) {
 	}
 	if !strings.Contains(out, "first note") {
 		t.Fatalf("expected first note, got:\n%s", out)
+	}
+}
+
+func TestContextPanelRecoversClosedNotesWatcher(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	cp := NewContextPanel("watcher-profile")
+	cp.SetDomain("watcher-domain")
+	defer cp.Close()
+	oldWatcher := cp.notesWatcher
+	if oldWatcher == nil {
+		t.Fatal("test setup did not create notes watcher")
+	}
+	cmd := cp.watchNotesCmd()
+	if cmd == nil {
+		t.Fatal("notes watcher command is nil")
+	}
+	messages := make(chan tea.Msg, 1)
+	go func() { messages <- cmd() }()
+	go func() { oldWatcher.Errors <- errors.New("synthetic notes watcher error") }()
+	select {
+	case msg := <-messages:
+		errorMsg, ok := msg.(notesWatcherErrorMsg)
+		if !ok || errorMsg.err == nil {
+			t.Fatalf("notes watcher error message = %#v", msg)
+		}
+		cp.Update(msg)
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed notes watcher did not report recovery")
+	}
+	if cp.notesWatcher == nil || cp.notesWatcher == oldWatcher {
+		t.Fatal("notes watcher was not recreated")
+	}
+}
+
+func TestTruncatePanelTextIsUnicodeAndCellWidthSafe(t *testing.T) {
+	text := "你好世界🙂abc"
+	for _, width := range []int{1, 2, 3, 4, 5, 6, 8} {
+		got := truncatePanelText(text, width)
+		if !utf8.ValidString(got) {
+			t.Fatalf("width %d produced invalid UTF-8: %q", width, got)
+		}
+		if gotWidth := lipgloss.Width(got); gotWidth > width {
+			t.Fatalf("width %d produced %d cells: %q", width, gotWidth, got)
+		}
+	}
+}
+
+func TestContextPanelSurfacesNotesReadError(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	const domain = "broken-notes"
+	dir := paths.DomainDir("", domain)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.json"), []byte("not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cp := NewContextPanel("")
+	t.Cleanup(func() { cp.Close() })
+	cp.SetDomain(domain)
+	if cp.data != nil {
+		t.Fatal("corrupt notes produced data")
+	}
+	if !strings.Contains(cp.notesStatus, "Notes read error") {
+		t.Fatalf("notes error was not surfaced: %q", cp.notesStatus)
+	}
+}
+
+func TestContextPanelEmptyProfileUsesDefault(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "wrong-profile")
+	const domain = "default-domain"
+
+	defaultDir := paths.DomainDir("", domain)
+	wrongDir := paths.DomainDir("wrong-profile", domain)
+	for _, dir := range []string{defaultDir, wrongDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(defaultDir, "notes.json"), []byte(`[{"title":"Default title"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wrongDir, "notes.json"), []byte(`[{"title":"Wrong title"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cp := NewContextPanel("")
+	t.Cleanup(func() { cp.Close() })
+	cp.SetDomain(domain)
+	if got := cp.domainDirForActive(); got != defaultDir {
+		t.Fatalf("empty profile domain directory = %q, want %q", got, defaultDir)
+	}
+	if cp.data == nil || len(cp.data.Notes) != 1 || cp.data.Notes[0].Title != "Default title" {
+		t.Fatalf("expected default notes, got %+v", cp.data)
 	}
 }
 

@@ -57,6 +57,61 @@ func TestStopSessionRuntimeClearsOwnerAndFamiliarState(t *testing.T) {
 	}
 }
 
+func TestStopSessionRuntimeSurfacesActiveSessionPersistenceFailure(t *testing.T) {
+	tr := tree.New()
+	persistErr := errors.New("active state unavailable")
+	tr.SetSaveStateFunc(func() error { return persistErr })
+	const sessionID = "owner"
+	app := &App{
+		tree:                  tr,
+		profile:               "test",
+		activeSessions:        map[string]struct{}{sessionID: {}},
+		runningSessions:       map[string]struct{}{sessionID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "owner", "", nil)},
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchPending:   make(map[string]bool),
+	}
+
+	err := app.stopSessionRuntime(sessionID, stopSessionOptions{persistInactive: true})
+	if err == nil || !runtimeStopWasCommitted(err) || !errors.Is(err, persistErr) {
+		t.Fatalf("persistence error = %v, committed=%v", err, runtimeStopWasCommitted(err))
+	}
+	if _, ok := app.emulatorCache[sessionID]; ok {
+		t.Fatal("runtime emulator remained after committed stop")
+	}
+	if _, ok := app.activeSessions[sessionID]; ok {
+		t.Fatal("active session remained after committed stop")
+	}
+}
+
+func TestCleanupDeletedTreeItemAbortsOnActiveSessionPersistenceFailure(t *testing.T) {
+	tr := tree.New()
+	tr.Profile = "test"
+	tr.AddChat("chat")
+	item := tr.Root()[0]
+	tr.SetSaveStateFunc(func() error { return errors.New("active state unavailable") })
+	sessionID := tr.SessionKeyOf(item)
+	app := &App{
+		tree:                  tr,
+		profile:               "test",
+		currentSessionID:      sessionID,
+		activeSessions:        map[string]struct{}{sessionID: {}},
+		runningSessions:       map[string]struct{}{sessionID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "chat", "", nil)},
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchPending:   make(map[string]bool),
+	}
+
+	if err := app.cleanupDeletedTreeItem(item); err == nil {
+		t.Fatal("cleanup unexpectedly succeeded")
+	}
+	if tr.Root()[0] != item {
+		t.Fatal("tree item was removed after active-session persistence failure")
+	}
+}
+
 func TestCleanupDeletedTreeItemLeavesRuntimeOnJobPreflightFailure(t *testing.T) {
 	tr := tree.New()
 	tr.Profile = "test"

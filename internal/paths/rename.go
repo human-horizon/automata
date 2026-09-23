@@ -200,7 +200,7 @@ func RewriteFamiliarSessionIDs(profile, oldOwnerID, newOwnerID string) (map[stri
 	if err != nil {
 		return nil, fmt.Errorf("encode familiars.json: %w", err)
 	}
-	if err := os.WriteFile(path, updated, 0o644); err != nil {
+	if err := writeFileAtomic(path, append(updated, '\n'), 0o644); err != nil {
 		return nil, fmt.Errorf("write familiars.json: %w", err)
 	}
 	return mapping, nil

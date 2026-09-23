@@ -7,19 +7,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
-// effectiveProfile preserves explicit profile precedence and uses AI_PROFILE
-// only when the caller leaves the profile empty. paths.DomainDir applies the
-// canonical slug and default profile mapping.
+// effectiveProfile keeps memory reads and writes in the explicit profile
+// scope. paths.DomainDir maps an empty profile to the canonical default.
 func effectiveProfile(profile string) string {
-	if profile != "" {
-		return profile
-	}
-	return os.Getenv("AI_PROFILE")
+	return profile
 }
 
 type NoteSection struct {
@@ -37,23 +32,23 @@ type Data struct {
 	Notes []NoteSummary
 }
 
-// CachedReader caches notes reads by mtime so we only re-read when the file changes.
+// CachedReader caches notes reads by file signature so we only re-read when the file changes.
 type CachedReader struct {
 	mu    sync.Mutex
 	cache map[string]cachedNotesEntry
 }
 
 type cachedNotesEntry struct {
-	data  *Data
-	mtime time.Time
+	data      *Data
+	signature string
 }
 
-// NewCachedReader creates a notes reader with mtime caching.
+// NewCachedReader creates a notes reader with file-signature caching.
 func NewCachedReader() *CachedReader {
 	return &CachedReader{cache: make(map[string]cachedNotesEntry)}
 }
 
-// Invalidate removes a domain from the mtime cache so a subsequent read sees
+// Invalidate removes a domain from the cache so a subsequent read sees
 // an immediately replaced notes file even when filesystem timestamps are coarse.
 func (r *CachedReader) Invalidate(profile, domain string) {
 	if domain == "" {
@@ -130,61 +125,63 @@ func Write(profile, domain string, notes []NoteSummary) error {
 	return nil
 }
 
-// Read returns notes for a domain, using mtime cache to skip unchanged files.
+func emptyData() *Data {
+	return &Data{Notes: []NoteSummary{}}
+}
+
+func notesSignature(info os.FileInfo) string {
+	return fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
+}
+
+func readNotesFile(path string) (*Data, string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return emptyData(), "missing", nil
+		}
+		return nil, "", fmt.Errorf("stat notes file %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, "", fmt.Errorf("notes path %s is not a regular file", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("read notes file %s: %w", path, err)
+	}
+	var notes []NoteSummary
+	if err := json.Unmarshal(raw, &notes); err != nil {
+		return nil, "", fmt.Errorf("decode notes file %s: %w", path, err)
+	}
+	return &Data{Notes: normalizeNotes(notes)}, notesSignature(info), nil
+}
+
+// Read returns notes for a domain, using file signatures to skip unchanged files.
 func (r *CachedReader) Read(profile, domain string) (*Data, error) {
 	if domain == "" {
-		return &Data{Notes: []NoteSummary{}}, nil
+		return emptyData(), nil
 	}
 	path := filepath.Join(paths.DomainDir(effectiveProfile(profile), domain), "notes.json")
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Check mtime cache
-	fi, err := os.Stat(path)
+	data, signature, err := readNotesFile(path)
 	if err != nil {
-		// File missing — cache empty result
-		empty := &Data{Notes: []NoteSummary{}}
-		r.cache[path] = cachedNotesEntry{data: empty, mtime: time.Time{}}
-		return empty, nil
+		return nil, err
 	}
-	if entry, ok := r.cache[path]; ok && entry.mtime.Equal(fi.ModTime()) {
+	if entry, ok := r.cache[path]; ok && entry.signature == signature {
 		return entry.data, nil
 	}
-
-	// Read file
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		empty := &Data{Notes: []NoteSummary{}}
-		r.cache[path] = cachedNotesEntry{data: empty, mtime: fi.ModTime()}
-		return empty, nil
-	}
-	var notes []NoteSummary
-	_ = json.Unmarshal(raw, &notes)
-	data := &Data{Notes: normalizeNotes(notes)}
-	r.cache[path] = cachedNotesEntry{data: data, mtime: fi.ModTime()}
+	r.cache[path] = cachedNotesEntry{data: data, signature: signature}
 	return data, nil
 }
 
 func Read(profile, domain string) (*Data, error) {
 	if domain == "" {
-		return &Data{
-			Notes: []NoteSummary{},
-		}, nil
+		return emptyData(), nil
 	}
 
 	notesPath := filepath.Join(paths.DomainDir(effectiveProfile(profile), domain), "notes.json")
-
-	if raw, err := os.ReadFile(notesPath); err == nil {
-		data := &Data{
-			Notes: []NoteSummary{},
-		}
-		_ = json.Unmarshal(raw, &data.Notes)
-		data.Notes = normalizeNotes(data.Notes)
-		return data, nil
-	}
-
-	return &Data{
-		Notes: []NoteSummary{},
-	}, nil
+	data, _, err := readNotesFile(notesPath)
+	return data, err
 }

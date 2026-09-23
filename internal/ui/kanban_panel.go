@@ -14,6 +14,7 @@ import (
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/fsnotify/fsnotify"
 	warp "github.com/starframe-dev/warp"
 )
@@ -600,7 +601,7 @@ func (k *KanbanPanel) renderPicker(width, height int) string {
 	if k.assignmentErr != "" {
 		errLine := " Ошибка: " + k.assignmentErr
 		if lipgloss.Width(errLine) > width {
-			errLine = errLine[:width]
+			errLine = ansi.Truncate(errLine, width, "")
 		}
 		b.WriteString(errLine)
 		b.WriteString("\n")
@@ -614,7 +615,7 @@ func (k *KanbanPanel) renderPicker(width, height int) string {
 		}
 		line := fmt.Sprintf("  💬 %s", chat.Name)
 		if lipgloss.Width(line) > width {
-			line = line[:width]
+			line = ansi.Truncate(line, width, "")
 		}
 		b.WriteString(style.Render(line))
 		b.WriteString("\n")
@@ -861,9 +862,10 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	wrapLine := func(content string) string {
 		// Pad/truncate the visible content to fit inside the card.
 		if lipgloss.Width(content) > inner {
-			content = content[:inner]
+			content = ansi.Truncate(content, inner, "…")
 		}
-		pad := strings.Repeat(" ", inner-lipgloss.Width(content))
+		contentWidth := lipgloss.Width(content)
+		pad := strings.Repeat(" ", max(0, inner-contentWidth))
 		styled := bgStyle.Render(content + pad)
 		left := borderStyle.Render("│")
 		right := borderStyle.Render("│")
@@ -877,7 +879,7 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	}
 	title := task.Title
 	if lipgloss.Width(title) > titleMax {
-		title = title[:titleMax]
+		title = ansi.Truncate(title, titleMax, "")
 	}
 	titlePad := strings.Repeat(" ", titleMax-lipgloss.Width(title))
 	del := " ×"
@@ -898,8 +900,9 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 			}
 		}
 		assigned := fmt.Sprintf("  👤 %s", name)
-		if lipgloss.Width(assigned) > inner {
-			assigned = assigned[:inner]
+		assignedWidth := max(0, inner-styles.assigned.GetHorizontalPadding())
+		if lipgloss.Width(assigned) > assignedWidth {
+			assigned = ansi.Truncate(assigned, assignedWidth, "")
 		}
 		styled := styles.assigned.Render(assigned)
 		// Pad to fill the inner width after styling.
@@ -916,8 +919,9 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	// has been recorded. Mirrors the tree's status column.
 	if task.Substatus != "" {
 		sub := fmt.Sprintf("  ↳ %s", task.Substatus)
-		if lipgloss.Width(sub) > inner {
-			sub = sub[:inner]
+		subWidth := max(0, inner-styles.substatus.GetHorizontalPadding())
+		if lipgloss.Width(sub) > subWidth {
+			sub = ansi.Truncate(sub, subWidth, "")
 		}
 		styled := styles.substatus.Render(sub)
 		visW := lipgloss.Width(styled)
@@ -953,6 +957,9 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	href := "file://" + task.Path
 	hyperlinked := fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", href, label)
 	link := styles.cardPath.Render(hyperlinked)
+	if lipgloss.Width(link) > inner {
+		link = ansi.Truncate(link, inner, "")
+	}
 	visW := lipgloss.Width(link)
 	pad := ""
 	if visW < inner {
@@ -1333,8 +1340,12 @@ func (voidPanel) View(width, height int) string { return "" }
 func (voidPanel) Update(msg tea.Msg) tea.Cmd    { return nil }
 
 func padOrTruncate(s string, w int) string {
-	if lipgloss.Width(s) >= w {
-		return s[:w]
+	if w <= 0 {
+		return ""
 	}
-	return s + strings.Repeat(" ", w-lipgloss.Width(s))
+	visibleWidth := lipgloss.Width(s)
+	if visibleWidth > w {
+		return ansi.Truncate(s, w, "")
+	}
+	return s + strings.Repeat(" ", w-visibleWidth)
 }

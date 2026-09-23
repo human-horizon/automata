@@ -48,6 +48,33 @@ func TestReadTaskParsesSubstatus(t *testing.T) {
 	}
 }
 
+func TestUpdateStatusPreservesUnknownFrontmatter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metadata.md")
+	contents := "---\n" +
+		"title: Preserve metadata\n" +
+		"status: progress\n" +
+		"priority: high\n" +
+		"labels: [one, two]\n" +
+		"owner_note: \"keep: this\"\n" +
+		"---\nbody\n"
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpdateStatus(path, "done"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"priority: high", "labels: [one, two]", "owner_note: \"keep: this\""} {
+		if !strings.Contains(string(updated), want) {
+			t.Fatalf("unknown metadata %q was not preserved:\n%s", want, updated)
+		}
+	}
+}
+
 // TestUpdateStatusClearsSubstatus verifies that moving a task out of
 // "progress" wipes its substatus — the spec requires substatus to reflect
 // the agent's *current* activity, and a non-progress task has none.

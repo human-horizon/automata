@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -277,6 +278,61 @@ func TestRemoveFamiliarUpdatesFile(t *testing.T) {
 	}
 	if entries[0].SessionID != keepSID {
 		t.Errorf("kept entry mismatch: want %q got %q", keepSID, entries[0].SessionID)
+	}
+}
+
+func TestRemoveFamiliarPreservesUnknownMetadataAtomically(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const profile = "test"
+	const owner = "owner__sid"
+	path := FamiliarsJSONLPath(profile, owner)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := `[{"id":"keep","sessionId":"familiar__keep","created":"now","extra":{"keep":true}},{"id":"drop","sessionId":"familiar__drop","metadata":"remove"}]`
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveFamiliar(profile, owner, "familiar__drop"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var records []map[string]json.RawMessage
+	if err := json.Unmarshal(data, &records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records after remove = %d, want 1", len(records))
+	}
+	if _, ok := records[0]["extra"]; !ok {
+		t.Fatalf("unknown metadata was dropped: %s", data)
+	}
+	if strings.Contains(string(data), "familiar__drop") {
+		t.Fatalf("removed familiar remains: %s", data)
+	}
+}
+
+func TestClearFamiliarsJSONLIsAtomicAndCanonical(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	path := FamiliarsJSONLPath("", "owner")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`[{"id":"x"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearFamiliarsJSONL("", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "[]\n" {
+		t.Fatalf("cleared familiars = %q, want atomic canonical empty JSON", data)
 	}
 }
 

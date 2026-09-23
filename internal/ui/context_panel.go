@@ -11,6 +11,7 @@ import (
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/fsnotify/fsnotify"
 	warp "github.com/starframe-dev/warp"
 )
@@ -113,12 +114,15 @@ func (c *ContextPanel) Refresh() {
 func (c *ContextPanel) refresh() {
 	if c.domain == "" {
 		c.data = nil
+		c.notesStatus = ""
 		return
 	}
 	if d, err := c.notesReader.Read(c.profile, c.domain); err == nil {
 		c.data = d
+		c.notesStatus = ""
 	} else {
 		c.data = nil
+		c.notesStatus = "✗ Notes read error: " + err.Error()
 	}
 }
 
@@ -177,28 +181,35 @@ func (c *ContextPanel) watchNotesCmd() tea.Cmd {
 	}
 	w := c.notesWatcher
 	return func() tea.Msg {
-		_, ok := <-w.Events
-		if !ok {
-			return nil // watcher closed
+		select {
+		case _, ok := <-w.Events:
+			if !ok {
+				return notesWatcherErrorMsg{}
+			}
+			return notesChangedMsg{}
+		case err, ok := <-w.Errors:
+			if !ok {
+				return notesWatcherErrorMsg{}
+			}
+			return notesWatcherErrorMsg{err: err}
 		}
-		return notesChangedMsg{}
 	}
 }
 
 // domainDirForActive returns the on-disk path of the active domain
-// directory under the resolved profile. Explicit profiles win; an empty
-// profile falls back to AI_PROFILE, then paths.DomainDir applies the default.
+// directory under the explicit profile. paths.DomainDir maps an empty profile
+// to the canonical default.
 func (c *ContextPanel) domainDirForActive() string {
-	profile := c.profile
-	if profile == "" {
-		profile = os.Getenv("AI_PROFILE")
-	}
-	return paths.DomainDir(profile, c.domain)
+	return paths.DomainDir(c.profile, c.domain)
 }
 
 // notesChangedMsg is sent by watchNotesCmd when fsnotify reports a
 // change to the active domain directory (typically notes.json).
 type notesChangedMsg struct{}
+
+type notesWatcherErrorMsg struct {
+	err error
+}
 
 type notesClipboardAction string
 
@@ -279,6 +290,13 @@ func (c *ContextPanel) Update(msg tea.Msg) tea.Cmd {
 			c.handleNotesClipboard(msg)
 		case notesChangedMsg:
 			c.notesWatchPending = false
+			c.refresh()
+		case notesWatcherErrorMsg:
+			if msg.err != nil {
+				fmt.Fprintf(os.Stderr, "automata: notes watcher failed: %v\n", msg.err)
+			}
+			c.closeNotesWatcher()
+			c.setupNotesWatcher()
 			c.refresh()
 		}
 	}
@@ -717,14 +735,10 @@ func truncatePanelText(text string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	runes := []rune(text)
-	if len(runes) <= width {
+	if ansi.StringWidth(text) <= width {
 		return text
 	}
-	if width == 1 {
-		return string(runes[:1])
-	}
-	return string(runes[:width-1]) + "…"
+	return ansi.Truncate(text, width, "…")
 }
 
 func (c *ContextPanel) notesToolbarActionAt(x int) notesClipboardAction {

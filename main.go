@@ -150,7 +150,9 @@ func newApp(profile, piAgentDir string) (a *App) {
 		}
 		a.runningSessions[sessionID] = struct{}{}
 		a.activeSessions[sessionID] = struct{}{}
-		a.tree.SetActiveSessions(a.activeSessions)
+		if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
+			log.Printf("automata: persist assigned task session %q: %v", sessionID, err)
+		}
 		return em.Listen()
 	})
 
@@ -296,7 +298,9 @@ func newApp(profile, piAgentDir string) (a *App) {
 
 	container.SetOnPlanWidthChange(func(w int) {
 		t.SetPlanWidth(w)
-		t.SaveState()
+		if err := t.SaveState(); err != nil {
+			log.Printf("automata: persist plan width: %v", err)
+		}
 	})
 
 	a = &App{
@@ -491,19 +495,35 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 		a.container.ApplyKnowledgeRefresh(msg)
 		return a, nil
 
-	case statusWatcherClosedMsg:
-		// A closed watcher must never be re-armed.
-		a.statusWatchPending = false
-		a.statusWatcher = nil
-		return a, nil
-
-	case sessionWatcherClosedMsg:
-		if w, ok := a.sessionWatchers[msg.sessionID]; ok {
-			_ = w.Close()
-			delete(a.sessionWatchers, msg.sessionID)
+	case statusWatcherClosedMsg, statusWatcherErrorMsg:
+		if errorMsg, ok := msg.(statusWatcherErrorMsg); ok && errorMsg.err != nil {
+			log.Printf("automata: status watcher failed: %v", errorMsg.err)
 		}
-		delete(a.sessionWatchPending, msg.sessionID)
-		return a, nil
+		// Recreate the parent watcher after either a close or an fsnotify
+		// error. A failed watcher otherwise leaves status badges stale forever.
+		a.statusWatchPending = false
+		if a.statusWatcher != nil {
+			_ = a.statusWatcher.Close()
+			a.statusWatcher = nil
+		}
+		a.setupStatusWatcher()
+		a.recomputeTreeStatusBadges()
+		cmds := a.syncSessionWatchers()
+		cmds = append(cmds, a.watchTreeStatusCmd())
+		return a, tea.Batch(cmds...)
+
+	case sessionWatcherClosedMsg, sessionWatcherErrorMsg:
+		sessionID := msg.(interface{ sessionIDValue() string }).sessionIDValue()
+		if errorMsg, ok := msg.(sessionWatcherErrorMsg); ok && errorMsg.err != nil {
+			log.Printf("automata: session watcher %s failed: %v", sessionID, errorMsg.err)
+		}
+		if w, ok := a.sessionWatchers[sessionID]; ok {
+			_ = w.Close()
+			delete(a.sessionWatchers, sessionID)
+		}
+		delete(a.sessionWatchPending, sessionID)
+		a.recomputeTreeStatusBadges()
+		return a, tea.Batch(a.syncSessionWatchers()...)
 
 	case treeStatusChangedMsg:
 		// The status watcher fired — either sessionBaseDir() saw a new
@@ -616,8 +636,14 @@ func (a *App) restoreSessions() tea.Cmd {
 
 	// Persist only sessions that reach PtyReadyMsg. A failed restore must not
 	// leave stale IDs marked active in state.json.
+	previousActive := a.activeSessions
 	a.activeSessions = make(map[string]struct{})
-	a.tree.SetActiveSessions(a.activeSessions)
+	if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
+		a.activeSessions = previousActive
+		a.tree.SetActiveSessionsInMemory(previousActive)
+		log.Printf("automata: cannot persist restore-session cleanup: %v", err)
+		return nil
+	}
 
 	var cmds []tea.Cmd
 	for _, sessionID := range ids {
@@ -723,11 +749,15 @@ func (a *App) createChatEmulator(sessionID string) *portalis.Emulator {
 		}
 		em.OnCWDChange = func(path string) {
 			item.CWD = path
-			a.tree.SaveState()
+			if err := a.tree.SaveState(); err != nil {
+				log.Printf("automata: persist CWD for %q: %v", item.Name, err)
+			}
 		}
 		em.OnCommandHistoryChanged = func(history []string) {
 			item.CommandHistory = history
-			a.tree.SaveState()
+			if err := a.tree.SaveState(); err != nil {
+				log.Printf("automata: persist command history for %q: %v", item.Name, err)
+			}
 		}
 	}
 
@@ -784,7 +814,9 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 		_, cachedChat := a.emulatorCache[sessionID]
 		_, cachedFamiliar := a.familiarEmulatorCache[sessionID]
 		if cachedChat || cachedFamiliar {
-			_ = a.stopSessionRuntime(sessionID, stopSessionOptions{persistInactive: true})
+			if err := a.stopSessionRuntime(sessionID, stopSessionOptions{persistInactive: true}); err != nil {
+				log.Printf("automata: persist exited session %q: %v", sessionID, err)
+			}
 			// Let the active ChatPanel remove the dead tab and keep polling.
 			return nil, false
 		}
@@ -814,7 +846,9 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 		if _, alreadyActive := a.activeSessions[sessionID]; !alreadyActive {
 			a.activeSessions[sessionID] = struct{}{}
 			if a.tree != nil {
-				a.tree.SetActiveSessions(a.activeSessions)
+				if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
+					log.Printf("automata: persist active session %q: %v", sessionID, err)
+				}
 			}
 		}
 	}
@@ -949,7 +983,7 @@ func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
 		stopFamiliars:   true,
 		persistInactive: true,
 	}); err != nil {
-		if !runtimeStopWasCommitted(err) {
+		if !runtimeStopWasCommitted(err) || runtimeStopPersistenceFailed(err) {
 			return err
 		}
 		log.Printf("automata: delete runtime cleanup warning: %v", err)
@@ -977,7 +1011,7 @@ func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 		stopJobs:        true,
 		persistInactive: true,
 	})
-	if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
+	if stopErr != nil && (!runtimeStopWasCommitted(stopErr) || runtimeStopPersistenceFailed(stopErr)) {
 		return stopErr
 	}
 	if stopErr != nil {
@@ -1031,9 +1065,22 @@ type treeStatusChangedMsg struct {
 
 type statusWatcherClosedMsg struct{}
 
+type statusWatcherErrorMsg struct {
+	err error
+}
+
 type sessionWatcherClosedMsg struct {
 	sessionID string
 }
+
+func (m sessionWatcherClosedMsg) sessionIDValue() string { return m.sessionID }
+
+type sessionWatcherErrorMsg struct {
+	sessionID string
+	err       error
+}
+
+func (m sessionWatcherErrorMsg) sessionIDValue() string { return m.sessionID }
 
 // setupStatusWatcher attaches fsnotify watchers to sessionBaseDir() and to
 // every currently visible chat's subdirectory. Best-effort: a missing base
@@ -1146,11 +1193,18 @@ func (a *App) watchTreeStatusCmd() tea.Cmd {
 	a.statusWatchPending = true
 	w := a.statusWatcher
 	return func() tea.Msg {
-		_, ok := <-w.Events
-		if !ok {
-			return statusWatcherClosedMsg{}
+		select {
+		case _, ok := <-w.Events:
+			if !ok {
+				return statusWatcherClosedMsg{}
+			}
+			return treeStatusChangedMsg{}
+		case err, ok := <-w.Errors:
+			if !ok {
+				return statusWatcherClosedMsg{}
+			}
+			return statusWatcherErrorMsg{err: err}
 		}
-		return treeStatusChangedMsg{}
 	}
 }
 
@@ -1173,11 +1227,18 @@ func (a *App) watchSessionCmd(key string) tea.Cmd {
 	}
 	a.sessionWatchPending[key] = true
 	return func() tea.Msg {
-		_, ok := <-sw.Events
-		if !ok {
-			return sessionWatcherClosedMsg{sessionID: key}
+		select {
+		case _, ok := <-sw.Events:
+			if !ok {
+				return sessionWatcherClosedMsg{sessionID: key}
+			}
+			return treeStatusChangedMsg{sessionID: key}
+		case err, ok := <-sw.Errors:
+			if !ok {
+				return sessionWatcherClosedMsg{sessionID: key}
+			}
+			return sessionWatcherErrorMsg{sessionID: key, err: err}
 		}
-		return treeStatusChangedMsg{sessionID: key}
 	}
 }
 
@@ -1284,6 +1345,10 @@ func disableMouse() tea.Cmd {
 	}
 }
 
+func openDebugLog(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+}
+
 func main() {
 	profile := flag.String("profile", "", "profile name for state isolation")
 	piTag := flag.String("pi", "just", "pi agent tag (e.g. 'just', 'getic', 'magic') — sets PI_CODING_AGENT_DIR to ~/.ai/<tag>/pi")
@@ -1314,13 +1379,15 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	// Configure log output. Default is /tmp/automata-familiar.log so we
-	// keep familiar diagnostics even when cuetty's screen buffer scrolls.
+	// Configure log output. Default is /tmp/automata-familiar.log. Appending
+	// preserves diagnostics from another running instance and never truncates
+	// an existing log at startup.
 	logPath := *debugLog
 	if logPath == "" {
 		logPath = filepath.Join(os.TempDir(), "automata-familiar.log")
 	}
-	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_TRUNC, 0644); err == nil {
+	if f, err := openDebugLog(logPath); err == nil {
+		defer f.Close()
 		log.SetOutput(f)
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	}

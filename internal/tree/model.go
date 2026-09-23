@@ -1037,6 +1037,15 @@ func (t *Tree) deleteItem(item *Item) {
 			return
 		}
 	}
+
+	oldRoot := append([]*Item(nil), t.root...)
+	oldSelected := t.SelectedItem()
+	var oldParent *Item
+	var oldParentChildren []*Item
+	if item.parent != nil {
+		oldParent = item.parent
+		oldParentChildren = append([]*Item(nil), item.parent.Children...)
+	}
 	if item.parent != nil {
 		parent := item.parent
 		for i, child := range parent.Children {
@@ -1054,7 +1063,17 @@ func (t *Tree) deleteItem(item *Item) {
 		}
 	}
 	t.rebuildFlat()
-	t.autoSave()
+	if err := t.SaveState(); err != nil {
+		t.root = oldRoot
+		if oldParent != nil {
+			oldParent.Children = oldParentChildren
+		}
+		t.rebuildFlat()
+		if oldSelected != nil {
+			t.reselectItem(oldSelected)
+		}
+		_, _ = fmt.Fprintln(os.Stderr, "Failed to persist tree deletion:", err)
+	}
 }
 
 // MoveItem moves an item relative to a target item using the same guarded
@@ -1748,10 +1767,16 @@ func (item *Item) EffectiveBoundPath() string {
 }
 
 // SetActiveSessions replaces the set of IDs currently considered active and
-// persists it to state.json.
-func (t *Tree) SetActiveSessions(ids map[string]struct{}) {
+// persists it to state.json. The error is returned so lifecycle callers can
+// surface a failed active-session commit instead of silently continuing.
+func (t *Tree) SetActiveSessions(ids map[string]struct{}) error {
+	previous := t.activeSessions
 	t.SetActiveSessionsInMemory(ids)
-	_ = t.SaveState()
+	if err := t.SaveState(); err != nil {
+		t.SetActiveSessionsInMemory(previous)
+		return err
+	}
+	return nil
 }
 
 // SetActiveSessionsInMemory updates active-session state without persisting the

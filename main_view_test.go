@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -972,6 +973,97 @@ func TestWatchTreeStatusCmdNilWithoutWatcher(t *testing.T) {
 // Update and confirms a fresh recompute happened (badge appears) plus a
 // re-arm cmd is returned. The recompute works against an on-disk
 // status.json written before the message fires.
+func TestOpenDebugLogAppendsWithoutTruncating(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "automata.log")
+	if err := os.WriteFile(path, []byte("before\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := openDebugLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("after\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "before\nafter\n" {
+		t.Fatalf("debug log contents = %q, want preserved append", contents)
+	}
+}
+
+func TestWatcherRecoveryRecreatesClosedStatusAndSessionWatchers(t *testing.T) {
+	app := newTestApp(t, "")
+	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app.setupStatusWatcher()
+	app.syncSessionWatchers()
+	oldStatus := app.statusWatcher
+	oldSession := app.sessionWatchers[key]
+	if oldStatus == nil || oldSession == nil {
+		t.Fatal("test setup did not create both status watchers")
+	}
+	t.Cleanup(func() { app.Close() })
+
+	statusCmd := app.watchTreeStatusCmd()
+	if statusCmd == nil {
+		t.Fatal("status watcher command is nil")
+	}
+	statusMessages := make(chan tea.Msg, 1)
+	go func() { statusMessages <- statusCmd() }()
+	go func() { oldStatus.Errors <- errors.New("synthetic status watcher error") }()
+	select {
+	case msg := <-statusMessages:
+		errorMsg, ok := msg.(statusWatcherErrorMsg)
+		if !ok || errorMsg.err == nil {
+			t.Fatalf("status watcher error message = %#v", msg)
+		}
+		_, cmd := app.Update(msg)
+		if cmd == nil {
+			t.Fatal("status watcher recovery did not return a re-arm command")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed status watcher did not report recovery")
+	}
+	if app.statusWatcher == nil || app.statusWatcher == oldStatus {
+		t.Fatal("status watcher was not recreated")
+	}
+
+	app.sessionWatchPending[key] = false
+	sessionCmd := app.watchSessionCmd(key)
+	if sessionCmd == nil {
+		t.Fatal("session watcher command is nil")
+	}
+	sessionMessages := make(chan tea.Msg, 1)
+	go func() { sessionMessages <- sessionCmd() }()
+	go func() { oldSession.Errors <- errors.New("synthetic session watcher error") }()
+	select {
+	case msg := <-sessionMessages:
+		errorMsg, ok := msg.(sessionWatcherErrorMsg)
+		if !ok || errorMsg.err == nil {
+			t.Fatalf("session watcher error message = %#v", msg)
+		}
+		_, cmd := app.Update(msg)
+		if cmd == nil {
+			t.Fatal("session watcher recovery did not return a re-arm command")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed session watcher did not report recovery")
+	}
+	if app.sessionWatchers[key] == nil || app.sessionWatchers[key] == oldSession {
+		t.Fatal("session watcher was not recreated")
+	}
+}
+
 func TestTreeStatusChangedMsgTriggersRefresh(t *testing.T) {
 	app := newTestApp(t, "")
 	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])

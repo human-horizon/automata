@@ -54,6 +54,16 @@ func TestContainerPreservesChatsAndAssignmentCallbackBeforeLazyContextPanel(t *t
 	container.Close()
 }
 
+func TestPlanFractionIsBoundedForTinyWidths(t *testing.T) {
+	container := NewContainer(nil)
+	for _, width := range []int{1, 2, 5, 10, 21, 35, 36, 80} {
+		fraction := container.planFraction(width)
+		if fraction < 0 || fraction > 1 {
+			t.Fatalf("planFraction(%d) = %v, want [0,1]", width, fraction)
+		}
+	}
+}
+
 func TestContainerRefreshKnowledgeCmdReadsCanonicalMemory(t *testing.T) {
 	tests := []struct {
 		name    string

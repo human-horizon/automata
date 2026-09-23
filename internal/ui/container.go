@@ -89,6 +89,12 @@ func (c *Container) planFraction(width int) float64 {
 	if width <= 0 {
 		return 0.7
 	}
+	// There is not enough room to honor the normal 20/15 cell minimums on
+	// tiny terminals. Keep both panes bounded instead of returning a negative
+	// width or a fraction greater than one.
+	if width < 36 {
+		return 0.5
+	}
 	planW := c.planWidth
 	if planW < 15 {
 		planW = 15
@@ -101,7 +107,14 @@ func (c *Container) planFraction(width int) float64 {
 		terminalW = 20
 		planW = width - 1 - terminalW
 	}
-	return float64(terminalW) / float64(width)
+	fraction := float64(terminalW) / float64(width)
+	if fraction < 0 {
+		return 0
+	}
+	if fraction > 1 {
+		return 1
+	}
+	return fraction
 }
 
 // SetChat switches the container to chat mode with the knowledge side panel.
@@ -235,12 +248,13 @@ func (c *Container) RefreshKnowledge() {
 // knowledge and context panels. The UI applies it in the main Update loop so
 // file I/O never blocks the renderer.
 type KnowledgeRefreshMsg struct {
-	SessionID string
-	Domain    string
-	Profile   string
-	Context   *akcontext.Data
-	Jobs      []akjobs.Job
-	Memory    *memory.Data
+	SessionID   string
+	Domain      string
+	Profile     string
+	Context     *akcontext.Data
+	Jobs        []akjobs.Job
+	Memory      *memory.Data
+	MemoryError string
 }
 
 // RefreshKnowledgeCmd returns a command that reads the knowledge files for
@@ -274,6 +288,8 @@ func (c *Container) RefreshKnowledgeCmd() tea.Cmd {
 		if domain != "" {
 			if d, err := memory.Read(profile, domain); err == nil {
 				msg.Memory = d
+			} else {
+				msg.MemoryError = err.Error()
 			}
 		}
 		return msg
@@ -295,6 +311,9 @@ func (c *Container) ApplyKnowledgeRefresh(msg KnowledgeRefreshMsg) {
 	if c.contextPanel != nil && msg.Domain == c.contextPanel.domain && msg.Profile == c.contextPanel.profile {
 		if msg.Memory != nil {
 			c.contextPanel.data = msg.Memory
+		} else if msg.MemoryError != "" {
+			c.contextPanel.data = nil
+			c.contextPanel.notesStatus = "✗ Notes read error: " + msg.MemoryError
 		}
 	}
 }

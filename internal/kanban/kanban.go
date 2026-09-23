@@ -34,12 +34,13 @@ var ErrDoneToProgressForbidden = errors.New("kanban: task in done cannot be move
 
 // Task represents a single kanban task.
 type Task struct {
-	Title       string `yaml:"title"`
-	Status      string `yaml:"status"`
-	AssignedTo  string `yaml:"assigned_to"`
-	Substatus   string `yaml:"substatus"`
-	Description string // body of the .md file (after frontmatter)
-	Path        string // full path to the .md file
+	Title       string            `yaml:"title"`
+	Status      string            `yaml:"status"`
+	AssignedTo  string            `yaml:"assigned_to"`
+	Substatus   string            `yaml:"substatus"`
+	Description string            // body of the .md file (after frontmatter)
+	Path        string            // full path to the .md file
+	Metadata    map[string]string // unknown frontmatter fields preserved on write
 }
 
 // ReadAll reads all kanban tasks for the given domain within the given profile.
@@ -87,7 +88,7 @@ func readTask(path string) (Task, error) {
 	}
 
 	content := string(data)
-	task := Task{}
+	task := Task{Metadata: make(map[string]string)}
 
 	if strings.HasPrefix(content, "---") {
 		parts := strings.SplitN(content[3:], "---", 2)
@@ -103,8 +104,8 @@ func readTask(path string) (Task, error) {
 					continue
 				}
 				key := strings.TrimSpace(line[:colon])
-				value := strings.TrimSpace(line[colon+1:])
-				value = strings.Trim(value, "\"'")
+				rawValue := strings.TrimSpace(line[colon+1:])
+				value := strings.Trim(rawValue, "\"'")
 				switch key {
 				case "title":
 					task.Title = value
@@ -114,6 +115,8 @@ func readTask(path string) (Task, error) {
 					task.AssignedTo = value
 				case "substatus":
 					task.Substatus = value
+				default:
+					task.Metadata[key] = rawValue
 				}
 			}
 			body := strings.TrimSpace(parts[1])
@@ -235,6 +238,17 @@ func writeTask(path string, task Task) error {
 	}
 	if task.Substatus != "" {
 		b.WriteString(fmt.Sprintf("substatus: %s\n", task.Substatus))
+	}
+	keys := make([]string, 0, len(task.Metadata))
+	for key := range task.Metadata {
+		if key == "" || key == "title" || key == "status" || key == "assigned_to" || key == "substatus" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		b.WriteString(fmt.Sprintf("%s: %s\n", key, task.Metadata[key]))
 	}
 	b.WriteString("---\n")
 	if task.Description != "" {

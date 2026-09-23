@@ -88,6 +88,35 @@ func TestRunningCountForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	}
 }
 
+func TestRunningCountForEmptyExplicitProfileUsesDefault(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "wrong-profile")
+
+	const sessionID = "default-chat"
+	defaultJobs := filepath.Join(paths.SessionDir("", sessionID), "jobs", "job_active")
+	wrongJobs := filepath.Join(paths.SessionDir("wrong-profile", sessionID), "jobs", "job_active")
+	for _, dir := range []string{defaultJobs, wrongJobs} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(defaultJobs, "job.json"), []byte(`{"id":"default","status":"running"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wrongJobs, "job.json"), []byte(`{"id":"wrong","status":"running"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := RunningCountForProfile("", sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("empty explicit profile running count = %d, want 1 from default", count)
+	}
+}
+
 func TestListKeepsLiveJobWithoutStartedAt(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("AI_DATA_HOME", dataHome)

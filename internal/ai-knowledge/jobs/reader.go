@@ -52,15 +52,27 @@ func profileFromSessionID(sessionID string) string {
 }
 
 func sessionDirForProfile(profile, sessionID string) string {
-	if profile == "" {
-		profile = os.Getenv("AI_PROFILE")
-	}
 	return paths.SessionDir(profile, sessionID)
 }
 
-// sessionDir returns the session data directory.
+// legacyProfileForSession preserves the environment fallback for convenience
+// APIs that receive only an unprefixed session ID. Explicit profile APIs never
+// call this helper.
+func legacyProfileForSession(sessionID string) string {
+	profile := profileFromSessionID(sessionID)
+	if profile == "" {
+		return os.Getenv("AI_PROFILE")
+	}
+	return profile
+}
+
+func legacyEnvironmentProfile() string {
+	return os.Getenv("AI_PROFILE")
+}
+
+// sessionDir returns the session data directory for the legacy convenience API.
 func sessionDir(sessionID string) string {
-	return sessionDirForProfile(profileFromSessionID(sessionID), sessionID)
+	return sessionDirForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 // pidStartSkewTolerance is the maximum allowed difference between the job's
@@ -234,7 +246,7 @@ func listForProfile(profile, sessionID string) ([]Job, error) {
 // List returns running jobs using the profile encoded in the session ID or
 // AI_PROFILE for legacy unprefixed IDs.
 func List(sessionID string) ([]Job, error) {
-	return listForProfile("", sessionID)
+	return listForProfile(legacyEnvironmentProfile(), sessionID)
 }
 
 // ListForProfile returns running jobs under an explicit canonical profile.
@@ -284,7 +296,7 @@ func pruneStaleSessionForProfile(profile, sessionID string) error {
 // PruneStaleSession marks dead jobs using the profile encoded in the session
 // ID or AI_PROFILE for legacy unprefixed IDs.
 func PruneStaleSession(sessionID string) error {
-	return pruneStaleSessionForProfile(profileFromSessionID(sessionID), sessionID)
+	return pruneStaleSessionForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 // PruneStaleSessionForProfile marks dead jobs under an explicit profile.
@@ -324,7 +336,7 @@ func runningCountForProfile(profile, sessionID string) (int, error) {
 // RunningCount returns the number of running job records using the profile
 // encoded in the session ID or AI_PROFILE for legacy unprefixed IDs.
 func RunningCount(sessionID string) (int, error) {
-	return runningCountForProfile("", sessionID)
+	return runningCountForProfile(legacyEnvironmentProfile(), sessionID)
 }
 
 // RunningCountForProfile returns the number of running records under an
@@ -381,7 +393,7 @@ func materializeStaleJob(jobDir, metaPath string, rec *JobRecord) error {
 // KillSession uses the profile encoded in the session ID for compatibility
 // with the legacy command-line API.
 func KillSession(sessionID string) error {
-	return KillSessionForProfile(profileFromSessionID(sessionID), sessionID)
+	return KillSessionForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 type killCandidate struct {
@@ -629,7 +641,7 @@ func jobsSignature(jobsDir string) string {
 }
 
 func (r *CachedReader) List(sessionID string) ([]Job, error) {
-	return r.ListForProfile("", sessionID)
+	return r.ListForProfile(legacyEnvironmentProfile(), sessionID)
 }
 
 func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) {
