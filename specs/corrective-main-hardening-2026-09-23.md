@@ -42,4 +42,4 @@
 - [x] Ошибка и закрытие каналов Kanban watcher приводят к восстановлению watcher и reload.
 - [x] Legacy context/jobs APIs выбирают профиль одинаково по префиксу, `AI_PROFILE` и default; explicit APIs изолированы от `AI_PROFILE`.
 - [x] Адресные тесты, `gofmt -l .`, `go vet ./...`, `go mod verify`, `go test ./... -count=1 -p 1`, `git diff --check` и два воспроизводимых build проходят.
-- [ ] Новый commit находится в существующем PR #2, локальный HEAD совпадает с remote; CI нового HEAD зелёный, PR не смёржен.
+- [x] Новый commit находится в существующем PR #2, локальный HEAD совпадает с remote; CI нового HEAD зелёный, PR не смёржен.
