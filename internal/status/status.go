@@ -18,7 +18,7 @@ type Record struct {
 	Action string `json:"action"`
 }
 
-// CachedReader caches status reads by mtime so we only re-read when files change.
+// CachedReader caches status reads while file identity, size and mtime remain unchanged.
 // Safe for concurrent use from a single goroutine (bubbletea main loop).
 type CachedReader struct {
 	profile string
@@ -28,13 +28,15 @@ type CachedReader struct {
 type cachedEntry struct {
 	value string
 	mtime time.Time
+	size  int64
+	info  os.FileInfo
 }
 
 func statusPath(profile, sessionID string) string {
 	return filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 }
 
-// NewCachedReader creates a reader that caches by mtime.
+// NewCachedReader creates a reader that caches by file identity, size and mtime.
 func NewCachedReader(profile string) *CachedReader {
 	return &CachedReader{
 		profile: profile,
@@ -43,7 +45,7 @@ func NewCachedReader(profile string) *CachedReader {
 }
 
 // Read returns the "action" field of status.json for a session, or "" if the
-// file is missing or unreadable. Uses mtime cache to avoid re-reading unchanged files.
+// file is missing or unreadable. Uses file metadata to avoid re-reading unchanged files.
 func (r *CachedReader) Read(sessionID string) string {
 	if sessionID == "" {
 		return ""
@@ -57,22 +59,23 @@ func (r *CachedReader) Read(sessionID string) string {
 		r.cache[sessionID] = cachedEntry{value: "", mtime: time.Time{}}
 		return ""
 	}
-	if entry, ok := r.cache[sessionID]; ok && entry.mtime.Equal(fi.ModTime()) {
+	if entry, ok := r.cache[sessionID]; ok && entry.info != nil &&
+		entry.mtime.Equal(fi.ModTime()) && entry.size == fi.Size() && os.SameFile(entry.info, fi) {
 		return entry.value
 	}
 
 	// Read file
 	data, err := os.ReadFile(path)
 	if err != nil {
-		r.cache[sessionID] = cachedEntry{value: "", mtime: fi.ModTime()}
+		r.cache[sessionID] = cachedEntry{value: "", mtime: fi.ModTime(), size: fi.Size(), info: fi}
 		return ""
 	}
 	var rec Record
 	if err := json.Unmarshal(data, &rec); err != nil {
-		r.cache[sessionID] = cachedEntry{value: "", mtime: fi.ModTime()}
+		r.cache[sessionID] = cachedEntry{value: "", mtime: fi.ModTime(), size: fi.Size(), info: fi}
 		return ""
 	}
-	r.cache[sessionID] = cachedEntry{value: rec.Action, mtime: fi.ModTime()}
+	r.cache[sessionID] = cachedEntry{value: rec.Action, mtime: fi.ModTime(), size: fi.Size(), info: fi}
 	return rec.Action
 }
 

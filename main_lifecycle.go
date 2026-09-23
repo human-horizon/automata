@@ -122,27 +122,24 @@ func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) 
 			delete(a.activeSessions, sessionID)
 		}
 	}
+	var failures []error
+	persistenceFailed := false
 	if opts.persistInactive && a.tree != nil {
 		if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
-			return &stopSessionError{
-				committed:   true,
-				persistence: true,
-				err:         fmt.Errorf("persist inactive sessions: %w", err),
-			}
+			persistenceFailed = true
+			failures = append(failures, fmt.Errorf("persist inactive sessions: %w", err))
 		}
 	}
 
-	if !opts.stopJobs {
-		return nil
-	}
-	var failures []error
-	for _, jobPlan := range prepared {
-		if err := a.executeSessionJob(jobPlan, jobPlan.sessionID); err != nil {
-			failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
+	if opts.stopJobs {
+		for _, jobPlan := range prepared {
+			if err := a.executeSessionJob(jobPlan, jobPlan.sessionID); err != nil {
+				failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
+			}
 		}
 	}
 	if err := errors.Join(failures...); err != nil {
-		return &stopSessionError{committed: true, err: err}
+		return &stopSessionError{committed: true, persistence: persistenceFailed, err: err}
 	}
 	return nil
 }

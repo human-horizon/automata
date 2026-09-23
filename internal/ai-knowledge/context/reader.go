@@ -172,7 +172,7 @@ func readForProfile(profile, sessionID string) (*Data, error) {
 // Read returns context data using the profile encoded in the session ID or
 // AI_PROFILE for legacy unprefixed IDs.
 func Read(sessionID string) (*Data, error) {
-	return readForProfile("", sessionID)
+	return readForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 // ReadForProfile returns context data using the explicit canonical profile.
@@ -241,7 +241,7 @@ func (r *CachedReader) Invalidate(profile, sessionID string) {
 // Read returns the context data for a session, cached by the complete
 // existence/size/mtime signature of plans.json, status.json and settings.json.
 func (r *CachedReader) Read(sessionID string) (*Data, error) {
-	return r.ReadForProfile("", sessionID)
+	return r.ReadForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 // ReadForProfile reads and caches context data under an explicit profile.

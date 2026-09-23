@@ -1782,7 +1782,15 @@ func (t *Tree) SetActiveSessions(ids map[string]struct{}) error {
 // SetActiveSessionsInMemory updates active-session state without persisting the
 // tree. Transactional rename/move rollback uses this before an explicit save.
 func (t *Tree) SetActiveSessionsInMemory(ids map[string]struct{}) {
-	t.activeSessions = ids
+	if ids == nil {
+		t.activeSessions = nil
+		return
+	}
+	owned := make(map[string]struct{}, len(ids))
+	for id := range ids {
+		owned[id] = struct{}{}
+	}
+	t.activeSessions = owned
 }
 
 // IsActiveSession reports whether the given item currently has a running session.

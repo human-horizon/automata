@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -202,7 +204,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 		})
 		cp.SetOnCloseFamiliar(func(familiarID string, em *portalis.Emulator) error {
 			if err := a.closeFamiliar(familiarID, em); err != nil {
-				log.Printf("closeFamiliar: stop runtime %q: %v", familiarID, err)
+				log.Printf("closeFamiliar: cleanup warning for %q: %v", familiarID, err)
 				return err
 			}
 			return nil
@@ -684,9 +686,7 @@ func (a *App) restoreSessions() tea.Cmd {
 // Returns cmd == "" when nothing is available; callers must NOT fall back
 // to a shell for pi sessions.
 func (a *App) piLaunch(sessionID string) (cmd string, args []string, env []string) {
-	if a.profile != "" {
-		env = append(env, "AUTOMATA_PROFILE="+slug.Slug(a.profile))
-	}
+	env = append(env, "AUTOMATA_PROFILE="+paths.ProfileSlug(a.profile))
 	if configured := strings.TrimSpace(os.Getenv("PI_CMD")); configured != "" {
 		path, err := exec.LookPath(configured)
 		if err != nil {
@@ -997,45 +997,42 @@ func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
 	return nil
 }
 
-// closeFamiliarCmd cleans up after the user confirms closing a familiar:
-// stops the emulator (idempotent), removes the JSONL, and strips the
-// entry from familiars.json. ChatPanel has already dropped the tab by
-// the time this fires, so we only deal with host-side state.
+// closeFamiliar cleans up after the user confirms closing a familiar. An
+// uncommitted runtime preflight failure leaves host data and the tab intact;
+// committed cleanup warnings are returned after every host cleanup is tried.
 func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 	log.Printf("closeFamiliar: start familiarID=%q em=%v profile=%q activeChat=%q",
 		familiarID, em != nil, a.profile, a.activeChatSessionID())
-	// Stop the familiar and its jobs through the canonical lifecycle kernel.
-	// A failed preflight leaves the tab and host state intact; a committed
-	// cleanup warning is logged while the persisted familiar entry is removed.
 	stopErr := a.stopSessionRuntime(familiarID, stopSessionOptions{
 		stopJobs:        true,
 		persistInactive: true,
 	})
-	if stopErr != nil && (!runtimeStopWasCommitted(stopErr) || runtimeStopPersistenceFailed(stopErr)) {
+	if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
 		return stopErr
 	}
+
+	var cleanupFailures []error
 	if stopErr != nil {
+		cleanupFailures = append(cleanupFailures, stopErr)
 		log.Printf("closeFamiliar: committed stop warning for %q: %v", familiarID, stopErr)
 	}
 	if em != nil {
 		em.Stop()
-	}
-
-	// Drop the familiar's JSONL. If it doesn't exist (or pi never
-	// wrote one), we log but don't fail the close.
-	if em != nil {
 		cwd := em.CWD()
-		if _, err := paths.DeleteSessionJSONL(familiarID, cwd, a.piAgentDir); err != nil {
-			log.Printf("closeFamiliar: delete JSONL %q: %v", familiarID, err)
+		if paths.FindSessionJSONL(familiarID, cwd, a.piAgentDir) != "" {
+			if _, err := paths.DeleteSessionJSONL(familiarID, cwd, a.piAgentDir); err != nil {
+				cleanupFailures = append(cleanupFailures, fmt.Errorf("delete familiar JSONL %q: %w", familiarID, err))
+			}
 		}
 	}
-
-	// Strip the entry from familiars.json so the next poll doesn't
-	// resurrect it.
 	if err := paths.RemoveFamiliar(a.profile, a.activeChatSessionID(), familiarID); err != nil {
-		log.Printf("closeFamiliar: remove from familiars.json: %v", err)
+		cleanupFailures = append(cleanupFailures, fmt.Errorf("remove familiar %q from registry: %w", familiarID, err))
 	}
 
+	if err := errors.Join(cleanupFailures...); err != nil {
+		log.Printf("closeFamiliar: committed cleanup warning for %q: %v", familiarID, err)
+		return &ui.CommittedCleanupError{Err: err}
+	}
 	log.Printf("closeFamiliar: done familiarID=%q", familiarID)
 	return nil
 }

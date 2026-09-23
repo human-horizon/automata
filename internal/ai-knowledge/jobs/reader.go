@@ -66,10 +66,6 @@ func legacyProfileForSession(sessionID string) string {
 	return profile
 }
 
-func legacyEnvironmentProfile() string {
-	return os.Getenv("AI_PROFILE")
-}
-
 // sessionDir returns the session data directory for the legacy convenience API.
 func sessionDir(sessionID string) string {
 	return sessionDirForProfile(legacyProfileForSession(sessionID), sessionID)
@@ -246,7 +242,7 @@ func listForProfile(profile, sessionID string) ([]Job, error) {
 // List returns running jobs using the profile encoded in the session ID or
 // AI_PROFILE for legacy unprefixed IDs.
 func List(sessionID string) ([]Job, error) {
-	return listForProfile(legacyEnvironmentProfile(), sessionID)
+	return listForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 // ListForProfile returns running jobs under an explicit canonical profile.
@@ -336,7 +332,7 @@ func runningCountForProfile(profile, sessionID string) (int, error) {
 // RunningCount returns the number of running job records using the profile
 // encoded in the session ID or AI_PROFILE for legacy unprefixed IDs.
 func RunningCount(sessionID string) (int, error) {
-	return runningCountForProfile(legacyEnvironmentProfile(), sessionID)
+	return runningCountForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 // RunningCountForProfile returns the number of running records under an
@@ -641,7 +637,7 @@ func jobsSignature(jobsDir string) string {
 }
 
 func (r *CachedReader) List(sessionID string) ([]Job, error) {
-	return r.ListForProfile(legacyEnvironmentProfile(), sessionID)
+	return r.ListForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) {

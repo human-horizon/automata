@@ -4,8 +4,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // writeTaskFile is a tiny test helper that writes a minimal frontmatter
@@ -45,6 +48,109 @@ func TestReadTaskParsesSubstatus(t *testing.T) {
 	}
 	if task.Substatus != "analyze" {
 		t.Errorf("Substatus = %q, want %q", task.Substatus, "analyze")
+	}
+}
+
+func TestUpdateStatusPreservesNestedYAMLFrontmatter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nested.md")
+	contents := "---\n" +
+		"title: Nested metadata\n" +
+		"status: progress\n" +
+		"metadata:\n" +
+		"  owner:\n" +
+		"    name: \"A: B\"\n" +
+		"    labels: [one, {kind: two}]\n" +
+		"  enabled: true\n" +
+		"  notes: |\n" +
+		"    first line\n" +
+		"    second line\n" +
+		"priority: 3\n" +
+		"---\nbody\n"
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := readTask(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeYAML, err := yaml.Marshal(before.frontmatter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeFields map[string]any
+	if err := yaml.Unmarshal(beforeYAML, &beforeFields); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := UpdateStatus(path, "done"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := readTask(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterYAML, err := yaml.Marshal(after.frontmatter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterFields map[string]any
+	if err := yaml.Unmarshal(afterYAML, &afterFields); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(beforeFields["metadata"], afterFields["metadata"]) {
+		t.Fatalf("nested metadata changed: before=%#v after=%#v", beforeFields["metadata"], afterFields["metadata"])
+	}
+	if afterFields["priority"] != beforeFields["priority"] {
+		t.Fatalf("typed scalar metadata changed: before=%#v after=%#v", beforeFields["priority"], afterFields["priority"])
+	}
+	if after.Status != "done" {
+		t.Fatalf("updated status = %q, want done", after.Status)
+	}
+}
+
+func TestInvalidKanbanStatusesAreRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTaskFile(t, dir, "invalid-target.md", "Strict status", "todo")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := UpdateStatus(path, "in_review"); !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("UpdateStatus invalid target error = %v, want ErrInvalidStatus", err)
+	}
+	if _, _, err := AssignTaskAndStatus(path, "chat", "unknown"); !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("AssignTaskAndStatus invalid target error = %v, want ErrInvalidStatus", err)
+	}
+	if err := WriteTask(path, Task{Title: "Strict status", Status: "unknown"}); !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("WriteTask invalid target error = %v, want ErrInvalidStatus", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("invalid status mutation changed file:\nbefore: %s\nafter:  %s", before, after)
+	}
+
+	for _, invalidStatus := range []string{"in_review", `""`, "3"} {
+		contents := "---\ntitle: Invalid source\nstatus: " + invalidStatus + "\n---\n"
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadTask(path); !errors.Is(err, ErrInvalidStatus) {
+			t.Errorf("ReadTask status %s error = %v, want ErrInvalidStatus", invalidStatus, err)
+		}
+	}
+
+	missingStatusPath := filepath.Join(dir, "missing-status.md")
+	if err := os.WriteFile(missingStatusPath, []byte("---\ntitle: Legacy status\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missingStatus, err := ReadTask(missingStatusPath)
+	if err != nil || missingStatus.Status != "todo" {
+		t.Fatalf("missing status task = %+v, err=%v, want todo default", missingStatus, err)
 	}
 }
 

@@ -178,6 +178,66 @@ func TestReadForProfileEmptyUsesDefault(t *testing.T) {
 	}
 }
 
+func TestLegacyReadResolvesProfilePrefixEnvironmentAndDefault(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "wrong-profile")
+
+	writeStatus := func(profile, sessionID, text string) {
+		t.Helper()
+		dir := paths.SessionDir(profile, sessionID)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"text":"`+text+`"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeStatus("encoded-profile", "encoded-profile__chat", "encoded")
+	writeStatus("wrong-profile", "encoded-profile__chat", "wrong")
+	writeStatus("wrong-profile", "legacy-chat", "environment")
+	writeStatus("", "default-chat", "default")
+
+	for _, test := range []struct {
+		sessionID string
+		want      string
+	}{
+		{sessionID: "encoded-profile__chat", want: "encoded"},
+		{sessionID: "legacy-chat", want: "environment"},
+	} {
+		data, err := Read(test.sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data.Status == nil || data.Status.Text != test.want {
+			t.Fatalf("Read(%q) = %#v, want %q", test.sessionID, data.Status, test.want)
+		}
+		cached, err := NewCachedReader().Read(test.sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cached.Status == nil || cached.Status.Text != test.want {
+			t.Fatalf("CachedReader.Read(%q) = %#v, want %q", test.sessionID, cached.Status, test.want)
+		}
+	}
+
+	t.Setenv("AI_PROFILE", "")
+	data, err := Read("default-chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Status == nil || data.Status.Text != "default" {
+		t.Fatalf("Read with unset profile = %#v, want canonical default", data.Status)
+	}
+	cached, err := NewCachedReader().Read("default-chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.Status == nil || cached.Status.Text != "default" {
+		t.Fatalf("CachedReader.Read with unset profile = %#v, want canonical default", cached.Status)
+	}
+}
+
 func TestReadForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	t.Setenv("AI_PROFILE", "wrong-profile")
 	profile := "Explicit Profile"
@@ -201,8 +261,15 @@ func TestReadForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if legacy.Status != nil {
-		t.Fatalf("legacy reader unexpectedly read explicit profile: %#v", legacy.Status)
+	if legacy.Status == nil || legacy.Status.Text != "explicit" {
+		t.Fatalf("legacy reader did not honor session profile prefix: %#v", legacy.Status)
+	}
+	cachedLegacy, err := NewCachedReader().Read(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cachedLegacy.Status == nil || cachedLegacy.Status.Text != "explicit" {
+		t.Fatalf("cached legacy reader did not honor session profile prefix: %#v", cachedLegacy.Status)
 	}
 
 	cached := NewCachedReader()

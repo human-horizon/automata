@@ -863,16 +863,22 @@ func TestMoveSelectedOutSaveFailureRestoresTargetTreeBeforeRollback(t *testing.T
 	}
 }
 
-func TestSetActiveSessionsReturnsPersistenceErrorAndRestoresMemory(t *testing.T) {
+func TestSetActiveSessionsReturnsPersistenceErrorAndRestoresIndependentSnapshot(t *testing.T) {
 	tr := New()
 	previous := map[string]struct{}{"old": {}}
 	tr.SetActiveSessionsInMemory(previous)
-	tr.SetSaveStateFunc(func() error { return errors.New("injected active-session save failure") })
+	delete(previous, "old")
+	previous["caller-mutated"] = struct{}{}
+	if !reflect.DeepEqual(tr.ActiveSessionIDs(), []string{"old"}) {
+		t.Fatalf("active sessions aliased input map = %v, want old", tr.ActiveSessionIDs())
+	}
 
+	tr.SetSaveStateFunc(func() error { return errors.New("injected active-session save failure") })
 	updated := map[string]struct{}{"new": {}}
 	if err := tr.SetActiveSessions(updated); err == nil {
 		t.Fatal("SetActiveSessions unexpectedly succeeded")
 	}
+	updated["caller-mutated"] = struct{}{}
 	if !reflect.DeepEqual(tr.ActiveSessionIDs(), []string{"old"}) {
 		t.Fatalf("active sessions after failed save = %v, want old", tr.ActiveSessionIDs())
 	}

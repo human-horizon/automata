@@ -510,6 +510,35 @@ func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 	}
 }
 
+func TestConfirmYesRemovesTabAfterCommittedCleanupWarning(t *testing.T) {
+	familiar := portalis.NewEmulator("f1", "f1", "/bin/sh", nil)
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", familiarID: "f1", em: familiar, panel: &fakePanel{}},
+		},
+		activeIdx: 0,
+		started:   true,
+		known:     map[string]bool{"expert": true},
+	}
+	cleanupErr := errors.New("active-state persistence failed after stop")
+	var observedErr error
+	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) error {
+		observedErr = &CommittedCleanupError{Err: cleanupErr}
+		return observedErr
+	})
+	cp.pendingCloseFamiliar = "f1"
+	cp.openCloseFamiliarModal("expert")
+
+	_ = cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if len(cp.sessions) != 1 || cp.sessions[0].familiarID != "" {
+		t.Fatalf("sessions after committed cleanup = %+v, want only Main", cp.sessions)
+	}
+	if !errors.Is(observedErr, cleanupErr) {
+		t.Fatalf("observable committed warning = %v, want wrapped cleanup error", observedErr)
+	}
+}
+
 func TestConfirmYesKeepsTabWhenHostCleanupFails(t *testing.T) {
 	familiar := portalis.NewEmulator("f1", "f1", "/bin/sh", nil)
 	cp := &ChatPanel{

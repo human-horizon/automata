@@ -85,6 +85,36 @@ func TestStopSessionRuntimeSurfacesActiveSessionPersistenceFailure(t *testing.T)
 	}
 }
 
+func TestStopSessionRuntimeStopsPreparedJobsAfterPersistenceFailure(t *testing.T) {
+	tr := tree.New()
+	persistErr := errors.New("active state unavailable")
+	tr.SetSaveStateFunc(func() error { return persistErr })
+	const sessionID = "owner"
+	app := &App{
+		tree:            tr,
+		profile:         "test",
+		activeSessions:  map[string]struct{}{sessionID: {}},
+		runningSessions: map[string]struct{}{sessionID: {}},
+	}
+	jobErr := errors.New("job finalization failed")
+	jobCalls := 0
+	app.killSessionFn = func(string, string) error {
+		jobCalls++
+		return jobErr
+	}
+
+	err := app.stopSessionRuntime(sessionID, stopSessionOptions{stopJobs: true, persistInactive: true})
+	if err == nil || !runtimeStopWasCommitted(err) || !runtimeStopPersistenceFailed(err) {
+		t.Fatalf("cleanup error = %v, want committed persistence failure", err)
+	}
+	if !errors.Is(err, persistErr) || !errors.Is(err, jobErr) {
+		t.Fatalf("cleanup error = %v, want both persistence and job failures", err)
+	}
+	if jobCalls != 1 {
+		t.Fatalf("job finalization calls = %d, want one after runtime commit", jobCalls)
+	}
+}
+
 func TestCleanupDeletedTreeItemAbortsOnActiveSessionPersistenceFailure(t *testing.T) {
 	tr := tree.New()
 	tr.Profile = "test"

@@ -68,7 +68,7 @@ func TestRunningCountForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(`{"id":"job_active","status":"running"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(`{"id":"job_active","pid":`+strconv.Itoa(os.Getpid())+`,"status":"running"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,8 +83,22 @@ func TestRunningCountForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if legacy != 0 {
-		t.Fatalf("legacy running count leaked explicit profile: %d", legacy)
+	if legacy != 1 {
+		t.Fatalf("legacy running count did not honor session profile prefix: %d", legacy)
+	}
+	listed, err := List(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != "job_active" {
+		t.Fatalf("legacy list did not honor session profile prefix: %#v", listed)
+	}
+	cached, err := NewCachedReader().List(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cached) != 1 || cached[0].ID != "job_active" {
+		t.Fatalf("cached legacy list did not honor session profile prefix: %#v", cached)
 	}
 }
 
@@ -115,6 +129,60 @@ func TestRunningCountForEmptyExplicitProfileUsesDefault(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("empty explicit profile running count = %d, want 1 from default", count)
 	}
+}
+
+func TestLegacyJobReadersResolveProfilePrefixEnvironmentAndDefault(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "wrong-profile")
+	writeRunningJob := func(profile, sessionID, jobID string) {
+		t.Helper()
+		jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", jobID)
+		if err := os.MkdirAll(jobDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data := []byte(`{"id":"` + jobID + `","pid":` + strconv.Itoa(os.Getpid()) + `,"status":"running"}`)
+		if err := os.WriteFile(filepath.Join(jobDir, "job.json"), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertSession := func(sessionID, wantID string, wantCount int) {
+		t.Helper()
+		listed, err := List(sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(listed) != 1 || listed[0].ID != wantID {
+			t.Fatalf("List(%q) = %#v, want job %q", sessionID, listed, wantID)
+		}
+		cached, err := NewCachedReader().List(sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cached) != 1 || cached[0].ID != wantID {
+			t.Fatalf("CachedReader.List(%q) = %#v, want job %q", sessionID, cached, wantID)
+		}
+		count, err := RunningCount(sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count != wantCount {
+			t.Fatalf("RunningCount(%q) = %d, want %d", sessionID, count, wantCount)
+		}
+	}
+
+	writeRunningJob("Encoded Profile", "encoded-profile__chat", "encoded-job")
+	writeRunningJob("wrong-profile", "encoded-profile__chat", "wrong-prefix-job")
+	assertSession("encoded-profile__chat", "encoded-job", 1)
+
+	writeRunningJob("wrong-profile", "legacy-chat", "environment-job")
+	writeRunningJob("", "legacy-chat", "default-decoy")
+	assertSession("legacy-chat", "environment-job", 1)
+
+	t.Setenv("AI_PROFILE", "")
+	writeRunningJob("", "default-chat", "default-job")
+	writeRunningJob("wrong-profile", "default-chat", "environment-decoy")
+	assertSession("default-chat", "default-job", 1)
 }
 
 func TestListKeepsLiveJobWithoutStartedAt(t *testing.T) {

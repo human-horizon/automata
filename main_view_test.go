@@ -93,11 +93,18 @@ func TestClearRestartsChatWithConfiguredPiAgentDir(t *testing.T) {
 		t.Fatalf("started session = %v, want %q", restarted, sessionID)
 	}
 
-	t.Log("И: эмулятор несёт PI_CODING_AGENT_DIR в startEnv, так что любой Start сохраняет окружение")
-	wantEnv := "PI_CODING_AGENT_DIR=" + piAgentDir
+	t.Log("И: эмулятор несёт PI_CODING_AGENT_DIR и canonical default profile в startEnv")
 	gotEnv := restarted.StartEnv()
-	if len(gotEnv) != 1 || gotEnv[0] != wantEnv {
-		t.Fatalf("start environment = %#v, want [%q]", gotEnv, wantEnv)
+	for _, wantEnv := range []string{
+		"PI_CODING_AGENT_DIR=" + piAgentDir,
+		"AUTOMATA_PROFILE=default",
+	} {
+		if !containsString(gotEnv, wantEnv) {
+			t.Fatalf("start environment = %#v, missing %q", gotEnv, wantEnv)
+		}
+	}
+	if len(gotEnv) != 2 {
+		t.Fatalf("start environment = %#v, want exactly both profile variables", gotEnv)
 	}
 }
 
@@ -154,6 +161,53 @@ func TestPiLaunchHonorsPiCmdOverride(t *testing.T) {
 			t.Fatalf("env must not contain PI_CODING_AGENT_DIR with PI_CMD override, got %#v", env)
 		}
 	}
+	if !containsString(env, "AUTOMATA_PROFILE=keller") {
+		t.Fatalf("PI_CMD environment = %#v, want canonical profile", env)
+	}
+}
+
+func TestPiLaunchAlwaysSetsCanonicalProfileEnvironment(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile string
+		want    string
+	}{
+		{name: "default", profile: "", want: "default"},
+		{name: "named", profile: "Getic", want: "getic"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("PI_CMD", "/bin/bash")
+			t.Setenv("AI_PROFILE", "wrong-profile")
+			app := &App{profile: test.profile}
+			cmd, _, env := app.piLaunch("chat")
+			if cmd != "/bin/bash" {
+				t.Fatalf("cmd = %q, want PI_CMD /bin/bash", cmd)
+			}
+			wantEnv := "AUTOMATA_PROFILE=" + test.want
+			count := 0
+			for _, item := range env {
+				if strings.HasPrefix(item, "AUTOMATA_PROFILE=") {
+					count++
+					if item != wantEnv {
+						t.Fatalf("profile environment = %q, want %q", item, wantEnv)
+					}
+				}
+			}
+			if count != 1 {
+				t.Fatalf("AUTOMATA_PROFILE entries = %d in %#v, want exactly one", count, env)
+			}
+		})
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCreateChatEmulatorWithoutPiCommandReturnsNil(t *testing.T) {
@@ -588,6 +642,68 @@ func TestCloseFamiliarCleansHostState(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].SessionID != mainSID+"__helper" {
 		t.Fatalf("unexpected remaining familiars: %#v", entries)
+	}
+}
+
+func TestCloseFamiliarCompletesHostCleanupAfterCommittedPersistenceFailure(t *testing.T) {
+	dataHome := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("HOME", home)
+
+	const (
+		profile = "close-familiar-warning"
+		mainSID = "close-familiar-warning__chat"
+		famSID  = "close-familiar-warning__chat__expert"
+		cwd     = "/tmp"
+	)
+	familiarJSONL := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
+	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	panel := ui.NewChatPanel(mainEm, mainSID, profile)
+	familiarsPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(familiarsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(familiarsPath, []byte(`[{"id":"expert","sessionId":"`+famSID+`"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	persistErr := errors.New("active state unavailable")
+	tr := tree.New()
+	tr.Profile = profile
+	tr.SetSaveStateFunc(func() error { return persistErr })
+	app := &App{
+		tree:            tr,
+		container:       ui.NewContainer(panel),
+		profile:         profile,
+		piAgentDir:      filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:  map[string]struct{}{famSID: {}},
+		emulatorCache:   map[string]*portalis.Emulator{famSID: familiarEm},
+		runningSessions: map[string]struct{}{famSID: {}},
+	}
+
+	err := app.closeFamiliar(famSID, familiarEm)
+	if !errors.Is(err, persistErr) {
+		t.Fatalf("close familiar error = %v, want persistence error", err)
+	}
+	var committedErr *ui.CommittedCleanupError
+	if !errors.As(err, &committedErr) {
+		t.Fatalf("close familiar error = %T, want committed cleanup warning", err)
+	}
+	if _, err := os.Stat(familiarJSONL); !os.IsNotExist(err) {
+		t.Fatalf("familiar JSONL remains after committed close: %v", err)
+	}
+	data, err := os.ReadFile(familiarsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []paths.FamiliarEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("familiar registry entries = %#v, want empty after committed close", entries)
 	}
 }
 

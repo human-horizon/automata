@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
 )
@@ -124,6 +125,61 @@ func TestReadUsesCanonicalSessionPaths(t *testing.T) {
 	homeStatus := filepath.Join(home, ".ai", "automata", "profiles", "default", "sessions", "default-session", "status.json")
 	if _, err := os.Stat(homeStatus); !os.IsNotExist(err) {
 		t.Fatalf("test must not write status under HOME, stat err: %v", err)
+	}
+}
+
+func TestCachedReaderNoticesSameMtimeReplacement(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "same-mtime-replacement"
+	dir := paths.SessionDir("", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(dir, "status.json")
+	temporaryPath := filepath.Join(dir, "replacement.json")
+	mtime := time.Unix(1_700_000_000, 0)
+	oldContents := []byte(`{"action":"old"}`)
+	newContents := []byte(`{"action":"new"}`)
+	if len(oldContents) != len(newContents) {
+		t.Fatal("replacement fixtures must have equal sizes")
+	}
+	if err := os.WriteFile(statusPath, oldContents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(statusPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := NewCachedReader("")
+	if got := reader.Read(sessionID); got != "old" {
+		t.Fatalf("initial status = %q, want old", got)
+	}
+	oldInfo, err := os.Stat(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(temporaryPath, newContents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(temporaryPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	replacementInfo, err := os.Stat(temporaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldInfo.Size() != replacementInfo.Size() || !oldInfo.ModTime().Equal(replacementInfo.ModTime()) {
+		t.Fatal("replacement fixture must preserve file size and mtime")
+	}
+	if os.SameFile(oldInfo, replacementInfo) {
+		t.Fatal("replacement fixture unexpectedly refers to the same file")
+	}
+	if err := os.Rename(temporaryPath, statusPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := reader.Read(sessionID); got != "new" {
+		t.Fatalf("status after same-mtime replacement = %q, want new", got)
 	}
 }
 
