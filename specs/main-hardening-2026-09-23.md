@@ -67,4 +67,4 @@
 - [x] Watcher errors имеют recovery path и regression coverage.
 - [x] Tiny-width layout bounded, debug-log contract согласован.
 - [x] `gofmt -l .`, `go vet ./...`, `go test ./... -count=1 -p 1`, `go mod verify`, `git diff --check` и два reproducible builds проходят.
-- [ ] Новая ветка опубликована, PR в `main` открыт, merge-branch CI и clean-tree/reproducible checks зелёные.
+- [x] Новая ветка опубликована, PR в `main` открыт, merge-branch CI и clean-tree/reproducible checks зелёные.
