@@ -33,4 +33,4 @@
 - [x] Ошибка move `SaveState` сначала восстанавливает старое дерево; rollback не сохраняет промежуточное новое дерево.
 - [x] PIDUnknown в любой session multi-stop даёт ноль сигналов до commit; partial signal failure очищает все цели и возвращает aggregate error.
 - [x] Failed familiar cleanup не удаляет tab, emulator или familiar metadata.
-- [ ] Targeted/full tests, `gofmt`, `go vet`, `go mod verify`, reproducible builds, `git diff --check` и новый GitHub Actions run проходят.
+- [x] Targeted/full tests, `gofmt`, `go vet`, `go mod verify`, reproducible builds, `git diff --check` и новый GitHub Actions run проходят.
