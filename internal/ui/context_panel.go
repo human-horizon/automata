@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -33,9 +34,15 @@ type ContextPanel struct {
 	notesReader  *memory.CachedReader
 	kanbanPanel  *KanbanPanel
 
-	expandedNotes map[string]bool
-	activeNoteKey string
-	noteHits      []noteHit
+	expandedNotes  map[string]bool
+	activeNoteKey  string
+	noteHits       []noteHit
+	notesClipboard notesClipboard
+	notesStatus    string
+
+	pendingNotesPasteAction   notesClipboardAction
+	notesPasteModal           *warp.Modal
+	confirmedNotesPasteAction notesClipboardAction
 
 	// notesWatcher observes the active domain directory so changes to
 	// notes.json reach the panel without polling. Created in SetDomain,
@@ -48,11 +55,12 @@ type ContextPanel struct {
 // NewContextPanel creates an empty context panel for the given profile.
 func NewContextPanel(profile string) *ContextPanel {
 	return &ContextPanel{
-		profile:       profile,
-		palette:       apptheme.Default(),
-		notesReader:   memory.NewCachedReader(),
-		kanbanPanel:   NewKanbanPanel(profile),
-		expandedNotes: make(map[string]bool),
+		profile:        profile,
+		palette:        apptheme.Default(),
+		notesReader:    memory.NewCachedReader(),
+		kanbanPanel:    NewKanbanPanel(profile),
+		expandedNotes:  make(map[string]bool),
+		notesClipboard: newSystemClipboard(),
 	}
 }
 
@@ -73,7 +81,7 @@ func (c *ContextPanel) SetChats(chats []ChatInfo) {
 }
 
 // SetOnTaskAssigned sets a callback for when a task is assigned to a chat.
-func (c *ContextPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string)) {
+func (c *ContextPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string) tea.Cmd) {
 	c.kanbanPanel.SetOnTaskAssigned(fn)
 }
 
@@ -85,11 +93,13 @@ func (c *ContextPanel) SetDomain(domain string) {
 	// Close the watcher on the previous domain before swapping so we never
 	// leak an fsnotify descriptor when the user jumps between folders.
 	c.closeNotesWatcher()
+	c.closeNotesPasteConfirmation()
 	c.domain = domain
 	c.scrollOffset = 0
 	c.expandedNotes = make(map[string]bool)
 	c.activeNoteKey = ""
 	c.noteHits = nil
+	c.notesStatus = ""
 	c.refresh()
 	c.setupNotesWatcher()
 	c.kanbanPanel.SetDomain(domain)
@@ -143,10 +153,19 @@ func (c *ContextPanel) setupNotesWatcher() {
 // closeNotesWatcher releases the domain notes watcher if one is attached.
 func (c *ContextPanel) closeNotesWatcher() {
 	if c.notesWatcher != nil {
-		c.notesWatcher.Close()
+		_ = c.notesWatcher.Close()
 		c.notesWatcher = nil
 	}
 	c.notesWatchPending = false
+}
+
+// Close releases the notes and Kanban watchers owned by the panel.
+func (c *ContextPanel) Close() {
+	c.closeNotesWatcher()
+	c.closeNotesPasteConfirmation()
+	if c.kanbanPanel != nil {
+		c.kanbanPanel.Close()
+	}
 }
 
 // watchNotesCmd blocks on the domain notes watcher and returns a single
@@ -181,32 +200,168 @@ func (c *ContextPanel) domainDirForActive() string {
 // change to the active domain directory (typically notes.json).
 type notesChangedMsg struct{}
 
-// Update handles resize, tab switching, and scrolling.
+type notesClipboardAction string
+
+const (
+	notesClipboardCopy    notesClipboardAction = "copy"
+	notesClipboardAdd     notesClipboardAction = "add"
+	notesClipboardReplace notesClipboardAction = "replace"
+)
+
+type notesClipboardMsg struct {
+	action  notesClipboardAction
+	profile string
+	domain  string
+	text    string
+	err     error
+}
+
+type notesToolbarButton struct {
+	action notesClipboardAction
+	label  string
+}
+
+const (
+	notesToolbarRow      = 2
+	notesContentStartRow = 4
+)
+
+func notesToolbarButtons(width int) []notesToolbarButton {
+	if width < 23 {
+		return []notesToolbarButton{
+			{action: notesClipboardCopy, label: "C"},
+			{action: notesClipboardAdd, label: "+"},
+			{action: notesClipboardReplace, label: "↺"},
+		}
+	}
+	if width < 32 {
+		return []notesToolbarButton{
+			{action: notesClipboardCopy, label: " Copy "},
+			{action: notesClipboardAdd, label: " Add "},
+			{action: notesClipboardReplace, label: " Replace "},
+		}
+	}
+	return []notesToolbarButton{
+		{action: notesClipboardCopy, label: " Copy "},
+		{action: notesClipboardAdd, label: " Paste + "},
+		{action: notesClipboardReplace, label: " Paste replace "},
+	}
+}
+
+// Update handles resize, tab switching, scrolling, clipboard actions, and
+// paste confirmations.
 func (c *ContextPanel) Update(msg tea.Msg) tea.Cmd {
 	var baseCmd tea.Cmd
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		c.width = msg.Width
-		c.height = msg.Height
-		c.kanbanPanel.Update(warp.ResizeMsg{Width: msg.Width, Height: msg.Height - 1})
-	case warp.ResizeMsg:
-		c.width = msg.Width
-		c.height = msg.Height
-		c.kanbanPanel.Update(warp.ResizeMsg{Width: msg.Width, Height: msg.Height - 1})
-	case tea.MouseMsg:
-		baseCmd = c.handleMouse(msg)
-	case tea.KeyMsg:
-		c.handleKey(msg)
-	case notesChangedMsg:
-		c.notesWatchPending = false
-		c.refresh()
+	modalHandled := false
+	if c.pendingNotesPasteAction != "" {
+		switch msg.(type) {
+		case tea.KeyMsg, tea.MouseMsg:
+			baseCmd = c.handleNotesPasteConfirmation(msg)
+			modalHandled = true
+		}
 	}
 
+	if !modalHandled {
+		switch msg := msg.(type) {
+		case tea.WindowSizeMsg:
+			c.width = msg.Width
+			c.height = msg.Height
+			c.kanbanPanel.Update(warp.ResizeMsg{Width: msg.Width, Height: msg.Height - 1})
+		case warp.ResizeMsg:
+			c.width = msg.Width
+			c.height = msg.Height
+			c.kanbanPanel.Update(warp.ResizeMsg{Width: msg.Width, Height: msg.Height - 1})
+		case tea.MouseMsg:
+			baseCmd = c.handleMouse(msg)
+		case tea.KeyMsg:
+			c.handleKey(msg)
+		case notesClipboardMsg:
+			c.handleNotesClipboard(msg)
+		case notesChangedMsg:
+			c.notesWatchPending = false
+			c.refresh()
+		}
+	}
+
+	if c.confirmedNotesPasteAction != "" {
+		action := c.confirmedNotesPasteAction
+		c.confirmedNotesPasteAction = ""
+		baseCmd = tea.Batch(baseCmd, c.readNotesClipboard(action))
+	}
 	if c.notesWatcher != nil && !c.notesWatchPending {
 		c.notesWatchPending = true
 		baseCmd = tea.Batch(baseCmd, c.watchNotesCmd())
 	}
 	return baseCmd
+}
+
+func (c *ContextPanel) handleNotesPasteConfirmation(msg tea.Msg) tea.Cmd {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "y", "Y":
+			c.confirmNotesPaste(c.pendingNotesPasteAction)
+		case "n", "N", "esc":
+			c.closeNotesPasteConfirmation()
+		}
+	case tea.MouseMsg:
+		if c.notesPasteModal != nil && c.notesPasteModal.HandleMouse(msg) {
+			return nil
+		}
+		if msg.Action == tea.MouseActionPress {
+			c.closeNotesPasteConfirmation()
+		}
+	}
+	return nil
+}
+
+func (c *ContextPanel) openNotesPasteConfirmation(action notesClipboardAction) {
+	if action != notesClipboardAdd && action != notesClipboardReplace {
+		return
+	}
+
+	title := "Add notes"
+	content := "Add notes from clipboard?"
+	if action == notesClipboardReplace {
+		title = "Replace notes"
+		content = "Replace current notes with clipboard?"
+	}
+
+	c.pendingNotesPasteAction = action
+	c.confirmedNotesPasteAction = ""
+	c.notesPasteModal = warp.NewModal(
+		title,
+		content,
+		[]warp.ModalButton{
+			{Label: "Yes", Action: func() {
+				c.confirmNotesPaste(action)
+			}},
+			{Label: "No", Action: func() {
+				c.closeNotesPasteConfirmation()
+			}},
+		},
+		func() {
+			c.closeNotesPasteConfirmation()
+		},
+	)
+	if c.width > 0 && c.height > 0 {
+		c.notesPasteModal.EnsureDimensions(c.width, c.height)
+	}
+}
+
+func (c *ContextPanel) confirmNotesPaste(action notesClipboardAction) {
+	if c.pendingNotesPasteAction != action {
+		return
+	}
+	c.pendingNotesPasteAction = ""
+	c.notesPasteModal = nil
+	c.confirmedNotesPasteAction = action
+}
+
+func (c *ContextPanel) closeNotesPasteConfirmation() {
+	c.pendingNotesPasteAction = ""
+	c.notesPasteModal = nil
+	c.confirmedNotesPasteAction = ""
 }
 
 func (c *ContextPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
@@ -234,8 +389,14 @@ func (c *ContextPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 		return c.kanbanPanel.Update(relMsg)
 	}
-	if c.activeTab == 0 && msg.Y > 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-		if hit, ok := c.noteAt(msg.Y - 1 + c.scrollOffset); ok {
+	if c.activeTab == 0 && msg.Y == notesToolbarRow && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		if action := c.notesToolbarActionAt(msg.X); action != "" {
+			return c.beginNotesClipboard(action)
+		}
+		return nil
+	}
+	if c.activeTab == 0 && msg.Y >= notesContentStartRow && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		if hit, ok := c.noteAt(msg.Y - notesContentStartRow + c.scrollOffset); ok {
 			c.activeNoteKey = hit.key
 			c.toggleNote(hit.key)
 			return nil
@@ -252,6 +413,133 @@ func (c *ContextPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		c.scrollOffset += 3
 	}
 	return nil
+}
+
+func (c *ContextPanel) beginNotesClipboard(action notesClipboardAction) tea.Cmd {
+	profile := c.profile
+	domain := c.domain
+	if domain == "" {
+		return func() tea.Msg {
+			return notesClipboardMsg{action: action, profile: profile, domain: domain, err: fmt.Errorf("no active domain")}
+		}
+	}
+
+	if action == notesClipboardAdd || action == notesClipboardReplace {
+		c.openNotesPasteConfirmation(action)
+		return nil
+	}
+	return c.writeNotesClipboard(action, profile, domain)
+}
+
+func (c *ContextPanel) writeNotesClipboard(action notesClipboardAction, profile, domain string) tea.Cmd {
+	if c.notesClipboard == nil {
+		c.notesClipboard = newSystemClipboard()
+	}
+	clipboard := c.notesClipboard
+	payload, err := marshalNotes(c.data)
+	if err != nil {
+		return func() tea.Msg {
+			return notesClipboardMsg{action: action, profile: profile, domain: domain, err: err}
+		}
+	}
+	return func() tea.Msg {
+		return notesClipboardMsg{action: action, profile: profile, domain: domain, err: clipboard.Write(payload)}
+	}
+}
+
+func (c *ContextPanel) readNotesClipboard(action notesClipboardAction) tea.Cmd {
+	profile := c.profile
+	domain := c.domain
+	if domain == "" {
+		return func() tea.Msg {
+			return notesClipboardMsg{action: action, profile: profile, domain: domain, err: fmt.Errorf("no active domain")}
+		}
+	}
+	if c.notesClipboard == nil {
+		c.notesClipboard = newSystemClipboard()
+	}
+	clipboard := c.notesClipboard
+	return func() tea.Msg {
+		text, err := clipboard.Read()
+		return notesClipboardMsg{action: action, profile: profile, domain: domain, text: text, err: err}
+	}
+}
+
+func marshalNotes(data *memory.Data) (string, error) {
+	notes := make([]memory.NoteSummary, 0)
+	if data != nil {
+		notes = append(notes, data.Notes...)
+	}
+	encoded, err := json.MarshalIndent(notes, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(encoded) + "\n", nil
+}
+
+func decodeClipboardNotes(text string) ([]memory.NoteSummary, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || trimmed[0] != '[' {
+		return nil, fmt.Errorf("clipboard does not contain a notes array")
+	}
+
+	var notes []memory.NoteSummary
+	if err := json.Unmarshal([]byte(trimmed), &notes); err != nil {
+		return nil, fmt.Errorf("decode notes: %w", err)
+	}
+	if notes == nil {
+		notes = make([]memory.NoteSummary, 0)
+	}
+	return notes, nil
+}
+
+func (c *ContextPanel) handleNotesClipboard(msg notesClipboardMsg) {
+	if msg.profile != c.profile || msg.domain != c.domain {
+		return
+	}
+	if msg.err != nil {
+		c.notesStatus = "✗ Clipboard error"
+		return
+	}
+	if msg.action == notesClipboardCopy {
+		c.notesStatus = "✓ Copied"
+		return
+	}
+
+	pastedNotes, err := decodeClipboardNotes(msg.text)
+	if err != nil {
+		c.notesStatus = "✗ Invalid notes"
+		return
+	}
+
+	notes := pastedNotes
+	if msg.action == notesClipboardAdd {
+		existing := make([]memory.NoteSummary, 0)
+		if c.data != nil {
+			existing = c.data.Notes
+		}
+		notes = make([]memory.NoteSummary, 0, len(existing)+len(pastedNotes))
+		notes = append(notes, existing...)
+		notes = append(notes, pastedNotes...)
+	}
+	if err := memory.Write(c.profile, c.domain, notes); err != nil {
+		c.notesStatus = "✗ Save error"
+		return
+	}
+	if c.notesReader == nil {
+		c.notesReader = memory.NewCachedReader()
+	}
+	c.notesReader.Invalidate(c.profile, c.domain)
+	c.refresh()
+	c.scrollOffset = 0
+	c.expandedNotes = make(map[string]bool)
+	c.activeNoteKey = ""
+	c.noteHits = nil
+	if msg.action == notesClipboardAdd {
+		c.notesStatus = "✓ Added"
+	} else {
+		c.notesStatus = "✓ Replaced"
+	}
 }
 
 func (c *ContextPanel) handleKey(msg tea.KeyMsg) {
@@ -321,14 +609,64 @@ func (c *ContextPanel) View(width, height int) string {
 	}
 
 	tabBar := c.renderTabBar(c.width)
-	bodyHeight := c.height - 1
-	if bodyHeight < 1 {
-		return tabBar
+	var out string
+	if c.activeTab == 0 {
+		out = c.renderContentView(tabBar)
+	} else {
+		bodyHeight := c.height - 1
+		if bodyHeight < 1 {
+			out = tabBar
+		} else {
+			body := c.renderBody(c.width, bodyHeight)
+			lines := strings.Split(body, "\n")
+			lines = c.scrollPanelLines(lines, bodyHeight)
+			out = tabBar + "\n" + strings.Join(lines, "\n")
+		}
 	}
-	body := c.renderBody(c.width, bodyHeight)
-	lines := strings.Split(body, "\n")
-	if len(lines) > bodyHeight {
-		maxOffset := len(lines) - bodyHeight
+
+	if c.notesPasteModal != nil {
+		lines := c.notesPasteModal.Overlay(strings.Split(out, "\n"), c.width, c.height)
+		out = strings.Join(lines, "\n")
+	}
+	return out
+}
+
+func (c *ContextPanel) renderContentView(tabBar string) string {
+	lines := []string{tabBar}
+	if len(lines) >= c.height {
+		return strings.Join(lines[:c.height], "\n")
+	}
+
+	blank := strings.Repeat(" ", c.width)
+	lines = append(lines, blank)
+	if len(lines) >= c.height {
+		return strings.Join(lines[:c.height], "\n")
+	}
+
+	lines = append(lines, c.renderNotesToolbar(c.width))
+	if len(lines) >= c.height {
+		return strings.Join(lines[:c.height], "\n")
+	}
+
+	lines = append(lines, blank)
+	if len(lines) >= c.height {
+		return strings.Join(lines[:c.height], "\n")
+	}
+
+	contentHeight := c.height - notesContentStartRow
+	body := c.renderContent(c.width, contentHeight)
+	bodyLines := strings.Split(body, "\n")
+	bodyLines = c.scrollPanelLines(bodyLines, contentHeight)
+	lines = append(lines, bodyLines...)
+	return strings.Join(lines, "\n")
+}
+
+func (c *ContextPanel) scrollPanelLines(lines []string, height int) []string {
+	if height < 1 {
+		return nil
+	}
+	if len(lines) > height {
+		maxOffset := len(lines) - height
 		if c.scrollOffset > maxOffset {
 			c.scrollOffset = maxOffset
 		}
@@ -336,16 +674,73 @@ func (c *ContextPanel) View(width, height int) string {
 			c.scrollOffset = 0
 		}
 		lines = lines[c.scrollOffset:]
-		if len(lines) > bodyHeight {
-			lines = lines[:bodyHeight]
+		if len(lines) > height {
+			lines = lines[:height]
 		}
 	} else {
 		c.scrollOffset = 0
 	}
-	for len(lines) < bodyHeight {
+	for len(lines) < height {
 		lines = append(lines, strings.Repeat(" ", c.width))
 	}
-	return tabBar + "\n" + strings.Join(lines, "\n")
+	return lines
+}
+
+func (c *ContextPanel) renderNotesToolbar(width int) string {
+	styles := c.styles()
+	buttons := notesToolbarButtons(width)
+	var builder strings.Builder
+	for index, button := range buttons {
+		if index > 0 {
+			builder.WriteByte(' ')
+		}
+		builder.WriteString(styles.toolbarButton.Render(button.label))
+	}
+
+	line := builder.String()
+	if c.notesStatus != "" {
+		available := width - lipgloss.Width(line) - 1
+		if available > 0 {
+			status := truncatePanelText(c.notesStatus, available)
+			if status != "" {
+				line += " " + styles.toolbarStatus.Render(status)
+			}
+		}
+	}
+	if lineWidth := lipgloss.Width(line); lineWidth < width {
+		line += strings.Repeat(" ", width-lineWidth)
+	}
+	return line
+}
+
+func truncatePanelText(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= width {
+		return text
+	}
+	if width == 1 {
+		return string(runes[:1])
+	}
+	return string(runes[:width-1]) + "…"
+}
+
+func (c *ContextPanel) notesToolbarActionAt(x int) notesClipboardAction {
+	cursor := 0
+	width := c.width
+	if width <= 0 {
+		width = 80
+	}
+	for _, button := range notesToolbarButtons(width) {
+		buttonWidth := lipgloss.Width(button.label)
+		if x >= cursor && x < cursor+buttonWidth {
+			return button.action
+		}
+		cursor += buttonWidth + 1
+	}
+	return ""
 }
 
 func (c *ContextPanel) renderTabBar(width int) string {
@@ -558,7 +953,7 @@ func (c *ContextPanel) expandActiveNote() {
 }
 
 func (c *ContextPanel) ensureActiveNoteVisible() {
-	bodyHeight := c.height - 1
+	bodyHeight := c.height - notesContentStartRow
 	if bodyHeight < 1 {
 		return
 	}
@@ -582,6 +977,8 @@ type contextStyles struct {
 	sectionHeader lipgloss.Style
 	sectionActive lipgloss.Style
 	empty         lipgloss.Style
+	toolbarButton lipgloss.Style
+	toolbarStatus lipgloss.Style
 }
 
 func newContextStyles(palette apptheme.Theme) contextStyles {
@@ -592,6 +989,8 @@ func newContextStyles(palette apptheme.Theme) contextStyles {
 		sectionHeader: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(palette.TextStrong)),
 		sectionActive: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(palette.TextStrong)).Background(lipgloss.Color(palette.Raised)),
 		empty:         lipgloss.NewStyle().Foreground(lipgloss.Color(palette.TextDim)).Italic(true),
+		toolbarButton: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(palette.SelectionForeground)).Background(lipgloss.Color(palette.Raised)),
+		toolbarStatus: lipgloss.NewStyle().Foreground(lipgloss.Color(palette.TextMuted)),
 	}
 }
 

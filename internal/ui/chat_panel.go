@@ -32,8 +32,8 @@ type chatSession struct {
 }
 
 // ChatPanel manages multiple terminal sessions (main + familiars) with a tab
-// bar at the bottom. It polls ~/.ai/automata/sessions/<sessionID>/familiars.json
-// to detect new familiars and creates TermPanel tabs (Portalis Emulator) for them.
+// bar at the bottom. It polls the active profile's canonical session directory
+// for familiars.json and creates TermPanel tabs (Portalis Emulator) for them.
 type ChatPanel struct {
 	sessions  []*chatSession
 	activeIdx int
@@ -55,15 +55,16 @@ type ChatPanel struct {
 	onClearSession func(sessionID, cwd string) tea.Cmd
 
 	// onCloseFamiliar is called when the user confirms closing a familiar via the
-	// × button on a familiar tab. The handler stops the emulator, deletes the
-	// familiar's JSONL, and removes its entry from familiars.json.
+	// × button on a familiar tab. The handler must complete host cleanup before
+	// the panel removes the tab and returns an error when fail-closed preflight
+	// rejects the operation.
 	//
 	// Synchronous (no tea.Cmd return) on purpose: Modal.Action callbacks and
 	// the Y-key path both fire the close, and Modal.Action is a plain
 	// `func()` — there's no way to surface a returned cmd from inside it.
 	// Doing the cleanup synchronously here means both mouse and keyboard
 	// confirm paths work identically. See Anya's report 2026-08-25.
-	onCloseFamiliar func(familiarID string, em *portalis.Emulator)
+	onCloseFamiliar func(familiarID string, em *portalis.Emulator) error
 
 	// pendingCloseFamiliar holds the familiarID awaiting y/n confirmation.
 	// When non-empty, View draws a confirm overlay on top of the terminal area.
@@ -112,10 +113,10 @@ func (cp *ChatPanel) SetOnClearSession(fn func(sessionID, cwd string) tea.Cmd) {
 // SetOnCloseFamiliar sets the handler invoked when the user confirms closing
 // a familiar via the × button on a familiar tab. The handler stops the
 // emulator, deletes the familiar's JSONL, and removes the entry from
-// familiars.json.
+// familiars.json. A non-nil error keeps the tab in place.
 //
 // Synchronous by design — see the comment on ChatPanel.onCloseFamiliar.
-func (cp *ChatPanel) SetOnCloseFamiliar(fn func(familiarID string, em *portalis.Emulator)) {
+func (cp *ChatPanel) SetOnCloseFamiliar(fn func(familiarID string, em *portalis.Emulator) error) {
 	cp.onCloseFamiliar = fn
 }
 
@@ -425,13 +426,9 @@ func (cp *ChatPanel) openCloseFamiliarModal(name string) {
 	)
 }
 
-// closeFamiliarByID drops the familiar tab from cp.sessions and asks the
-// host (main.go via onCloseFamiliar) to clean up the underlying emulator,
-// JSONL, and familiars.json entry. The host callback is synchronous (no
-// cmd return) — that way it works identically whether the user confirms
-// via the Y key (handled in Update) or by clicking the Yes button in the
-// Modal overlay (handled in warp.ModalButton.Action, which is a plain
-// `func()` and can't surface a cmd).
+// closeFamiliarByID asks the host (main.go via onCloseFamiliar) to clean up
+// the underlying emulator, JSONL, and familiars.json entry before removing
+// the tab. A failed host preflight leaves the tab and emulator untouched.
 func (cp *ChatPanel) closeFamiliarByID(familiarID string) {
 	var (
 		idx = -1
@@ -447,11 +444,14 @@ func (cp *ChatPanel) closeFamiliarByID(familiarID string) {
 	if idx < 0 {
 		return
 	}
-	// Stop the panel synchronously so the terminal stops drawing.
-	cp.removeSessionAt(idx)
 	if cp.onCloseFamiliar != nil {
-		cp.onCloseFamiliar(familiarID, em)
+		if err := cp.onCloseFamiliar(familiarID, em); err != nil {
+			return
+		}
 	}
+	// Stop the panel synchronously after host cleanup succeeds so a failed
+	// destructive preflight cannot orphan a hidden familiar runtime.
+	cp.removeSessionAt(idx)
 }
 
 func (cp *ChatPanel) removeFamiliar(id string) {

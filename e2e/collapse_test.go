@@ -45,7 +45,9 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 
 	t.Cleanup(func() {
 		if t.Failed() {
-			page.SaveArtifact("test-artifacts", "ChatCollapse")
+			if err := saveTestArtifact(page, "ChatCollapse"); err != nil {
+				t.Logf("save ChatCollapse artifact: %v", err)
+			}
 		}
 	})
 

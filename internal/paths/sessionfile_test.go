@@ -230,6 +230,16 @@ func TestDeleteSessionJSONLRefusesEmptyAgentDir(t *testing.T) {
 	}
 }
 
+func TestFamiliarsJSONLPathUsesCanonicalDefaultProfile(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "chat"
+	got := FamiliarsJSONLPath("", sessionID)
+	want := filepath.Join(SessionDir("", sessionID), "familiars.json")
+	if got != want {
+		t.Fatalf("default familiars path = %q, want %q", got, want)
+	}
+}
+
 func TestRemoveFamiliarUpdatesFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

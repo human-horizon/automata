@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
@@ -179,6 +180,10 @@ type Tree struct {
 	// Callback when the user requests to stop an active session
 	onStopSession func(*Item)
 
+	// Callback before an item (or folder subtree) is deleted. Returning an
+	// error aborts the tree mutation so runtime cleanup can fail closed.
+	onBeforeDelete func(*Item) error
+
 	// Callback fired after the active theme changes.
 	onThemeChange func(string)
 
@@ -186,6 +191,10 @@ type Tree struct {
 	// local overlay fallback for standalone use and unit tests.
 	onOpenHelp     func()
 	onOpenSettings func()
+
+	// Callback fired before an item changes parent. It may migrate external
+	// data and returns a rollback function used if the state save fails.
+	onBeforeItemMoved func(item, newParent *Item) (func() error, error)
 
 	// Callback fired after an item is moved to a new parent. The arguments are
 	// the bare session ID (no profile prefix) of the item before and after the
@@ -197,6 +206,16 @@ type Tree struct {
 	// onRename runs before the tree item is changed. Returning an error keeps
 	// the old name and leaves the input modal open.
 	onRename func(item *Item, newName string) error
+
+	// onBeforeRename runs before the tree item is changed and returns an
+	// external migration rollback used when Tree.SaveState fails.
+	onBeforeRename func(item *Item, newName string) (func() error, error)
+
+	// onRenameCommitted runs only after the renamed tree state is persisted.
+	onRenameCommitted func(item *Item, oldName, newName string)
+
+	// saveStateOverride is a test seam for persistence failure ordering.
+	saveStateOverride func() error
 
 	// ActiveSessions holds the set of currently running session IDs (keyed by
 	// the same identifier used to create the emulator).
@@ -218,6 +237,9 @@ type Tree struct {
 
 	// Profile name for state isolation (e.g. "ai" → ~/.automata/ai/state.json)
 	Profile string
+
+	// saveMu serializes atomic state snapshots and replacements.
+	saveMu sync.Mutex
 }
 
 func generateID() string {
@@ -426,6 +448,25 @@ func (t *Tree) MoveSelectedOut() bool {
 	}
 	parent := sel.parent
 	grandparent := parent.parent
+	oldID := t.sessionIDOf(sel)
+	newParent := grandparent
+	newID := t.sessionIDOfWithParent(sel, newParent)
+	var rollback func() error
+	if oldID != newID && t.onBeforeItemMoved != nil {
+		var err error
+		rollback, err = t.onBeforeItemMoved(sel, newParent)
+		if err != nil {
+			return false
+		}
+	}
+
+	oldRoot := append([]*Item(nil), t.root...)
+	oldParentChildren := append([]*Item(nil), parent.Children...)
+	var oldTargetChildren []*Item
+	if grandparent != nil && grandparent != parent {
+		oldTargetChildren = append([]*Item(nil), grandparent.Children...)
+	}
+	oldArchived := sel.Archived
 
 	// Remove sel from parent.Children.
 	remaining := make([]*Item, 0, len(parent.Children))
@@ -458,7 +499,7 @@ func (t *Tree) MoveSelectedOut() bool {
 	}
 	if !inserted {
 		// Anchor lost (shouldn't happen) — restore parent state.
-		parent.Children = append(parent.Children, sel)
+		parent.Children = oldParentChildren
 		sel.parent = parent
 		return false
 	}
@@ -493,7 +534,31 @@ func (t *Tree) MoveSelectedOut() bool {
 
 	t.rebuildFlat()
 	t.reselectItem(sel)
-	t.autoSave()
+	if err := t.SaveState(); err != nil {
+		t.root = oldRoot
+		parent.Children = oldParentChildren
+		if grandparent != nil && grandparent != parent {
+			grandparent.Children = oldTargetChildren
+		}
+		sel.parent = parent
+		sel.Archived = oldArchived
+		t.rebuildFlat()
+		t.reselectItem(sel)
+		var rollbackErr error
+		if rollback != nil {
+			rollbackErr = rollback()
+		}
+		if persistErr := t.SaveState(); persistErr != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "Failed to restore tree state after move:", persistErr)
+		}
+		if rollbackErr != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "Failed to rollback moved data:", rollbackErr)
+		}
+		return false
+	}
+	if t.onItemMoved != nil && oldID != newID {
+		t.onItemMoved(sel, oldID, newID)
+	}
 	return true
 }
 
@@ -671,22 +736,14 @@ func (f *Item) Path() []string {
 // Examples:
 //
 //	profile "human-horizon", folder "Projects/HumanHorizon/Automata" → "human-horizon__projects.humanhorizon.automata"
-//	profile "human-horizon", chat in root "chat1" → "human-horizon__"
+//	profile "human-horizon", root chat "chat1" → "human-horizon"
 //	no profile, folder "Projects" → "projects"
 func (f *Item) Domain(profile string) string {
-	var parts []string
-	p := f
-	for p != nil {
-		if p.IsFolder {
-			parts = append([]string{slug.Slug(p.Name)}, parts...)
-		}
-		p = p.parent
+	folders := f.Path()
+	if f.IsFolder {
+		folders = append(folders, f.Name)
 	}
-	profilePart := paths.ProfileSlug(profile)
-	if len(parts) == 0 {
-		return profilePart
-	}
-	return profilePart + "__" + strings.Join(parts, ".")
+	return paths.DomainID(profile, folders)
 }
 
 // Icon returns the display icon for the item.
@@ -922,7 +979,15 @@ func (t *Tree) renameItem(item *Item, name string) error {
 		return nil
 	}
 
-	if t.onRename != nil {
+	oldName := item.Name
+	var rollback func() error
+	if t.onBeforeRename != nil {
+		var err error
+		rollback, err = t.onBeforeRename(item, name)
+		if err != nil {
+			return err
+		}
+	} else if t.onRename != nil {
 		if err := t.onRename(item, name); err != nil {
 			return err
 		}
@@ -930,7 +995,25 @@ func (t *Tree) renameItem(item *Item, name string) error {
 
 	item.Name = name
 	t.rebuildFlat()
-	t.autoSave()
+	if err := t.SaveState(); err != nil {
+		item.Name = oldName
+		t.rebuildFlat()
+		var rollbackErr error
+		if rollback != nil {
+			rollbackErr = rollback()
+		}
+		persistErr := t.SaveState()
+		if rollbackErr != nil {
+			return fmt.Errorf("save renamed tree: %w; rollback: %v", err, rollbackErr)
+		}
+		if persistErr != nil {
+			return fmt.Errorf("save renamed tree: %w; restore old state: %v", err, persistErr)
+		}
+		return err
+	}
+	if t.onRenameCommitted != nil {
+		t.onRenameCommitted(item, oldName, name)
+	}
 	return nil
 }
 
@@ -945,6 +1028,15 @@ func (t *Tree) siblings(item *Item) []*Item {
 }
 
 func (t *Tree) deleteItem(item *Item) {
+	if item == nil {
+		return
+	}
+	if t.onBeforeDelete != nil {
+		if err := t.onBeforeDelete(item); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "Failed to delete tree item:", err)
+			return
+		}
+	}
 	if item.parent != nil {
 		parent := item.parent
 		for i, child := range parent.Children {
@@ -965,14 +1057,16 @@ func (t *Tree) deleteItem(item *Item) {
 	t.autoSave()
 }
 
+// MoveItem moves an item relative to a target item using the same guarded
+// path as drag-and-drop. Invalid cycle moves are ignored.
+func (t *Tree) MoveItem(item, target *Item) {
+	t.moveItem(item, target)
+}
+
 func (t *Tree) moveItem(item, target *Item) {
-	if item == target || target == nil {
+	if item == nil || item == target || target == nil {
 		return
 	}
-
-	// Capture the session ID before mutating the tree so the callback can
-	// detect cross-parent moves that change the just-pi session id.
-	oldID := t.sessionIDOf(item)
 
 	// Determine target parent and insertion index before removing item,
 	// because removal shifts indices.
@@ -999,6 +1093,35 @@ func (t *Tree) moveItem(item, target *Item) {
 			}
 		}
 	}
+	if isDescendantOf(targetParent, item) {
+		return
+	}
+
+	// Capture the session ID before mutating the tree so the callback can
+	// detect cross-parent moves that change the just-pi session id.
+	oldID := t.sessionIDOf(item)
+	newID := t.sessionIDOfWithParent(item, targetParent)
+	var rollback func() error
+	if oldID != newID && t.onBeforeItemMoved != nil {
+		var err error
+		rollback, err = t.onBeforeItemMoved(item, targetParent)
+		if err != nil {
+			return
+		}
+	}
+
+	oldRoot := append([]*Item(nil), t.root...)
+	var oldParent *Item
+	var oldParentChildren []*Item
+	if item.parent != nil {
+		oldParent = item.parent
+		oldParentChildren = append([]*Item(nil), item.parent.Children...)
+	}
+	var oldTargetChildren []*Item
+	if targetParent != nil && targetParent != oldParent {
+		oldTargetChildren = append([]*Item(nil), targetParent.Children...)
+	}
+	oldArchived := item.Archived
 
 	// Remove item from current parent. If item was in the same parent before
 	// the target index, decrement targetIndex to account for the removal.
@@ -1067,12 +1190,43 @@ func (t *Tree) moveItem(item, target *Item) {
 	}
 
 	t.rebuildFlat()
-	t.autoSave()
+	if err := t.SaveState(); err != nil {
+		t.root = oldRoot
+		if oldParent != nil {
+			oldParent.Children = oldParentChildren
+		}
+		if targetParent != nil && targetParent != oldParent {
+			targetParent.Children = oldTargetChildren
+		}
+		item.parent = oldParent
+		item.Archived = oldArchived
+		t.rebuildFlat()
+		t.reselectItem(item)
+		var rollbackErr error
+		if rollback != nil {
+			rollbackErr = rollback()
+		}
+		if persistErr := t.SaveState(); persistErr != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "Failed to restore tree state after move:", persistErr)
+		}
+		if rollbackErr != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "Failed to rollback moved data:", rollbackErr)
+		}
+		return
+	}
 
-	newID := t.sessionIDOf(item)
 	if newID != oldID && t.onItemMoved != nil {
 		t.onItemMoved(item, oldID, newID)
 	}
+}
+
+func isDescendantOf(candidate, ancestor *Item) bool {
+	for current := candidate; current != nil; current = current.parent {
+		if current == ancestor {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Context menu ---
@@ -1451,6 +1605,12 @@ func (t *Tree) SetOnStopSession(fn func(*Item)) {
 	t.onStopSession = fn
 }
 
+// SetOnBeforeDelete sets the callback invoked before deleting an item or
+// folder subtree. Returning an error keeps the tree unchanged.
+func (t *Tree) SetOnBeforeDelete(fn func(*Item) error) {
+	t.onBeforeDelete = fn
+}
+
 // SetOnThemeChange registers a callback invoked after a theme is selected.
 func (t *Tree) SetOnThemeChange(fn func(string)) {
 	t.onThemeChange = fn
@@ -1487,6 +1647,13 @@ func (t *Tree) ThemeID() string {
 	return apptheme.Resolve(t.Theme).ID
 }
 
+// SetOnBeforeItemMoved registers a callback that runs before an item changes
+// parent. The callback can migrate external data and return a rollback
+// function for a later state-save failure. Returning an error aborts the move.
+func (t *Tree) SetOnBeforeItemMoved(fn func(*Item, *Item) (func() error, error)) {
+	t.onBeforeItemMoved = fn
+}
+
 // SetOnItemMoved registers a callback fired after a successful move with
 // (item, oldSessionID, newSessionID). The IDs are bare (no profile prefix) and
 // stable across renames within the same parent.
@@ -1494,10 +1661,30 @@ func (t *Tree) SetOnItemMoved(fn func(*Item, string, string)) {
 	t.onItemMoved = fn
 }
 
-// SetOnRename registers a callback that performs external data migration
-// before the tree item name changes. Returning an error aborts the rename.
+// SetOnRename registers a legacy callback that performs external data
+// migration before the tree item name changes. New callers should use
+// SetOnBeforeRename and SetOnRenameCommitted for transactional persistence.
 func (t *Tree) SetOnRename(fn func(*Item, string) error) {
 	t.onRename = fn
+}
+
+// SetOnBeforeRename registers a reversible external migration hook. The
+// rollback runs after the Tree has restored its old in-memory name when the
+// subsequent SaveState fails.
+func (t *Tree) SetOnBeforeRename(fn func(*Item, string) (func() error, error)) {
+	t.onBeforeRename = fn
+}
+
+// SetOnRenameCommitted registers a callback invoked only after the renamed
+// tree state has been persisted successfully.
+func (t *Tree) SetOnRenameCommitted(fn func(*Item, string, string)) {
+	t.onRenameCommitted = fn
+}
+
+// SetSaveStateFunc replaces persistence with a test seam. Passing nil restores
+// the normal atomic state writer.
+func (t *Tree) SetSaveStateFunc(fn func() error) {
+	t.saveStateOverride = fn
 }
 
 // SetProfile attaches a profile slug used to compute stable session IDs in
@@ -1512,13 +1699,19 @@ func (t *Tree) sessionIDOf(item *Item) string {
 	if item == nil {
 		return ""
 	}
+	return t.sessionIDOfWithParent(item, item.parent)
+}
+
+func (t *Tree) sessionIDOfWithParent(item, parent *Item) string {
+	if item == nil {
+		return ""
+	}
 	var parts []string
-	for _, p := range item.Path() {
-		parts = append(parts, slug.Slug(p))
+	for p := parent; p != nil; p = p.parent {
+		parts = append([]string{slug.Slug(p.Name)}, parts...)
 	}
 	parts = append(parts, slug.Slug(item.Name))
-	id := strings.Join(parts, ".")
-	return id
+	return strings.Join(parts, ".")
 }
 
 // refreshBoundStale re-evaluates whether the bound filesystem path still
@@ -1557,8 +1750,14 @@ func (item *Item) EffectiveBoundPath() string {
 // SetActiveSessions replaces the set of IDs currently considered active and
 // persists it to state.json.
 func (t *Tree) SetActiveSessions(ids map[string]struct{}) {
-	t.activeSessions = ids
+	t.SetActiveSessionsInMemory(ids)
 	_ = t.SaveState()
+}
+
+// SetActiveSessionsInMemory updates active-session state without persisting the
+// tree. Transactional rename/move rollback uses this before an explicit save.
+func (t *Tree) SetActiveSessionsInMemory(ids map[string]struct{}) {
+	t.activeSessions = ids
 }
 
 // IsActiveSession reports whether the given item currently has a running session.
@@ -1693,12 +1892,17 @@ func (t *Tree) Root() []*Item { return t.root }
 // needs to walk the whole tree without caring about the on-screen layout.
 func (t *Tree) AllItems() []*Item {
 	var out []*Item
+	visited := make(map[*Item]struct{})
 	var walk func(items []*Item)
 	walk = func(items []*Item) {
 		for _, it := range items {
 			if it == nil {
 				continue
 			}
+			if _, ok := visited[it]; ok {
+				continue
+			}
+			visited[it] = struct{}{}
 			out = append(out, it)
 			if it.IsFolder {
 				walk(it.Children)

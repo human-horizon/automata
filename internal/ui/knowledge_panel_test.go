@@ -1,8 +1,13 @@
 package ui
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/HumanHorizon/automata/internal/kanban"
+	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -11,6 +16,90 @@ type stubPanel struct{}
 
 func (stubPanel) View(width, height int) string { return "" }
 func (stubPanel) Update(msg tea.Msg) tea.Cmd    { return nil }
+
+func TestKnowledgePanelLateAttachesSessionAndJobsWatchersWithoutPolling(t *testing.T) {
+	profile := "Late Knowledge"
+	sessionID := "late-knowledge__chat"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile(profile)
+	k.SetSession(sessionID)
+
+	if k.knowledgeWatcher == nil || k.knowledgeWatcherPath != paths.SessionsDir(profile) {
+		t.Fatalf("missing-session watcher = %q, want sessions parent %q", k.knowledgeWatcherPath, paths.SessionsDir(profile))
+	}
+	watchCmd := k.watchKnowledgeCmd()
+	if watchCmd == nil {
+		t.Fatal("missing-session watch command is nil")
+	}
+	messages := make(chan tea.Msg, 1)
+	go func() { messages <- watchCmd() }()
+	if err := os.MkdirAll(filepath.Join(paths.SessionsDir(profile), sessionID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-messages:
+		if _, ok := msg.(knowledgeChangedMsg); !ok {
+			t.Fatalf("session creation message = %T", msg)
+		}
+		k.Update(msg)
+	case <-time.After(2 * time.Second):
+		t.Fatal("session parent watcher did not observe late session creation")
+	}
+	if k.knowledgeWatcherPath != paths.SessionDir(profile, sessionID) {
+		t.Fatalf("session watcher path = %q, want %q", k.knowledgeWatcherPath, paths.SessionDir(profile, sessionID))
+	}
+	if k.jobsWatcher == nil || k.jobsWatcherPath != paths.SessionDir(profile, sessionID) {
+		t.Fatalf("late jobs watcher = %q, want session directory", k.jobsWatcherPath)
+	}
+
+	jobsCmd := k.watchJobsCmd()
+	if jobsCmd == nil {
+		t.Fatal("late jobs watch command is nil")
+	}
+	go func() { messages <- jobsCmd() }()
+	if err := os.MkdirAll(filepath.Join(paths.SessionDir(profile, sessionID), "jobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-messages:
+		if _, ok := msg.(jobsChangedMsg); !ok {
+			t.Fatalf("jobs creation message = %T", msg)
+		}
+		k.Update(msg)
+	case <-time.After(2 * time.Second):
+		t.Fatal("session watcher did not observe late jobs creation")
+	}
+	if k.jobsWatcherPath != filepath.Join(paths.SessionDir(profile, sessionID), "jobs") {
+		t.Fatalf("jobs watcher path = %q, want jobs directory", k.jobsWatcherPath)
+	}
+}
+
+func TestKnowledgePanelUsesExplicitCanonicalDomainForTasks(t *testing.T) {
+	profile := "Domain Profile"
+	sessionID := "domain-profile__source.chat"
+	domain := "domain-profile__target"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	taskDir := kanban.KanbanDir(domain, profile)
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	taskPath := filepath.Join(taskDir, "task.md")
+	contents := "---\ntitle: Target task\nstatus: progress\nassigned_to: " + sessionID + "\n---\nbody\n"
+	if err := os.WriteFile(taskPath, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile(profile)
+	k.SetSession(sessionID)
+	k.SetDomain(domain)
+	if k.currentTask != "Target task" {
+		t.Fatalf("current task = %q, want explicit target-domain task", k.currentTask)
+	}
+}
 
 // TestKnowledgePanelEmpty ensures an uninitialised panel renders without crashing.
 func TestKnowledgePanelEmpty(t *testing.T) {

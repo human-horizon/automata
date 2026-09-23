@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,16 +120,14 @@ func assertCompleteSGRSequences(t *testing.T, value string) {
 // ---- Familiar detection tests ----
 
 // writeFamiliarsJSON writes a familiars.json file in a temp directory and
-// returns the session ID. profile can be empty for no-profile path.
+// returns the session ID. profile can be empty for the canonical default path.
 func writeFamiliarsJSON(t *testing.T, dir, profile string, familiars []FamiliarState) string {
 	t.Helper()
 	sessionID := "test-session"
-	var sessionDir string
-	if profile != "" {
-		sessionDir = filepath.Join(dir, ".ai", "automata", "profiles", profile, "sessions", sessionID)
-	} else {
-		sessionDir = filepath.Join(dir, ".ai", "automata", "sessions", sessionID)
+	if profile == "" {
+		profile = "default"
 	}
+	sessionDir := filepath.Join(dir, ".ai", "automata", "profiles", profile, "sessions", sessionID)
 	if err := os.MkdirAll(sessionDir, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -480,9 +479,10 @@ func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 		started:   true,
 		known:     map[string]bool{},
 	}
-	cp.SetOnCloseFamiliar(func(id string, em *portalis.Emulator) {
+	cp.SetOnCloseFamiliar(func(id string, em *portalis.Emulator) error {
 		capturedID = id
 		capturedEm = em
+		return nil
 	})
 	cp.pendingCloseFamiliar = "f1"
 	cp.openCloseFamiliarModal("expert")
@@ -507,6 +507,36 @@ func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 	}
 	if capturedEm == nil {
 		t.Error("onCloseFamiliar should receive the familiar's emulator")
+	}
+}
+
+func TestConfirmYesKeepsTabWhenHostCleanupFails(t *testing.T) {
+	familiar := portalis.NewEmulator("f1", "f1", "/bin/sh", nil)
+	cp := &ChatPanel{
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", familiarID: "f1", em: familiar, panel: &fakePanel{}},
+		},
+		activeIdx: 0,
+		started:   true,
+		known:     map[string]bool{"expert": true},
+	}
+	cleanupErr := errors.New("unknown PID identity")
+	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) error {
+		return cleanupErr
+	})
+	cp.pendingCloseFamiliar = "f1"
+	cp.openCloseFamiliarModal("expert")
+
+	_ = cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if len(cp.sessions) != 2 {
+		t.Fatalf("sessions after failed cleanup = %d, want 2", len(cp.sessions))
+	}
+	if cp.sessions[1].em != familiar || cp.sessions[1].familiarID != "f1" {
+		t.Fatal("familiar tab/emulator was removed after failed cleanup")
+	}
+	if !cp.known["expert"] {
+		t.Fatal("failed cleanup removed familiar tracking state")
 	}
 }
 

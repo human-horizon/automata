@@ -2,6 +2,8 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +12,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/HumanHorizon/automata/internal/paths"
 )
 
 // JobRecord matches the structure written by the pi job extension.
@@ -32,60 +36,31 @@ type Job struct {
 	Agent     string
 }
 
-// dataHome returns the base directory for ai-knowledge data.
 func dataHome() string {
-	if v := os.Getenv("AI_DATA_HOME"); v != "" {
-		return v
-	}
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
-	}
-	return filepath.Join(home, ".ai", "automata")
+	return paths.BaseDir()
 }
 
-// profileFromSessionID extracts the profile slug from the leading `profile__`
-// prefix that Automata bakes into session IDs. Returns "" if the session ID has
-// no profile prefix.
+// profileFromSessionID extracts the already canonical profile slug from the
+// leading `profile__` prefix baked into session IDs.
 func profileFromSessionID(sessionID string) string {
 	const sep = "__"
 	idx := strings.Index(sessionID, sep)
 	if idx <= 0 {
 		return ""
 	}
-	return slugify(sessionID[:idx])
+	return sessionID[:idx]
 }
 
-// profileSlug returns the profile directory name. Empty profile maps to "default".
-func profileSlug() string {
-	profile := os.Getenv("AI_PROFILE")
+func sessionDirForProfile(profile, sessionID string) string {
 	if profile == "" {
-		return "default"
+		profile = os.Getenv("AI_PROFILE")
 	}
-	return slugify(profile)
-}
-
-func slugify(s string) string {
-	var out strings.Builder
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			out.WriteRune(r)
-		} else if r >= 'A' && r <= 'Z' {
-			out.WriteRune(r + 32) // tolower
-		} else if r == ' ' || r == '.' {
-			out.WriteRune('-')
-		}
-	}
-	return out.String()
+	return paths.SessionDir(profile, sessionID)
 }
 
 // sessionDir returns the session data directory.
 func sessionDir(sessionID string) string {
-	profile := profileFromSessionID(sessionID)
-	if profile == "" {
-		profile = profileSlug()
-	}
-	return filepath.Join(dataHome(), "profiles", profile, "sessions", sessionID)
+	return sessionDirForProfile(profileFromSessionID(sessionID), sessionID)
 }
 
 // pidStartSkewTolerance is the maximum allowed difference between the job's
@@ -93,6 +68,17 @@ func sessionDir(sessionID string) string {
 // time a few seconds off from the kernel; 5s comfortably covers that without
 // risking false negatives for legitimately recycled PIDs.
 const pidStartSkewTolerance = 5 * time.Second
+
+// PIDIdentity describes how confidently a job record can be associated with
+// the process currently occupying its PID.
+type PIDIdentity int
+
+const (
+	PIDDead PIDIdentity = iota
+	PIDSame
+	PIDDifferent
+	PIDUnknown
+)
 
 // psRunner abstracts exec.Command so tests can swap it for a fake `ps` to
 // simulate absence, garbage output, or skewed start times.
@@ -111,55 +97,45 @@ func defaultPsRunner(pid int) (string, error) {
 
 var psRunnerOverride psRunner
 
-// pidIsSameProcess reports whether `pid` is still the same process the job
-// record was started for. The decision order is intentional:
-//
-//  1. A dead PID (kill(0) errors) is never the same process, no matter what
-//     startedAt or ps claims — recycled PIDs must NOT count as live jobs.
-//  2. When ps is missing/garbled we trust kill(0) and return true. Losing a
-//     stale row to the panel is a worse UX than briefly holding one extra.
-//  3. When ps is healthy we still require the start time to line up with
-//     startedAt within `pidStartSkewTolerance`. A recycled PID is a different
-//     process regardless of whether it is currently running.
-func pidIsSameProcess(pid int, startedAt string) bool {
-	return pidIsSameProcessWithRunner(pid, startedAt, defaultPsRunner)
+// inspectPIDIdentity distinguishes a dead PID, a definitely different
+// process, a matching process, and an inconclusive identity check. The last
+// state is intentionally separate: read-only callers may keep showing a job,
+// while destructive callers must refuse to signal it.
+func inspectPIDIdentity(pid int, startedAt string) PIDIdentity {
+	runner := psRunnerOverride
+	if runner == nil {
+		runner = defaultPsRunner
+	}
+	return inspectPIDIdentityWithRunner(pid, startedAt, runner)
 }
 
-func pidIsSameProcessWithRunner(pid int, startedAt string, runner psRunner) bool {
+func inspectPIDIdentityWithRunner(pid int, startedAt string, runner psRunner) PIDIdentity {
 	if pid <= 0 {
-		return false
+		return PIDDead
 	}
 
-	// kill(0) is the source of truth for "process exists". On Linux this only
-	// succeeds if the PID is alive and we have permission to signal it; on
-	// macOS the same check is also the cheapest race-free probe.
 	if err := syscall.Kill(pid, 0); err != nil {
-		return false
+		if errors.Is(err, syscall.ESRCH) {
+			return PIDDead
+		}
+		return PIDUnknown
 	}
 
 	psStart, err := runPs(runner, pid)
 	if err != nil || psStart == "" {
-		// kill(0) just told us the process is alive. If we cannot reach ps
-		// (e.g. PATH stripped, container without /bin/ps) we still consider
-		// the job live — losing the row to the panel would be worse than
-		// briefly showing a recycled PID, and PruneStaleSession will fix
-		// any real mismatch on the next event.
-		return true
+		return PIDUnknown
 	}
-
 	if startedAt == "" {
-		// Legacy record without a start time: trust kill(0).
-		return true
+		return PIDUnknown
 	}
 
 	jobTime, err := time.Parse(time.RFC3339, startedAt)
 	if err != nil {
-		return true
+		return PIDUnknown
 	}
-
 	psTime, err := time.ParseInLocation("Mon Jan 2 15:04:05 2006", psStart, time.Local)
 	if err != nil {
-		return true
+		return PIDUnknown
 	}
 	psTime = psTime.UTC()
 
@@ -167,7 +143,24 @@ func pidIsSameProcessWithRunner(pid int, startedAt string, runner psRunner) bool
 	if diff < 0 {
 		diff = -diff
 	}
-	return diff <= pidStartSkewTolerance
+	if diff <= pidStartSkewTolerance {
+		return PIDSame
+	}
+	return PIDDifferent
+}
+
+// pidIsSameProcess preserves the conservative read-only behavior used by the
+// job list and stale-prune paths: an unknown identity remains visible rather
+// than being treated as stale. KillSessionForProfile uses the full identity
+// value and therefore fails closed for PIDUnknown.
+func pidIsSameProcess(pid int, startedAt string) bool {
+	identity := inspectPIDIdentity(pid, startedAt)
+	return identity == PIDSame || identity == PIDUnknown
+}
+
+func pidIsSameProcessWithRunner(pid int, startedAt string, runner psRunner) bool {
+	identity := inspectPIDIdentityWithRunner(pid, startedAt, runner)
+	return identity == PIDSame || identity == PIDUnknown
 }
 
 func runPs(runner psRunner, pid int) (string, error) {
@@ -191,8 +184,8 @@ func writeJSON(path string, rec *JobRecord) error {
 // "process is dead" decision must invoke PruneStaleSession explicitly. This
 // keeps panel reads cheap and prevents a transient `ps` hiccup from erasing
 // the metadata of a job that is still legitimately running.
-func List(sessionID string) ([]Job, error) {
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+func listForProfile(profile, sessionID string) ([]Job, error) {
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -238,12 +231,23 @@ func List(sessionID string) ([]Job, error) {
 	return jobs, nil
 }
 
+// List returns running jobs using the profile encoded in the session ID or
+// AI_PROFILE for legacy unprefixed IDs.
+func List(sessionID string) ([]Job, error) {
+	return listForProfile("", sessionID)
+}
+
+// ListForProfile returns running jobs under an explicit canonical profile.
+func ListForProfile(profile, sessionID string) ([]Job, error) {
+	return listForProfile(profile, sessionID)
+}
+
 // PruneStaleSession scans a session's jobs/ directory and, for every record
 // whose PID is no longer the same process, marks it `exited` and removes the
 // record directory. It is the only path that mutates running→exited in
 // job.json, which makes the cleanup behaviour easy to test in isolation.
-func PruneStaleSession(sessionID string) error {
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+func pruneStaleSessionForProfile(profile, sessionID string) error {
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -277,12 +281,23 @@ func PruneStaleSession(sessionID string) error {
 	return nil
 }
 
+// PruneStaleSession marks dead jobs using the profile encoded in the session
+// ID or AI_PROFILE for legacy unprefixed IDs.
+func PruneStaleSession(sessionID string) error {
+	return pruneStaleSessionForProfile(profileFromSessionID(sessionID), sessionID)
+}
+
+// PruneStaleSessionForProfile marks dead jobs under an explicit profile.
+func PruneStaleSessionForProfile(profile, sessionID string) error {
+	return pruneStaleSessionForProfile(profile, sessionID)
+}
+
 // RunningCount returns the number of running job records on disk for the
 // given session, regardless of whether the process is still alive. It is a
 // cheap probe for callers that want to know "is there anything to look at?"
 // before doing the more expensive pidIsSameProcess sweep.
-func RunningCount(sessionID string) (int, error) {
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+func runningCountForProfile(profile, sessionID string) (int, error) {
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -306,17 +321,101 @@ func RunningCount(sessionID string) (int, error) {
 	return count, nil
 }
 
-// KillSession kills all running jobs for the given session and marks them as exited.
+// RunningCount returns the number of running job records using the profile
+// encoded in the session ID or AI_PROFILE for legacy unprefixed IDs.
+func RunningCount(sessionID string) (int, error) {
+	return runningCountForProfile("", sessionID)
+}
+
+// RunningCountForProfile returns the number of running records under an
+// explicit canonical profile.
+func RunningCountForProfile(profile, sessionID string) (int, error) {
+	return runningCountForProfile(profile, sessionID)
+}
+
+// processSignal is injectable so cleanup tests can verify signal safety without
+// sending SIGTERM to a real process.
+var processSignal = func(pid int, signal syscall.Signal) error {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return process.Signal(signal)
+}
+
+// processProbe is injectable so KillSessionForProfile can distinguish a
+// delivered SIGTERM from a confirmed process exit without making tests sleep
+// on real processes.
+type processProbe func(pid int) bool
+
+var processProbeFn processProbe = func(pid int) bool {
+	return pid > 0 && syscall.Kill(pid, 0) == nil
+}
+
+const (
+	processExitProbeAttempts = 5
+	processExitProbeInterval = 20 * time.Millisecond
+)
+
+func waitForProcessExit(pid int) bool {
+	for attempt := 0; attempt < processExitProbeAttempts; attempt++ {
+		if !processProbeFn(pid) {
+			return true
+		}
+		if attempt+1 < processExitProbeAttempts {
+			time.Sleep(processExitProbeInterval)
+		}
+	}
+	return false
+}
+
+func materializeStaleJob(jobDir, metaPath string, rec *JobRecord) error {
+	rec.Status = "exited"
+	rec.StoppedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := writeJSON(metaPath, rec); err != nil {
+		return err
+	}
+	return os.RemoveAll(jobDir)
+}
+
+// KillSession uses the profile encoded in the session ID for compatibility
+// with the legacy command-line API.
 func KillSession(sessionID string) error {
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+	return KillSessionForProfile(profileFromSessionID(sessionID), sessionID)
+}
+
+type killCandidate struct {
+	jobDirName string
+	record     JobRecord
+	identity   PIDIdentity
+}
+
+// KillPlan is an immutable snapshot of jobs whose process identity was
+// inspected before any destructive signal was sent. The session ID used at
+// execution time may differ from the one used during preparation when a
+// rename or move has committed the session directory migration.
+type KillPlan struct {
+	profile    string
+	sessionID  string
+	candidates []killCandidate
+}
+
+// PrepareKillSessionForProfile reads and verifies every running job under an
+// explicit profile without sending signals or mutating metadata. Unknown
+// identity fails closed, so callers can prepare several sessions before any
+// destructive commit begins.
+func PrepareKillSessionForProfile(profile, sessionID string) (*KillPlan, error) {
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
+	plan := &KillPlan{profile: profile, sessionID: sessionID}
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return plan, nil
 		}
-		return err
+		return nil, err
 	}
 
+	plan.candidates = make([]killCandidate, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -330,48 +429,133 @@ func KillSession(sessionID string) error {
 			continue
 		}
 
-		// Kill the process.
-		if rec.PID > 0 {
-			_ = exec.Command("kill", strconv.Itoa(rec.PID)).Run()
+		identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
+		if identity == PIDUnknown {
+			return nil, fmt.Errorf("cannot verify process identity for job %s", rec.ID)
 		}
-
-		// Mark as exited.
-		rec.Status = "exited"
-		rec.StoppedAt = time.Now().UTC().Format(time.RFC3339)
-		_ = writeJSON(metaPath, &rec) // best-effort
+		plan.candidates = append(plan.candidates, killCandidate{
+			jobDirName: entry.Name(),
+			record:     rec,
+			identity:   identity,
+		})
 	}
-	return nil
+	return plan, nil
 }
 
-// CleanupStale scans all sessions in all profiles and marks stale "running"
-// jobs as "exited". This is called at startup to clean up jobs that were left
-// behind after a crash or unclean shutdown. After this call the metadata
-// reflects the truth: any job whose PID is gone is now `exited` and its
-// directory is removed.
-func CleanupStale() error {
-	profilesDir := filepath.Join(dataHome(), "profiles")
-	profiles, err := os.ReadDir(profilesDir)
+// Execute terminates the prepared jobs in their original session directory.
+func (p *KillPlan) Execute() error {
+	if p == nil {
+		return nil
+	}
+	return p.ExecuteForProfile(p.profile, p.sessionID)
+}
+
+// ExecuteForProfile terminates a prepared plan under sessionID. Re-checking
+// identity immediately before signalling keeps the fail-closed guarantee when
+// a PID changes between prepare and commit. All candidates are attempted and
+// failures are joined so one failed signal cannot hide later cleanup work.
+func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
+	if p == nil {
+		return nil
+	}
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
+	var failures []error
+	for _, candidate := range p.candidates {
+		rec := candidate.record
+		jobDir := filepath.Join(jobsDir, candidate.jobDirName)
+		metaPath := filepath.Join(jobDir, "job.json")
+
+		identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
+		if identity == PIDUnknown {
+			failures = append(failures, fmt.Errorf("cannot verify process identity for job %s", rec.ID))
+			continue
+		}
+		if identity == PIDDead || identity == PIDDifferent {
+			if _, err := os.Stat(jobDir); os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				failures = append(failures, fmt.Errorf("stat stale job %s: %w", rec.ID, err))
+				continue
+			}
+			if err := materializeStaleJob(jobDir, metaPath, &rec); err != nil {
+				failures = append(failures, fmt.Errorf("materialize stale job %s: %w", rec.ID, err))
+			}
+			continue
+		}
+
+		if _, err := os.Stat(jobDir); err != nil {
+			failures = append(failures, fmt.Errorf("locate job %s after session migration: %w", rec.ID, err))
+			continue
+		}
+		if err := processSignal(rec.PID, syscall.SIGTERM); err != nil {
+			failures = append(failures, fmt.Errorf("signal job %s: %w", rec.ID, err))
+			continue
+		}
+		if !waitForProcessExit(rec.PID) {
+			failures = append(failures, fmt.Errorf("job %s is still running after SIGTERM", rec.ID))
+			continue
+		}
+
+		rec.Status = "exited"
+		rec.StoppedAt = time.Now().UTC().Format(time.RFC3339)
+		if err := writeJSON(metaPath, &rec); err != nil {
+			failures = append(failures, fmt.Errorf("write stopped job %s: %w", rec.ID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// KillSessionForProfile prepares and executes all jobs under an explicit
+// canonical profile. Preparation is signal-free; execution attempts every
+// verified candidate and returns an aggregate error when any cleanup fails.
+func KillSessionForProfile(profile, sessionID string) error {
+	plan, err := PrepareKillSessionForProfile(profile, sessionID)
+	if err != nil {
+		return err
+	}
+	return plan.Execute()
+}
+
+func cleanupStaleProfile(profile string) error {
+	sessions, err := os.ReadDir(filepath.Join(paths.ProfileDir(profile), "sessions"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
+	for _, session := range sessions {
+		if !session.IsDir() {
+			continue
+		}
+		if err := PruneStaleSessionForProfile(profile, session.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
+// CleanupStaleForProfile cleans stale jobs under one explicit profile.
+func CleanupStaleForProfile(profile string) error {
+	return cleanupStaleProfile(profile)
+}
+
+// CleanupStale scans all profile directories and cleans each one using its
+// explicit profile scope. It never relies on AI_PROFILE while iterating.
+func CleanupStale() error {
+	profiles, err := os.ReadDir(filepath.Join(dataHome(), "profiles"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
 	for _, profile := range profiles {
 		if !profile.IsDir() {
 			continue
 		}
-		sessionsDir := filepath.Join(profilesDir, profile.Name(), "sessions")
-		sessions, err := os.ReadDir(sessionsDir)
-		if err != nil {
-			continue
-		}
-		for _, session := range sessions {
-			if !session.IsDir() {
-				continue
-			}
-			_ = PruneStaleSession(session.Name())
+		if err := cleanupStaleProfile(profile.Name()); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -387,9 +571,10 @@ func readJSON(path string, v any) error {
 
 // CachedReader caches running jobs until the set of nested job.json files changes.
 type CachedReader struct {
-	mu     sync.Mutex
-	cache  map[string]cachedJobsEntry
-	listFn func(string) ([]Job, error)
+	mu            sync.Mutex
+	cache         map[string]cachedJobsEntry
+	listFn        func(string) ([]Job, error)
+	listProfileFn func(string, string) ([]Job, error)
 }
 
 type cachedJobsEntry struct {
@@ -398,13 +583,18 @@ type cachedJobsEntry struct {
 }
 
 func NewCachedReader() *CachedReader {
-	return newCachedReader(List)
+	return &CachedReader{
+		cache:         make(map[string]cachedJobsEntry),
+		listFn:        List,
+		listProfileFn: ListForProfile,
+	}
 }
 
 func newCachedReader(listFn func(string) ([]Job, error)) *CachedReader {
 	return &CachedReader{
-		cache:  make(map[string]cachedJobsEntry),
-		listFn: listFn,
+		cache:         make(map[string]cachedJobsEntry),
+		listFn:        listFn,
+		listProfileFn: func(_ string, sessionID string) ([]Job, error) { return listFn(sessionID) },
 	}
 }
 
@@ -439,23 +629,32 @@ func jobsSignature(jobsDir string) string {
 }
 
 func (r *CachedReader) List(sessionID string) ([]Job, error) {
+	return r.ListForProfile("", sessionID)
+}
+
+func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) {
 	if sessionID == "" {
 		return nil, nil
 	}
-	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	signature := jobsSignature(jobsDir)
+	cacheKey := profile + "\x00" + sessionID
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if entry, ok := r.cache[sessionID]; ok && entry.signature == signature {
+	if entry, ok := r.cache[cacheKey]; ok && entry.signature == signature {
 		return entry.jobs, nil
 	}
 
-	jobs, err := r.listFn(sessionID)
+	listFn := r.listProfileFn
+	if listFn == nil {
+		listFn = func(_ string, id string) ([]Job, error) { return r.listFn(id) }
+	}
+	jobs, err := listFn(profile, sessionID)
 	if err != nil {
 		return jobs, err
 	}
-	r.cache[sessionID] = cachedJobsEntry{jobs: jobs, signature: signature}
+	r.cache[cacheKey] = cachedJobsEntry{jobs: jobs, signature: signature}
 	return jobs, nil
 }

@@ -1,10 +1,13 @@
 package tree
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 
+	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -327,6 +330,18 @@ func TestInputMode(t *testing.T) {
 	}
 }
 
+func TestDomainUsesSessionPathConvention(t *testing.T) {
+	tr := New()
+	tr.AddFolder("Projects")
+	folder := tr.Root()[0]
+	if got := folder.Domain(""); got != "projects" {
+		t.Fatalf("default domain = %q, want projects", got)
+	}
+	if got := folder.Domain("Проект Ω"); got != "proekt-ω__projects" {
+		t.Fatalf("unicode profile domain = %q, want proekt-ω__projects", got)
+	}
+}
+
 func TestAddChildFolder(t *testing.T) {
 	tr := New()
 	tr.AddFolder("parent")
@@ -416,6 +431,48 @@ func TestMoveItemNilTargetNoop(t *testing.T) {
 
 	if len(tr.root) != 1 {
 		t.Fatalf("expected 1 root item, got %d", len(tr.root))
+	}
+}
+
+func TestMoveItemIntoDescendantNoop(t *testing.T) {
+	tr := New()
+	tr.AddFolder("outer")
+	outer := tr.root[0]
+	tr.addChildFolder(outer, "inner")
+	inner := outer.Children[0]
+	tr.addChildChat(inner, "chat")
+	chat := inner.Children[0]
+
+	tr.moveItem(outer, inner)
+	tr.moveItem(outer, chat)
+
+	if tr.root[0] != outer || len(outer.Children) != 1 || outer.Children[0] != inner {
+		t.Fatalf("descendant move mutated tree: root=%v children=%v", tr.root, outer.Children)
+	}
+	if inner.Children[0] != chat || chat.parent != inner {
+		t.Fatal("descendant move changed child parent")
+	}
+}
+
+func TestMoveItemBeforeCallbackFailureLeavesTreeUntouched(t *testing.T) {
+	tr := New()
+	tr.AddChat("chat")
+	tr.AddFolder("folder")
+	chat := tr.root[0]
+	folder := tr.root[1]
+	called := false
+	tr.SetOnBeforeItemMoved(func(_ *Item, _ *Item) (func() error, error) {
+		called = true
+		return nil, errors.New("migration failed")
+	})
+
+	tr.moveItem(chat, folder)
+
+	if !called {
+		t.Fatal("expected pre-move callback")
+	}
+	if chat.parent != nil || tr.root[0] != chat || len(folder.Children) != 0 {
+		t.Fatal("tree changed after rejected migration")
 	}
 }
 
@@ -730,6 +787,136 @@ func TestMoveSelectedOutFromRootIsNoop(t *testing.T) {
 	}
 	if len(tr.root) != 1 || len(tr.root[0].Children) != 0 {
 		t.Fatalf("tree mutated unexpectedly: %+v", tr.root)
+	}
+}
+
+func TestMoveSelectedOutRunsMigrationBeforeMutation(t *testing.T) {
+	tr := New()
+	tr.AddFolder("outer")
+	outer := tr.root[0]
+	tr.addChildFolder(outer, "inner")
+	inner := outer.Children[0]
+	tr.addChildChat(inner, "chat")
+	chat := inner.Children[0]
+	tr.rebuildFlat()
+	tr.reselectItem(chat)
+
+	called := false
+	var gotParent *Item
+	tr.SetOnBeforeItemMoved(func(_ *Item, newParent *Item) (func() error, error) {
+		called = true
+		gotParent = newParent
+		return nil, nil
+	})
+	tr.MoveSelectedOut()
+
+	if !called || gotParent != outer {
+		t.Fatalf("pre-move callback parent=%v called=%v, want outer", gotParent, called)
+	}
+	if chat.parent != outer {
+		t.Fatalf("chat parent = %v, want outer", chat.parent)
+	}
+}
+
+func TestMoveSelectedOutSaveFailureRestoresTargetTreeBeforeRollback(t *testing.T) {
+	tr := New()
+	tr.AddFolder("outer")
+	outer := tr.root[0]
+	tr.addChildFolder(outer, "inner")
+	inner := outer.Children[0]
+	tr.addChildChat(inner, "chat")
+	chat := inner.Children[0]
+	tr.rebuildFlat()
+	tr.reselectItem(chat)
+
+	rollbackSawOldTree := false
+	tr.SetOnBeforeItemMoved(func(item, newParent *Item) (func() error, error) {
+		if item != chat || newParent != outer {
+			t.Fatalf("pre-move hook got item=%v parent=%v", item, newParent)
+		}
+		return func() error {
+			rollbackSawOldTree = chat.parent == inner && len(inner.Children) == 1 && len(outer.Children) == 1
+			return nil
+		}, nil
+	})
+	saveCalls := 0
+	tr.SetSaveStateFunc(func() error {
+		saveCalls++
+		if saveCalls == 1 {
+			return errors.New("injected SaveState failure")
+		}
+		return nil
+	})
+
+	if tr.MoveSelectedOut() {
+		t.Fatal("MoveSelectedOut unexpectedly committed")
+	}
+	if saveCalls != 2 {
+		t.Fatalf("SaveState calls = %d, want 2", saveCalls)
+	}
+	if !rollbackSawOldTree {
+		t.Fatal("external rollback did not observe the restored old tree")
+	}
+	if chat.parent != inner || len(outer.Children) != 1 || len(inner.Children) != 1 {
+		t.Fatal("tree was not restored after SaveState failure")
+	}
+}
+
+func TestSaveStateKeepsPreviousStateWhenAtomicWriteFails(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	tr := New()
+	tr.AddChat("before")
+	if err := tr.SaveState(); err != nil {
+		t.Fatalf("initial SaveState: %v", err)
+	}
+	path := paths.StatePath("")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read initial state: %v", err)
+	}
+
+	originalWrite := writeStateTemp
+	t.Cleanup(func() { writeStateTemp = originalWrite })
+	writeStateTemp = func(*os.File, []byte) error { return errors.New("injected write failure") }
+	tr.AddChat("after")
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read preserved state: %v", err)
+	}
+	var state TreeState
+	if err := json.Unmarshal(got, &state); err != nil {
+		t.Fatalf("preserved state is invalid JSON: %v", err)
+	}
+	if string(got) != string(before) {
+		t.Fatalf("state changed after failed atomic write:\nold=%s\nnew=%s", before, got)
+	}
+}
+
+func TestSaveStateRenameFailureKeepsPreviousState(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	tr := New()
+	tr.AddChat("before")
+	if err := tr.SaveState(); err != nil {
+		t.Fatalf("initial SaveState: %v", err)
+	}
+	path := paths.StatePath("")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read initial state: %v", err)
+	}
+
+	originalRename := renameState
+	t.Cleanup(func() { renameState = originalRename })
+	renameState = func(_, _ string) error { return errors.New("injected rename failure") }
+	tr.AddChat("after")
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read preserved state: %v", err)
+	}
+	if string(got) != string(before) {
+		t.Fatalf("state changed after failed atomic rename:\nold=%s\nnew=%s", before, got)
 	}
 }
 

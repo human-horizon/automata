@@ -19,6 +19,7 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/HumanHorizon/automata/internal/slug"
 )
@@ -79,6 +80,24 @@ func SessionDir(profile, sessionID string) string {
 // DomainsDir returns the domains directory for a profile.
 func DomainsDir(profile string) string {
 	return filepath.Join(ProfileDir(profile), "domains")
+}
+
+// DomainID returns the canonical domain identity for a profile and tree folder path.
+// Session IDs append the chat name separately; domain IDs never include it.
+func DomainID(profile string, folders []string) string {
+	parts := make([]string, 0, len(folders))
+	for _, folder := range folders {
+		parts = append(parts, slug.Slug(folder))
+	}
+	domain := strings.Join(parts, ".")
+	if profile == "" {
+		return domain
+	}
+	profilePart := ProfileSlug(profile)
+	if domain == "" {
+		return profilePart
+	}
+	return profilePart + "__" + domain
 }
 
 // DomainDir returns the directory for a specific domain.

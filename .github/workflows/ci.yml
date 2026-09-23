@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Reject local module replacements
+        shell: bash
+        run: '! grep -Eq "=>[[:space:]]*\.\./" go.mod'
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Check formatting
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Build test binary
+        shell: bash
+        run: go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/automata-test" .
+
+      - name: Run tests
+        env:
+          AUTOMATA_BIN: ${{ runner.temp }}/automata-test
+          AUTOMATA_E2E_ARTIFACTS_DIR: ${{ runner.temp }}/automata-e2e-artifacts
+        run: go test ./... -count=1 -p 1
+
+      - name: Check whitespace and clean tree
+        if: always()
+        shell: bash
+        run: |
+          git diff --check
+          test -z "$(git status --porcelain)"
+
+      - name: Build reproducible artifacts
+        shell: bash
+        run: |
+          build_dir="$RUNNER_TEMP/automata-build"
+          mkdir -p "$build_dir"
+          go build -trimpath -buildvcs=false -o "$build_dir/automata-1" .
+          go build -trimpath -buildvcs=false -o "$build_dir/automata-2" .
+          sha256sum "$build_dir/automata-1" "$build_dir/automata-2"
+          test "$(sha256sum "$build_dir/automata-1" | awk '{print $1}')" = "$(sha256sum "$build_dir/automata-2" | awk '{print $1}')"

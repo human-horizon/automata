@@ -131,6 +131,40 @@ func readTask(path string) (Task, error) {
 	return task, nil
 }
 
+// ReadTask reads one task file and records its path.
+func ReadTask(path string) (Task, error) {
+	task, err := readTask(path)
+	if err != nil {
+		return Task{}, err
+	}
+	task.Path = path
+	return task, nil
+}
+
+// WriteTask persists a complete task snapshot to its file.
+func WriteTask(path string, task Task) error {
+	return writeTask(path, task)
+}
+
+// AssignTaskAndStatus changes assignment and status in one Kanban write and
+// returns the previous snapshot for transactional rollback by the caller.
+func AssignTaskAndStatus(path, sessionID, newStatus string) (Task, Task, error) {
+	previous, err := ReadTask(path)
+	if err != nil {
+		return Task{}, Task{}, err
+	}
+	updated := previous
+	updated.AssignedTo = sessionID
+	updated.Status = newStatus
+	if newStatus != "progress" {
+		updated.Substatus = ""
+	}
+	if err := WriteTask(path, updated); err != nil {
+		return Task{}, Task{}, err
+	}
+	return previous, updated, nil
+}
+
 // UpdateStatus changes the status of a task file and returns the updated task.
 // If the new status is anything other than "progress", the substatus is
 // cleared — substatus only makes sense while a task is actively being
@@ -207,5 +241,28 @@ func writeTask(path string, task Task) error {
 		b.WriteString(task.Description)
 		b.WriteString("\n")
 	}
-	return os.WriteFile(path, []byte(b.String()), 0644)
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".kanban-write-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
