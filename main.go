@@ -57,6 +57,10 @@ type App struct {
 	// failures without touching real job processes.
 	killSessionFn func(profile, sessionID string) error
 
+	// prepareJobSessionFn is injectable so lifecycle tests can force a
+	// fail-closed job preflight before any runtime state is changed.
+	prepareJobSessionFn func(profile, sessionID string) error
+
 	// mouseEnabled toggles mouse capture. When disabled, mouse events are
 	// not captured, allowing text selection in the terminal. Toggle with F8.
 	mouseEnabled bool
@@ -96,6 +100,10 @@ type App struct {
 	// movePlans stores external migrations between the pre-move and post-move
 	// tree callbacks. The plan is consumed after the state snapshot succeeds.
 	pendingMovePlans map[*tree.Item]*renamePlan
+
+	// renamePlans stores external migrations until the renamed Tree state has
+	// been persisted successfully.
+	pendingRenamePlans map[*tree.Item]*renamePlan
 
 	// pendingRuntimeCmds carries PTY restart/listen commands from a move
 	// rollback into Bubble Tea's command pipeline.
@@ -190,8 +198,12 @@ func newApp(profile, piAgentDir string) (a *App) {
 		cp.SetOnClearSession(func(sid, cwd string) tea.Cmd {
 			return a.clearSessionCmd(sid, cwd, cp.FamiliarSessionIDs())
 		})
-		cp.SetOnCloseFamiliar(func(familiarID string, em *portalis.Emulator) {
-			a.closeFamiliar(familiarID, em)
+		cp.SetOnCloseFamiliar(func(familiarID string, em *portalis.Emulator) error {
+			if err := a.closeFamiliar(familiarID, em); err != nil {
+				log.Printf("closeFamiliar: stop runtime %q: %v", familiarID, err)
+				return err
+			}
+			return nil
 		})
 		cp.SetCreateFamiliarEmulator(func(familiarID string) (*portalis.Emulator, []string) {
 			return a.createFamiliarEmulator(familiarID)
@@ -236,8 +248,32 @@ func newApp(profile, piAgentDir string) (a *App) {
 		}
 	})
 
-	t.SetOnRename(func(item *tree.Item, newName string) error {
-		return a.renameTreeItem(item, newName)
+	t.SetOnBeforeRename(func(item *tree.Item, newName string) (func() error, error) {
+		plan, err := buildRenamePlan(item, newName, a.profile)
+		if err != nil {
+			return nil, err
+		}
+		rollback, err := a.applyRenamePlan(plan)
+		if err != nil {
+			return nil, err
+		}
+		if a.pendingRenamePlans == nil {
+			a.pendingRenamePlans = make(map[*tree.Item]*renamePlan)
+		}
+		a.pendingRenamePlans[item] = plan
+		return func() error {
+			delete(a.pendingRenamePlans, item)
+			return rollback()
+		}, nil
+	})
+	t.SetOnRenameCommitted(func(item *tree.Item, _, _ string) {
+		plan := a.pendingRenamePlans[item]
+		delete(a.pendingRenamePlans, item)
+		if plan == nil {
+			return
+		}
+		a.applyRenameMappings(plan)
+		_ = a.finalizeRenamePlan(plan)
 	})
 
 	t.SetOnStopSession(func(item *tree.Item) {
@@ -280,6 +316,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 		sessionWatchers:       make(map[string]*fsnotify.Watcher),
 		sessionWatchPending:   make(map[string]bool),
 		pendingMovePlans:      make(map[*tree.Item]*renamePlan),
+		pendingRenamePlans:    make(map[*tree.Item]*renamePlan),
 	}
 	t.SetOnOpenHelp(a.openHelpOverlay)
 	t.SetOnOpenSettings(a.openSettingsOverlay)
@@ -912,7 +949,10 @@ func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
 		stopFamiliars:   true,
 		persistInactive: true,
 	}); err != nil {
-		return err
+		if !runtimeStopWasCommitted(err) {
+			return err
+		}
+		log.Printf("automata: delete runtime cleanup warning: %v", err)
 	}
 	for _, ownerID := range owners {
 		if a.currentSessionID == ownerID || strings.HasPrefix(a.currentSessionID, ownerID+"__") {
@@ -927,17 +967,21 @@ func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
 // stops the emulator (idempotent), removes the JSONL, and strips the
 // entry from familiars.json. ChatPanel has already dropped the tab by
 // the time this fires, so we only deal with host-side state.
-func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) {
+func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 	log.Printf("closeFamiliar: start familiarID=%q em=%v profile=%q activeChat=%q",
 		familiarID, em != nil, a.profile, a.activeChatSessionID())
 	// Stop the familiar and its jobs through the canonical lifecycle kernel.
-	// A failed destructive job check leaves the runtime intact.
-	if err := a.stopSessionRuntime(familiarID, stopSessionOptions{
+	// A failed preflight leaves the tab and host state intact; a committed
+	// cleanup warning is logged while the persisted familiar entry is removed.
+	stopErr := a.stopSessionRuntime(familiarID, stopSessionOptions{
 		stopJobs:        true,
 		persistInactive: true,
-	}); err != nil {
-		log.Printf("closeFamiliar: stop runtime %q: %v", familiarID, err)
-		return
+	})
+	if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
+		return stopErr
+	}
+	if stopErr != nil {
+		log.Printf("closeFamiliar: committed stop warning for %q: %v", familiarID, stopErr)
 	}
 	if em != nil {
 		em.Stop()
@@ -959,6 +1003,7 @@ func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) {
 	}
 
 	log.Printf("closeFamiliar: done familiarID=%q", familiarID)
+	return nil
 }
 
 // activeChatSessionID returns the session id of whichever chat is

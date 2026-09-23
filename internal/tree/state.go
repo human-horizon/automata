@@ -67,6 +67,9 @@ var (
 // SaveState serializes the tree and atomically replaces the unified profile
 // state path. The temporary file lives beside state.json so Rename is atomic.
 func (t *Tree) SaveState() error {
+	if t.saveStateOverride != nil {
+		return t.saveStateOverride()
+	}
 	t.saveMu.Lock()
 	defer t.saveMu.Unlock()
 

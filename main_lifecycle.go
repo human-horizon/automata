@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
@@ -15,11 +17,79 @@ type stopSessionOptions struct {
 	familiarSessionIDs []string
 }
 
+type stopSessionError struct {
+	committed bool
+	err       error
+}
+
+func (e *stopSessionError) Error() string {
+	if e == nil || e.err == nil {
+		return "runtime stop failed"
+	}
+	return e.err.Error()
+}
+
+func (e *stopSessionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func runtimeStopWasCommitted(err error) bool {
+	var stopErr *stopSessionError
+	return errors.As(err, &stopErr) && stopErr.committed
+}
+
+type preparedSessionJobs struct {
+	sessionID string
+	plan      *akjobs.KillPlan
+	injected  bool
+}
+
 func (a *App) killSessionForProfile(sessionID string) error {
 	if a.killSessionFn != nil {
 		return a.killSessionFn(a.profile, sessionID)
 	}
 	return akjobs.KillSessionForProfile(a.profile, sessionID)
+}
+
+func (a *App) prepareSessionJob(sessionID string) (preparedSessionJobs, error) {
+	if a.prepareJobSessionFn != nil {
+		if err := a.prepareJobSessionFn(a.profile, sessionID); err != nil {
+			return preparedSessionJobs{}, fmt.Errorf("prepare jobs for %s: %w", sessionID, err)
+		}
+	}
+	if a.killSessionFn != nil {
+		return preparedSessionJobs{sessionID: sessionID, injected: true}, nil
+	}
+	plan, err := akjobs.PrepareKillSessionForProfile(a.profile, sessionID)
+	if err != nil {
+		return preparedSessionJobs{}, fmt.Errorf("prepare jobs for %s: %w", sessionID, err)
+	}
+	return preparedSessionJobs{sessionID: sessionID, plan: plan}, nil
+}
+
+func (a *App) prepareSessionJobs(sessionIDs []string) ([]preparedSessionJobs, error) {
+	prepared := make([]preparedSessionJobs, 0, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		jobPlan, err := a.prepareSessionJob(sessionID)
+		if err != nil {
+			return nil, err
+		}
+		prepared = append(prepared, jobPlan)
+	}
+	return prepared, nil
+}
+
+func (a *App) executeSessionJob(jobPlan preparedSessionJobs, sessionID string) error {
+	if jobPlan.injected {
+		return a.killSessionForProfile(sessionID)
+	}
+	if jobPlan.plan == nil {
+		return nil
+	}
+	return jobPlan.plan.ExecuteForProfile(a.profile, sessionID)
 }
 
 func (a *App) stopSessionRuntime(sessionID string, opts stopSessionOptions) error {
@@ -28,11 +98,12 @@ func (a *App) stopSessionRuntime(sessionID string, opts stopSessionOptions) erro
 
 func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) error {
 	ids := a.expandRuntimeSessionIDs(ownerIDs, opts)
+	var prepared []preparedSessionJobs
 	if opts.stopJobs {
-		for _, sessionID := range ids {
-			if err := a.killSessionForProfile(sessionID); err != nil {
-				return fmt.Errorf("stop jobs for %s: %w", sessionID, err)
-			}
+		var err error
+		prepared, err = a.prepareSessionJobs(ids)
+		if err != nil {
+			return &stopSessionError{err: err}
 		}
 	}
 
@@ -46,6 +117,19 @@ func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) 
 	}
 	if opts.persistInactive && a.tree != nil {
 		a.tree.SetActiveSessions(a.activeSessions)
+	}
+
+	if !opts.stopJobs {
+		return nil
+	}
+	var failures []error
+	for _, jobPlan := range prepared {
+		if err := a.executeSessionJob(jobPlan, jobPlan.sessionID); err != nil {
+			failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
+		}
+	}
+	if err := errors.Join(failures...); err != nil {
+		return &stopSessionError{committed: true, err: err}
 	}
 	return nil
 }
@@ -67,6 +151,7 @@ func (a *App) expandRuntimeSessionIDs(ownerIDs []string, opts stopSessionOptions
 		add(sessionID)
 	}
 	if !opts.stopFamiliars {
+		sort.Strings(ids)
 		return ids
 	}
 	for _, sessionID := range opts.familiarSessionIDs {
@@ -101,6 +186,7 @@ func (a *App) expandRuntimeSessionIDs(ownerIDs []string, opts stopSessionOptions
 		}
 	}
 	if a.container == nil {
+		sort.Strings(ids)
 		return ids
 	}
 	panel := a.container.Active()
@@ -116,6 +202,7 @@ func (a *App) expandRuntimeSessionIDs(ownerIDs []string, opts stopSessionOptions
 			}
 		}
 	}
+	sort.Strings(ids)
 	return ids
 }
 

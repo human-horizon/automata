@@ -818,6 +818,50 @@ func TestMoveSelectedOutRunsMigrationBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestMoveSelectedOutSaveFailureRestoresTargetTreeBeforeRollback(t *testing.T) {
+	tr := New()
+	tr.AddFolder("outer")
+	outer := tr.root[0]
+	tr.addChildFolder(outer, "inner")
+	inner := outer.Children[0]
+	tr.addChildChat(inner, "chat")
+	chat := inner.Children[0]
+	tr.rebuildFlat()
+	tr.reselectItem(chat)
+
+	rollbackSawOldTree := false
+	tr.SetOnBeforeItemMoved(func(item, newParent *Item) (func() error, error) {
+		if item != chat || newParent != outer {
+			t.Fatalf("pre-move hook got item=%v parent=%v", item, newParent)
+		}
+		return func() error {
+			rollbackSawOldTree = chat.parent == inner && len(inner.Children) == 1 && len(outer.Children) == 1
+			return nil
+		}, nil
+	})
+	saveCalls := 0
+	tr.SetSaveStateFunc(func() error {
+		saveCalls++
+		if saveCalls == 1 {
+			return errors.New("injected SaveState failure")
+		}
+		return nil
+	})
+
+	if tr.MoveSelectedOut() {
+		t.Fatal("MoveSelectedOut unexpectedly committed")
+	}
+	if saveCalls != 2 {
+		t.Fatalf("SaveState calls = %d, want 2", saveCalls)
+	}
+	if !rollbackSawOldTree {
+		t.Fatal("external rollback did not observe the restored old tree")
+	}
+	if chat.parent != inner || len(outer.Children) != 1 || len(inner.Children) != 1 {
+		t.Fatal("tree was not restored after SaveState failure")
+	}
+}
+
 func TestSaveStateKeepsPreviousStateWhenAtomicWriteFails(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	tr := New()

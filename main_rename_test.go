@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -240,6 +241,170 @@ func TestMoveRollbackRestoresRuntimeAndFilesystem(t *testing.T) {
 	}
 	if got := tr.ActiveSessionIDs(); len(got) != 1 || got[0] != oldID {
 		t.Fatalf("tree active sessions after rollback = %v", got)
+	}
+}
+
+func TestRenameSaveStateFailureRollsBackExternalData(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	profile := "Rename Transaction"
+	agentDir := filepath.Join(home, ".ai", "just", "pi")
+	tr := tree.New()
+	tr.Profile = profile
+	tr.AddChat("old")
+	chat := tr.Root()[0]
+	oldID := fullRenameSessionID(profile, nil, "old")
+	newID := fullRenameSessionID(profile, nil, "new")
+	if err := os.MkdirAll(paths.SessionDir(profile, oldID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonlDir := filepath.Join(agentDir, "sessions", paths.EncodeCwdDir(chat.CWD))
+	if err := os.MkdirAll(jsonlDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonlPath := filepath.Join(jsonlDir, "chat.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(fmt.Sprintf("{\"type\":\"session\",\"id\":%q}\n", oldID)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{
+		tree:                  tr,
+		profile:               profile,
+		piAgentDir:            agentDir,
+		activeSessions:        make(map[string]struct{}),
+		runningSessions:       make(map[string]struct{}),
+		emulatorCache:         make(map[string]*portalis.Emulator),
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+	}
+	committed := false
+	app.killSessionFn = func(_, sessionID string) error {
+		t.Fatalf("job finalization ran before SaveState commit for %s", sessionID)
+		return nil
+	}
+	tr.SetOnBeforeRename(func(item *tree.Item, newName string) (func() error, error) {
+		plan, err := buildRenamePlan(item, newName, profile)
+		if err != nil {
+			return nil, err
+		}
+		return app.applyRenamePlan(plan)
+	})
+	tr.SetOnRenameCommitted(func(item *tree.Item, _, _ string) {
+		committed = true
+	})
+	saveCalls := 0
+	saveErr := errors.New("injected SaveState failure")
+	tr.SetSaveStateFunc(func() error {
+		saveCalls++
+		if saveCalls == 1 {
+			return saveErr
+		}
+		return nil
+	})
+
+	if err := tr.RenameItem(chat, "new"); !errors.Is(err, saveErr) {
+		t.Fatalf("rename error = %v, want SaveState error", err)
+	}
+	if committed {
+		t.Fatal("rename committed callback ran after failed SaveState")
+	}
+	if chat.Name != "old" || saveCalls != 2 {
+		t.Fatalf("tree rollback = name %q, save calls %d; want old, 2", chat.Name, saveCalls)
+	}
+	if _, err := os.Stat(paths.SessionDir(profile, oldID)); err != nil {
+		t.Fatalf("old session missing after rollback: %v", err)
+	}
+	if _, err := os.Stat(paths.SessionDir(profile, newID)); !os.IsNotExist(err) {
+		t.Fatalf("new session remains after rollback: %v", err)
+	}
+	gotJSONL, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(gotJSONL), oldID) {
+		t.Fatalf("JSONL header was not rolled back: %s", gotJSONL)
+	}
+	state, err := os.ReadFile(paths.StatePath(profile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(state), `"name": "old"`) {
+		t.Fatalf("persisted tree was not old after rollback: %s", state)
+	}
+}
+
+func TestMoveSaveStateFailureRestoresTreeBeforeRuntimeRollback(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	profile := "Move Transaction"
+	tr := tree.New()
+	tr.Profile = profile
+	tr.AddFolder("source")
+	tr.AddFolder("target")
+	source := tr.Root()[0]
+	target := tr.Root()[1]
+	chat := &tree.Item{Name: "chat", CWD: "/work"}
+	source.AddChild(chat)
+	oldID := fullRenameSessionID(profile, []string{"source"}, "chat")
+	newID := fullRenameSessionID(profile, []string{"target"}, "chat")
+	if err := os.MkdirAll(paths.SessionDir(profile, oldID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tr.SetActiveSessions(map[string]struct{}{oldID: {}})
+
+	app := &App{
+		tree:                  tr,
+		profile:               profile,
+		activeSessions:        map[string]struct{}{oldID: {}},
+		runningSessions:       map[string]struct{}{oldID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{oldID: portalis.NewEmulator(oldID, "chat", "/bin/sh", nil)},
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		startEmulatorSyncFn: func(*portalis.Emulator, []string) error {
+			return nil
+		},
+	}
+	tr.SetOnBeforeItemMoved(func(item, newParent *tree.Item) (func() error, error) {
+		plan, err := buildMovePlan(item, newParent, profile)
+		if err != nil {
+			return nil, err
+		}
+		return app.applyRenamePlan(plan)
+	})
+	savedIDs := make([]string, 0, 2)
+	saveCalls := 0
+	tr.SetSaveStateFunc(func() error {
+		saveCalls++
+		savedIDs = append(savedIDs, tr.SessionKeyOf(chat))
+		if saveCalls == 1 {
+			return errors.New("injected move SaveState failure")
+		}
+		return nil
+	})
+
+	tr.MoveItem(chat, target)
+	if saveCalls != 2 {
+		t.Fatalf("SaveState calls = %d, want 2", saveCalls)
+	}
+	if len(savedIDs) != 2 || savedIDs[0] != newID || savedIDs[1] != oldID {
+		t.Fatalf("SaveState tree IDs = %v, want [%s %s]", savedIDs, newID, oldID)
+	}
+	if got := tr.SessionKeyOf(chat); got != oldID {
+		t.Fatalf("chat session after rollback = %q, want %q", got, oldID)
+	}
+	if _, err := os.Stat(paths.SessionDir(profile, oldID)); err != nil {
+		t.Fatalf("old session missing after move rollback: %v", err)
+	}
+	if _, err := os.Stat(paths.SessionDir(profile, newID)); !os.IsNotExist(err) {
+		t.Fatalf("new session remains after move rollback: %v", err)
+	}
+	if _, ok := app.activeSessions[oldID]; !ok {
+		t.Fatal("active session was not restored")
+	}
+	state, err := os.ReadFile(paths.StatePath(profile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(state), "source") || strings.Contains(string(state), "target\\\"\\n") {
+		t.Fatalf("persisted tree was not kept old after move rollback: %s", state)
 	}
 }
 

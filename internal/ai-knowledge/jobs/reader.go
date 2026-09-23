@@ -385,35 +385,42 @@ func KillSession(sessionID string) error {
 }
 
 type killCandidate struct {
-	jobDir   string
-	metaPath string
-	record   JobRecord
-	identity PIDIdentity
+	jobDirName string
+	record     JobRecord
+	identity   PIDIdentity
 }
 
-// KillSessionForProfile terminates jobs under an explicit canonical profile.
-// Dead or recycled records are materialized as stale without sending a
-// signal. Unknown identity is a destructive-action error: no signal is sent
-// until every running record has a known identity. A successful SIGTERM is
-// recorded as exited only after a bounded liveness probe confirms the process
-// is gone.
-func KillSessionForProfile(profile, sessionID string) error {
+// KillPlan is an immutable snapshot of jobs whose process identity was
+// inspected before any destructive signal was sent. The session ID used at
+// execution time may differ from the one used during preparation when a
+// rename or move has committed the session directory migration.
+type KillPlan struct {
+	profile    string
+	sessionID  string
+	candidates []killCandidate
+}
+
+// PrepareKillSessionForProfile reads and verifies every running job under an
+// explicit profile without sending signals or mutating metadata. Unknown
+// identity fails closed, so callers can prepare several sessions before any
+// destructive commit begins.
+func PrepareKillSessionForProfile(profile, sessionID string) (*KillPlan, error) {
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
+	plan := &KillPlan{profile: profile, sessionID: sessionID}
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return plan, nil
 		}
-		return err
+		return nil, err
 	}
 
-	candidates := make([]killCandidate, 0, len(entries))
+	plan.candidates = make([]killCandidate, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		jobDir := filepath.Join(jobsDir, entry.Name())
-		metaPath := filepath.Join(jobDir, "job.json")
+		metaPath := filepath.Join(jobsDir, entry.Name(), "job.json")
 		var rec JobRecord
 		if err := readJSON(metaPath, &rec); err != nil || rec.ID == "" {
 			continue
@@ -424,39 +431,89 @@ func KillSessionForProfile(profile, sessionID string) error {
 
 		identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
 		if identity == PIDUnknown {
-			return fmt.Errorf("cannot verify process identity for job %s", rec.ID)
+			return nil, fmt.Errorf("cannot verify process identity for job %s", rec.ID)
 		}
-		candidates = append(candidates, killCandidate{
-			jobDir:   jobDir,
-			metaPath: metaPath,
-			record:   rec,
-			identity: identity,
+		plan.candidates = append(plan.candidates, killCandidate{
+			jobDirName: entry.Name(),
+			record:     rec,
+			identity:   identity,
 		})
 	}
+	return plan, nil
+}
 
-	for _, candidate := range candidates {
+// Execute terminates the prepared jobs in their original session directory.
+func (p *KillPlan) Execute() error {
+	if p == nil {
+		return nil
+	}
+	return p.ExecuteForProfile(p.profile, p.sessionID)
+}
+
+// ExecuteForProfile terminates a prepared plan under sessionID. Re-checking
+// identity immediately before signalling keeps the fail-closed guarantee when
+// a PID changes between prepare and commit. All candidates are attempted and
+// failures are joined so one failed signal cannot hide later cleanup work.
+func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
+	if p == nil {
+		return nil
+	}
+	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
+	var failures []error
+	for _, candidate := range p.candidates {
 		rec := candidate.record
-		if candidate.identity == PIDDead || candidate.identity == PIDDifferent {
-			if err := materializeStaleJob(candidate.jobDir, candidate.metaPath, &rec); err != nil {
-				return fmt.Errorf("materialize stale job %s: %w", rec.ID, err)
+		jobDir := filepath.Join(jobsDir, candidate.jobDirName)
+		metaPath := filepath.Join(jobDir, "job.json")
+
+		identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
+		if identity == PIDUnknown {
+			failures = append(failures, fmt.Errorf("cannot verify process identity for job %s", rec.ID))
+			continue
+		}
+		if identity == PIDDead || identity == PIDDifferent {
+			if _, err := os.Stat(jobDir); os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				failures = append(failures, fmt.Errorf("stat stale job %s: %w", rec.ID, err))
+				continue
+			}
+			if err := materializeStaleJob(jobDir, metaPath, &rec); err != nil {
+				failures = append(failures, fmt.Errorf("materialize stale job %s: %w", rec.ID, err))
 			}
 			continue
 		}
 
+		if _, err := os.Stat(jobDir); err != nil {
+			failures = append(failures, fmt.Errorf("locate job %s after session migration: %w", rec.ID, err))
+			continue
+		}
 		if err := processSignal(rec.PID, syscall.SIGTERM); err != nil {
-			return fmt.Errorf("signal job %s: %w", rec.ID, err)
+			failures = append(failures, fmt.Errorf("signal job %s: %w", rec.ID, err))
+			continue
 		}
 		if !waitForProcessExit(rec.PID) {
-			return fmt.Errorf("job %s is still running after SIGTERM", rec.ID)
+			failures = append(failures, fmt.Errorf("job %s is still running after SIGTERM", rec.ID))
+			continue
 		}
 
 		rec.Status = "exited"
 		rec.StoppedAt = time.Now().UTC().Format(time.RFC3339)
-		if err := writeJSON(candidate.metaPath, &rec); err != nil {
-			return fmt.Errorf("write stopped job %s: %w", rec.ID, err)
+		if err := writeJSON(metaPath, &rec); err != nil {
+			failures = append(failures, fmt.Errorf("write stopped job %s: %w", rec.ID, err))
 		}
 	}
-	return nil
+	return errors.Join(failures...)
+}
+
+// KillSessionForProfile prepares and executes all jobs under an explicit
+// canonical profile. Preparation is signal-free; execution attempts every
+// verified candidate and returns an aggregate error when any cleanup fails.
+func KillSessionForProfile(profile, sessionID string) error {
+	plan, err := PrepareKillSessionForProfile(profile, sessionID)
+	if err != nil {
+		return err
+	}
+	return plan.Execute()
 }
 
 func cleanupStaleProfile(profile string) error {

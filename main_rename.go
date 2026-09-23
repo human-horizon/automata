@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
+	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/slug"
@@ -45,11 +47,18 @@ type renameTaskMove struct {
 	createdTargetDir  bool
 }
 
+type renameJobPlan struct {
+	oldSessionID string
+	newSessionID string
+	plan         *akjobs.KillPlan
+}
+
 type renamePlan struct {
 	sessions  []renameSessionPlan
 	domains   []renameDomainPlan
 	familiars []renameFamiliarPlan
 	taskMoves []renameTaskMove
+	jobStops  []renameJobPlan
 }
 
 type renameRuntimeSnapshot struct {
@@ -386,6 +395,38 @@ func (a *App) prepareRenamePlan(plan *renamePlan) error {
 			return fmt.Errorf("familiar JSONL target already exists: %s", newJSONL)
 		}
 	}
+
+	plan.jobStops = nil
+	seenJobSessions := make(map[string]struct{}, len(plan.sessions)+len(plan.familiars))
+	prepareJob := func(oldID, newID string) error {
+		if oldID == newID {
+			return nil
+		}
+		if _, exists := seenJobSessions[oldID]; exists {
+			return nil
+		}
+		seenJobSessions[oldID] = struct{}{}
+		prepared, err := a.prepareSessionJob(oldID)
+		if err != nil {
+			return err
+		}
+		plan.jobStops = append(plan.jobStops, renameJobPlan{
+			oldSessionID: oldID,
+			newSessionID: newID,
+			plan:         prepared.plan,
+		})
+		return nil
+	}
+	for _, session := range plan.sessions {
+		if err := prepareJob(session.oldID, session.newID); err != nil {
+			return err
+		}
+	}
+	for _, familiar := range plan.familiars {
+		if err := prepareJob(familiar.oldID, familiar.newID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -431,7 +472,7 @@ func (a *App) captureRenameRuntime(plan *renamePlan) renameRuntimeSnapshot {
 	return snapshot
 }
 
-func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot) error {
+func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot, persist bool) error {
 	if a.emulatorCache == nil {
 		a.emulatorCache = make(map[string]*portalis.Emulator)
 	}
@@ -473,7 +514,10 @@ func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot) error {
 		a.currentSessionID = snapshot.currentSessionID
 	}
 	if a.tree != nil {
-		a.tree.SetActiveSessions(a.activeSessions)
+		a.tree.SetActiveSessionsInMemory(a.activeSessions)
+		if persist {
+			_ = a.tree.SaveState()
+		}
 		a.pendingRuntimeCmds = append(a.pendingRuntimeCmds, a.syncSessionWatchers()...)
 	}
 	return nil
@@ -488,19 +532,40 @@ func (a *App) stopRenameSessions(plan *renamePlan) (renameRuntimeSnapshot, error
 	}
 	if err := a.stopSessionRuntimeIDs(owners, stopSessionOptions{
 		stopFamiliars:   true,
-		persistInactive: true,
+		persistInactive: false,
 	}); err != nil {
 		return snapshot, err
+	}
+	for _, sessionID := range owners {
+		delete(a.activeSessions, sessionID)
+	}
+	if a.tree != nil {
+		a.tree.SetActiveSessionsInMemory(a.activeSessions)
 	}
 	return snapshot, nil
 }
 
-func (a *App) finalizeRenamePlan(plan *renamePlan) {
-	for sessionID := range renamePlanSessionIDs(plan) {
-		if err := a.killSessionForProfile(sessionID); err != nil {
-			log.Printf("automata: stop jobs for renamed session %s: %v", sessionID, err)
+func (a *App) finalizeRenamePlan(plan *renamePlan) error {
+	if plan == nil {
+		return nil
+	}
+	var failures []error
+	for _, jobPlan := range plan.jobStops {
+		var err error
+		if jobPlan.plan != nil {
+			err = jobPlan.plan.ExecuteForProfile(a.profile, jobPlan.newSessionID)
+		} else {
+			err = a.killSessionForProfile(jobPlan.newSessionID)
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("stop jobs for renamed session %s: %w", jobPlan.newSessionID, err))
 		}
 	}
+	if err := errors.Join(failures...); err != nil {
+		log.Printf("automata: rename job cleanup warning: %v", err)
+		return err
+	}
+	return nil
 }
 
 func moveRenameDirectory(oldPath, newPath string, moves *[]renameDirectoryMove) error {
@@ -603,7 +668,7 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	}
 	runtimeSnapshot, err := a.stopRenameSessions(plan)
 	if err != nil {
-		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot); restoreErr != nil {
+		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot, false); restoreErr != nil {
 			return nil, fmt.Errorf("%w; restore runtime: %v", err, restoreErr)
 		}
 		return nil, err
@@ -615,7 +680,7 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	var assignmentMoves []renameAssignmentMove
 	fail := func(err error) (func() error, error) {
 		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves, plan.taskMoves)
-		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot); restoreErr != nil {
+		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot, false); restoreErr != nil {
 			return nil, fmt.Errorf("%w; restore runtime: %v", err, restoreErr)
 		}
 		return nil, err
@@ -714,7 +779,7 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 		}
 		rolledBack = true
 		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves, plan.taskMoves)
-		return a.restoreRenameRuntime(runtimeSnapshot)
+		return a.restoreRenameRuntime(runtimeSnapshot, false)
 	}, nil
 }
 

@@ -481,6 +481,233 @@ func TestKillSessionReturnsSignalErrorAndPreservesLiveMetadata(t *testing.T) {
 	}
 }
 
+func TestKillPlanExecutesAgainstMigratedSessionDirectory(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	const (
+		profile = "test"
+		oldID   = "test__old-chat"
+		newID   = "test__new-chat"
+		jobName = "job_migrated"
+	)
+	oldJobDir := filepath.Join(paths.SessionDir(profile, oldID), "jobs", jobName)
+	if err := os.MkdirAll(oldJobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(oldJobDir, "job.json")
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	data := `{"id":"job_migrated","command":"sleep","pid":` + strconv.Itoa(os.Getpid()) + `,"status":"running","startedAt":"` + startedAt + `"}`
+	if err := os.WriteFile(metaPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+	})
+	signals := 0
+	processSignal = func(int, syscall.Signal) error {
+		signals++
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+	processProbeFn = func(int) bool { return false }
+
+	plan, err := PrepareKillSessionForProfile(profile, oldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(paths.SessionDir(profile, oldID), paths.SessionDir(profile, newID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.ExecuteForProfile(profile, newID); err != nil {
+		t.Fatal(err)
+	}
+	if signals != 1 {
+		t.Fatalf("processSignal calls = %d, want 1", signals)
+	}
+	if _, err := os.Stat(paths.SessionDir(profile, oldID)); !os.IsNotExist(err) {
+		t.Fatalf("old session directory remains: %v", err)
+	}
+	migratedMeta := filepath.Join(paths.SessionDir(profile, newID), "jobs", jobName, "job.json")
+	var record JobRecord
+	if err := readJSON(migratedMeta, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "exited" {
+		t.Fatalf("migrated job status = %q, want exited", record.Status)
+	}
+}
+
+func TestKillSessionForProfileAfterFilesystemMigration(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	profile := "Canonical Profile"
+	oldID := "canonical-profile__old-chat"
+	newID := "canonical-profile__new-chat"
+	jobDir := filepath.Join(sessionDirForProfile(profile, oldID), "jobs", "job_kill")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(jobDir, "job.json")
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	data := `{"id":"job_kill","command":"sleep","pid":` + strconv.Itoa(os.Getpid()) + `,"status":"running","startedAt":"` + startedAt + `"}`
+	if err := os.WriteFile(metaPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+	})
+	signals := 0
+	processSignal = func(pid int, signal syscall.Signal) error {
+		signals++
+		if pid != os.Getpid() || signal != syscall.SIGTERM {
+			t.Fatalf("signal = pid %d signal %v, want pid %d SIGTERM", pid, signal, os.Getpid())
+		}
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+	processProbeFn = func(int) bool { return false }
+
+	oldDir := sessionDirForProfile(profile, oldID)
+	newDir := sessionDirForProfile(profile, newID)
+	if err := os.Rename(oldDir, newDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := KillSessionForProfile(profile, newID); err != nil {
+		t.Fatal(err)
+	}
+	if signals != 1 {
+		t.Fatalf("processSignal calls = %d, want 1", signals)
+	}
+	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
+		t.Fatalf("old session directory remains: %v", err)
+	}
+	var record JobRecord
+	if err := readJSON(filepath.Join(newDir, "jobs", "job_kill", "job.json"), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "exited" {
+		t.Fatalf("migrated job status = %q, want exited", record.Status)
+	}
+}
+
+func TestKillPlanAttemptsAllCandidatesAfterSignalFailure(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__multi-job"
+	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	for _, job := range []struct {
+		name string
+		id   string
+	}{
+		{name: "job_a", id: "job_a"},
+		{name: "job_b", id: "job_b"},
+	} {
+		jobDir := filepath.Join(jobsDir, job.name)
+		if err := os.MkdirAll(jobDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data := `{"id":"` + job.id + `","command":"sleep","pid":` + strconv.Itoa(os.Getpid()) + `,"status":"running","startedAt":"` + startedAt + `"}`
+		if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+	})
+	signaled := make([]int, 0, 2)
+	processSignal = func(pid int, _ syscall.Signal) error {
+		signaled = append(signaled, pid)
+		if len(signaled) == 2 {
+			return errString("second signal failed")
+		}
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+	processProbeFn = func(int) bool { return false }
+
+	plan, err := PrepareKillSessionForProfile("test", sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Execute(); err == nil || !strings.Contains(err.Error(), "second signal failed") {
+		t.Fatalf("KillPlan error = %v, want aggregate signal failure", err)
+	}
+	if len(signaled) != 2 {
+		t.Fatalf("processSignal calls = %d, want 2", len(signaled))
+	}
+	var first, second JobRecord
+	if err := readJSON(filepath.Join(jobsDir, "job_a", "job.json"), &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := readJSON(filepath.Join(jobsDir, "job_b", "job.json"), &second); err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != "exited" || second.Status != "running" {
+		t.Fatalf("statuses after partial signal: first=%q second=%q", first.Status, second.Status)
+	}
+}
+
+func TestPrepareKillSessionFailsClosedAcrossAllJobsBeforeSignal(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__prepare-all"
+	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+	for _, job := range []struct {
+		name      string
+		startedAt string
+	}{
+		{name: "job_same", startedAt: time.Now().UTC().Format(time.RFC3339)},
+		{name: "job_unknown", startedAt: "invalid"},
+	} {
+		jobDir := filepath.Join(jobsDir, job.name)
+		if err := os.MkdirAll(jobDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data := `{"id":"` + job.name + `","command":"sleep","pid":` + strconv.Itoa(os.Getpid()) + `,"status":"running","startedAt":"` + job.startedAt + `"}`
+		if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	previousPS := psRunnerOverride
+	previousSignal := processSignal
+	t.Cleanup(func() {
+		psRunnerOverride = previousPS
+		processSignal = previousSignal
+	})
+	psRunnerOverride = matchingPSRunner()
+	signals := 0
+	processSignal = func(int, syscall.Signal) error {
+		signals++
+		return nil
+	}
+
+	if _, err := PrepareKillSessionForProfile("test", sessionID); err == nil {
+		t.Fatal("prepare unexpectedly succeeded with unknown identity")
+	}
+	if signals != 0 {
+		t.Fatalf("prepare sent %d signals, want 0", signals)
+	}
+}
+
 func writeProfileStaleJob(t *testing.T, profile, sessionID string) string {
 	t.Helper()
 	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", "job_stale")
