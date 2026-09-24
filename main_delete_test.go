@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"errors"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/HumanHorizon/automata/internal/paths"
@@ -10,6 +14,110 @@ import (
 	"github.com/Starframe/portalis"
 	"github.com/fsnotify/fsnotify"
 )
+
+func TestNewAppLogsInvalidTreeSnapshotAndBlocksOverwrite(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	profile := "invalid-startup"
+	path := paths.StatePath(profile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	invalid := []byte(`{"version":9,"items":[]}`)
+	if err := os.WriteFile(path, invalid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldWriter)
+
+	app := newApp(profile, "")
+	defer app.Close()
+	if app.tree.StateLoadError() == nil {
+		t.Fatal("newApp discarded the invalid state error")
+	}
+	if !strings.Contains(logs.String(), "load tree state") {
+		t.Fatalf("startup diagnostics missing from logs: %q", logs.String())
+	}
+	app.tree.AddChat("must-not-overwrite")
+	if len(app.tree.Root()) != 0 {
+		t.Fatal("Tree accepted a mutation after invalid startup state")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, invalid) {
+		t.Fatalf("startup autosave overwrote invalid state: %s", got)
+	}
+}
+
+func TestTreeDeletePreflightsThenRunsCleanupOnlyAfterStateCommit(t *testing.T) {
+	profile := "Delete Transaction"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	app := newApp(profile, "")
+	defer app.Close()
+	item, err := app.tree.CreateChat("transactional")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := app.tree.SessionKeyOf(item)
+	app.currentSessionID = sessionID
+	app.activeSessions[sessionID] = struct{}{}
+	app.tree.SetActiveSessionsInMemory(app.activeSessions)
+	em := portalis.NewEmulator(sessionID, item.Name, "", nil)
+	app.emulatorCache[sessionID] = em
+
+	prepareCalls, stopCalls := 0, 0
+	app.prepareJobSessionFn = func(_, got string) error {
+		prepareCalls++
+		if got != sessionID {
+			t.Fatalf("preflight session = %q, want %q", got, sessionID)
+		}
+		return nil
+	}
+	app.killSessionFn = func(_, got string) error {
+		stopCalls++
+		if got != sessionID {
+			t.Fatalf("stop session = %q, want %q", got, sessionID)
+		}
+		return nil
+	}
+	app.tree.SetSaveStateFunc(func() error { return errors.New("state commit failed") })
+	if err := app.tree.DeleteItem(item); err == nil {
+		t.Fatal("DeleteItem succeeded despite injected state failure")
+	}
+	if prepareCalls == 0 {
+		t.Fatal("delete did not preflight runtime jobs")
+	}
+	if stopCalls != 0 {
+		t.Fatalf("runtime cleanup ran before state commit: %d calls", stopCalls)
+	}
+	if len(app.tree.Root()) != 1 || app.tree.Root()[0] != item {
+		t.Fatal("failed state commit did not restore tree item")
+	}
+	if app.emulatorCache[sessionID] != em || app.currentSessionID != sessionID {
+		t.Fatal("failed state commit changed runtime state")
+	}
+	if _, ok := app.activeSessions[sessionID]; !ok {
+		t.Fatal("failed state commit removed the active session")
+	}
+
+	app.tree.SetSaveStateFunc(nil)
+	if err := app.tree.DeleteItem(item); err != nil {
+		t.Fatalf("DeleteItem after restoring persistence: %v", err)
+	}
+	if stopCalls != 1 {
+		t.Fatalf("post-commit runtime stop calls = %d, want 1", stopCalls)
+	}
+	if len(app.tree.Root()) != 0 || app.emulatorCache[sessionID] != nil || app.currentSessionID != "" {
+		t.Fatal("committed deletion did not clean tree/runtime state")
+	}
+	if _, ok := app.activeSessions[sessionID]; ok {
+		t.Fatal("committed deletion retained the active session")
+	}
+}
 
 func TestCleanupDeletedTreeItemStopsRuntimeAndRemovesGhostState(t *testing.T) {
 	profile := "Delete Profile"

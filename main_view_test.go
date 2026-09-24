@@ -749,6 +749,118 @@ func TestCloseFamiliarCleansHostState(t *testing.T) {
 	}
 }
 
+func TestCleanupExternallyRemovedFamiliarPreservesRegistryAndJSONL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
+	const (
+		profile = "external-familiar-profile"
+		mainSID = "external-familiar-profile__chat"
+		famSID  = "external-familiar-profile__chat__expert"
+		cwd     = "/tmp"
+	)
+	jsonlPath := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	registryPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registryContents := []byte(`[]`)
+	if err := os.WriteFile(registryPath, registryContents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	em := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	app := &App{
+		tree:                  tree.New(),
+		profile:               profile,
+		activeSessions:        map[string]struct{}{famSID: {}},
+		runningSessions:       map[string]struct{}{famSID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{famSID: em},
+		familiarEmulatorCache: map[string]*portalis.Emulator{famSID: em},
+		sessionWatchPending:   map[string]bool{famSID: true},
+	}
+	app.tree.Profile = profile
+	if err := app.cleanupExternallyRemovedFamiliar(famSID, em); err != nil {
+		t.Fatalf("cleanupExternallyRemovedFamiliar: %v", err)
+	}
+	for name, sessions := range map[string]map[string]struct{}{
+		"active":  app.activeSessions,
+		"running": app.runningSessions,
+	} {
+		if _, exists := sessions[famSID]; exists {
+			t.Fatalf("familiar remains in %s sessions", name)
+		}
+	}
+	if _, exists := app.emulatorCache[famSID]; exists {
+		t.Fatal("familiar remains in emulator cache")
+	}
+	if _, exists := app.familiarEmulatorCache[famSID]; exists {
+		t.Fatal("familiar remains in familiar emulator cache")
+	}
+	if _, exists := app.sessionWatchPending[famSID]; exists {
+		t.Fatal("familiar remains in watcher pending map")
+	}
+	if _, err := os.Stat(jsonlPath); err != nil {
+		t.Fatalf("external removal deleted familiar JSONL: %v", err)
+	}
+	gotRegistry, err := os.ReadFile(registryPath)
+	if err != nil || string(gotRegistry) != string(registryContents) {
+		t.Fatalf("external removal changed registry: contents=%q err=%v", gotRegistry, err)
+	}
+}
+
+func TestCleanupExternallyRemovedFamiliarPreflightFailurePreservesRuntime(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
+	const (
+		profile = "external-familiar-preflight"
+		mainSID = "external-familiar-preflight__chat"
+		famSID  = "external-familiar-preflight__chat__expert"
+		cwd     = "/tmp"
+	)
+	jsonlPath := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	registryPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registryContents := []byte(`[]`)
+	if err := os.WriteFile(registryPath, registryContents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	prepareErr := errors.New("unknown job PID identity")
+	app := &App{
+		profile:               profile,
+		activeSessions:        map[string]struct{}{famSID: {}},
+		runningSessions:       map[string]struct{}{famSID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{famSID: em},
+		familiarEmulatorCache: map[string]*portalis.Emulator{famSID: em},
+	}
+	app.prepareJobSessionFn = func(string, string) error { return prepareErr }
+	if err := app.cleanupExternallyRemovedFamiliar(famSID, em); !errors.Is(err, prepareErr) {
+		t.Fatalf("cleanup error = %v, want preflight error", err)
+	}
+	for name, sessions := range map[string]map[string]struct{}{
+		"active":  app.activeSessions,
+		"running": app.runningSessions,
+	} {
+		if _, exists := sessions[famSID]; !exists {
+			t.Fatalf("preflight failure removed familiar from %s sessions", name)
+		}
+	}
+	if app.emulatorCache[famSID] != em || app.familiarEmulatorCache[famSID] != em {
+		t.Fatal("preflight failure removed cached familiar emulator")
+	}
+	if _, err := os.Stat(jsonlPath); err != nil {
+		t.Fatalf("preflight failure changed JSONL: %v", err)
+	}
+	gotRegistry, err := os.ReadFile(registryPath)
+	if err != nil || string(gotRegistry) != string(registryContents) {
+		t.Fatalf("preflight failure changed registry: contents=%q err=%v", gotRegistry, err)
+	}
+}
+
 func TestCloseFamiliarCompletesHostCleanupAfterCommittedPersistenceFailure(t *testing.T) {
 	dataHome := t.TempDir()
 	home := t.TempDir()

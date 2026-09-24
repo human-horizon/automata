@@ -447,6 +447,28 @@ func TestDoneHasNoProgressTransition(t *testing.T) {
 	}
 }
 
+func TestKanbanPanelKeepsReadableTasksWhenAnotherFileIsInvalid(t *testing.T) {
+	profile, domain := "kanban-partial-read", "kanban-partial-read"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	dir := kanban.KanbanDir(domain, profile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "valid.md"), []byte("---\ntitle: Valid task\nstatus: todo\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "invalid.md"), []byte("---\ntitle: Invalid task\nstatus: broken\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	panel := NewKanbanPanel(profile)
+	defer panel.Close()
+	panel.SetDomain(domain)
+	if len(panel.tasks) != 1 || panel.tasks[0].Title != "Valid task" {
+		t.Fatalf("panel tasks after partial read = %#v", panel.tasks)
+	}
+}
+
 // TestKanbanDoneCardRendersNoTransitionButtons verifies the actual board
 // output for a DONE card contains no "↩ Progress" button text.
 func TestKanbanDoneCardRendersNoTransitionButtons(t *testing.T) {
