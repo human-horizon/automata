@@ -58,7 +58,7 @@
 - [x] Все explicit-profile APIs сохраняют текущий isolation contract, предыдущие PR #2 regressions остаются зелёными.
 - [x] `specs/profile-support.md` описывает актуальные explicit, child-env и legacy resolver contracts.
 - [x] Targeted tests, `gofmt -l .`, `go vet ./...`, `go mod verify`, полный `go test ./... -count=1 -p 1`, `git diff --check` и два идентичных reproducible build проходят.
-- [ ] Корректирующий commit отправлен в существующий PR #2; local/remote SHA совпадают, worktree чистый; push и pull_request CI этого SHA зелёные; PR не смёржен.
+- [x] Корректирующий source commit `bc6aaaa3a7233ded632e22c13309476490fed487` отправлен в существующий PR #2; push run `35960448765` и pull_request run `35960451911` зелёные; PR остаётся OPEN и не смёржен.
 
 ## Результаты локальной проверки
 
