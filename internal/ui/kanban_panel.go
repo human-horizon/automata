@@ -262,10 +262,10 @@ func (k *KanbanPanel) reload() {
 		return
 	}
 	tasks, err := kanban.ReadAll(k.domain, k.profile)
-	if err != nil {
-		return
-	}
 	k.tasks = tasks
+	if err != nil {
+		log.Printf("automata: read Kanban domain %q: %v", k.domain, err)
+	}
 	k.distribute()
 	// Reset scroll offsets on reload so the view doesn't jump to a stale
 	// position after tasks change.

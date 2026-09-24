@@ -298,9 +298,9 @@ func (t *Tree) handleToolbarClick(msg tea.MouseMsg) tea.Cmd {
 
 	// Show a dropdown popover with create options.
 	items := []warp.PopoverItem{
-		{Name: "+ Folder", Action: func() { t.startInput("Folder name:", func(name string) { t.AddFolder(name) }) }},
-		{Name: "+ Chat", Action: func() { t.startInput("Chat name:", func(name string) { t.AddChat(name) }) }},
-		{Name: "+ Terminal", Action: func() { t.startInput("Terminal name:", func(name string) { t.AddTerminal(name) }) }},
+		{Name: "+ Folder", Action: func() { t.startCreateInput("Folder name:", t.CreateFolder) }},
+		{Name: "+ Chat", Action: func() { t.startCreateInput("Chat name:", t.CreateChat) }},
+		{Name: "+ Terminal", Action: func() { t.startCreateInput("Terminal name:", t.CreateTerminal) }},
 	}
 
 	t.popover = &warp.Popover{

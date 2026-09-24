@@ -308,8 +308,8 @@ func TestRenameSaveStateFailureRollsBackExternalData(t *testing.T) {
 	if committed {
 		t.Fatal("rename committed callback ran after failed SaveState")
 	}
-	if chat.Name != "old" || saveCalls != 2 {
-		t.Fatalf("tree rollback = name %q, save calls %d; want old, 2", chat.Name, saveCalls)
+	if chat.Name != "old" || saveCalls != 1 {
+		t.Fatalf("tree rollback = name %q, save calls %d; want old, 1", chat.Name, saveCalls)
 	}
 	if _, err := os.Stat(paths.SessionDir(profile, oldID)); err != nil {
 		t.Fatalf("old session missing after rollback: %v", err)
@@ -381,11 +381,11 @@ func TestMoveSaveStateFailureRestoresTreeBeforeRuntimeRollback(t *testing.T) {
 	})
 
 	tr.MoveItem(chat, target)
-	if saveCalls != 2 {
-		t.Fatalf("SaveState calls = %d, want 2", saveCalls)
+	if saveCalls != 1 {
+		t.Fatalf("SaveState calls = %d, want 1 (rollback does not rewrite the persisted snapshot)", saveCalls)
 	}
-	if len(savedIDs) != 2 || savedIDs[0] != newID || savedIDs[1] != oldID {
-		t.Fatalf("SaveState tree IDs = %v, want [%s %s]", savedIDs, newID, oldID)
+	if len(savedIDs) != 1 || savedIDs[0] != newID {
+		t.Fatalf("SaveState tree IDs = %v, want [%s]", savedIDs, newID)
 	}
 	if got := tr.SessionKeyOf(chat); got != oldID {
 		t.Fatalf("chat session after rollback = %q, want %q", got, oldID)
@@ -621,6 +621,67 @@ func TestMoveChatReusesRenameMigrationWithoutMovingDomain(t *testing.T) {
 	gotFamiliarJSONL, err := os.ReadFile(familiarJSONLPath)
 	if err != nil || !strings.Contains(string(gotFamiliarJSONL), newFamiliarID) {
 		t.Fatalf("familiar JSONL was not migrated: err=%v data=%q", err, gotFamiliarJSONL)
+	}
+}
+
+func TestRenameFolderRollsBackWhenKanbanReadIsIncomplete(t *testing.T) {
+	home, dataHome := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", dataHome)
+	profile := "test"
+	app := &App{
+		profile:               profile,
+		piAgentDir:            filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:        make(map[string]struct{}),
+		runningSessions:       make(map[string]struct{}),
+		emulatorCache:         make(map[string]*portalis.Emulator),
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		tree:                  tree.New(),
+	}
+	app.tree.Profile = profile
+	app.tree.AddFolder("old-folder")
+	folder := app.tree.Root()[0]
+	chat := &tree.Item{Name: "chat"}
+	folder.AddChild(chat)
+	oldID := app.tree.SessionKeyOf(chat)
+	app.activeSessions[oldID] = struct{}{}
+	app.tree.SetActiveSessionsInMemory(app.activeSessions)
+
+	oldDomain := paths.DomainID(profile, []string{folder.Name})
+	newDomain := paths.DomainID(profile, []string{"new-folder"})
+	oldKanbanDir := filepath.Join(paths.DomainDir(profile, oldDomain), "kanban")
+	if err := os.MkdirAll(oldKanbanDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	validPath := filepath.Join(oldKanbanDir, "valid.md")
+	validTask := []byte(fmt.Sprintf("---\ntitle: Valid\nstatus: progress\nassigned_to: %s\n---\nbody\n", oldID))
+	if err := os.WriteFile(validPath, validTask, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invalidPath := filepath.Join(oldKanbanDir, "invalid.md")
+	if err := os.WriteFile(invalidPath, []byte("not frontmatter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := buildRenamePlan(folder, "new-folder", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.applyRenamePlan(plan); err == nil || !strings.Contains(err.Error(), "read Kanban") {
+		t.Fatalf("incomplete Kanban read error = %v, want read Kanban error", err)
+	}
+	if folder.Name != "old-folder" {
+		t.Fatalf("folder name changed despite incomplete Kanban read: %q", folder.Name)
+	}
+	if _, err := os.Stat(paths.DomainDir(profile, newDomain)); !os.IsNotExist(err) {
+		t.Fatalf("target domain remains after failed rename: %v", err)
+	}
+	gotTask, err := os.ReadFile(validPath)
+	if err != nil || string(gotTask) != string(validTask) {
+		t.Fatalf("partial Kanban task was changed: data=%q err=%v", gotTask, err)
+	}
+	if _, active := app.activeSessions[oldID]; !active {
+		t.Fatal("active session was not restored after failed migration")
 	}
 }
 

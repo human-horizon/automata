@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const (
@@ -449,18 +450,34 @@ func (t *Tree) renderHeader(width int) string {
 func (t *Tree) renderFooter(width int) string {
 	label := "? Help  Settings"
 	styles := t.styles()
-	if t.noColor() {
-		if len(label) < width {
-			return label + strings.Repeat(" ", width-len(label))
+	actionErr := t.lastActionError
+	if t.stateLoadErr != nil {
+		actionErr = t.stateLoadErr
+	}
+	warning := ""
+	if actionErr != nil {
+		message := strings.Join(strings.Fields(actionErr.Error()), " ")
+		baseWidth := lipgloss.Width(label)
+		if width > baseWidth+3 {
+			warning = "  ! " + message
+			warning = ansi.Truncate(warning, width-baseWidth, "…")
+		} else {
+			label = ansi.Truncate("! "+message, width, "…")
 		}
-		return label[:width]
+	}
+	if t.noColor() {
+		line := ansi.Truncate(label+warning, width, "")
+		return line + strings.Repeat(" ", max(0, width-ansi.StringWidth(line)))
 	}
 	styled := styles.headerStyle.Render(label)
-	lineWidth := lipgloss.Width(stripANSI(styled))
+	if warning != "" {
+		styled += styles.modalCloseStyle.Render(warning)
+	}
+	lineWidth := ansi.StringWidth(styled)
 	if lineWidth < width {
 		styled += strings.Repeat(" ", width-lineWidth)
 	}
-	return styled
+	return ansi.Truncate(styled, width, "")
 }
 
 func (t *Tree) renderCollapsed(width, height int) string {

@@ -68,6 +68,7 @@ func ReadAll(domain, profile string) ([]Task, error) {
 	}
 
 	var tasks []Task
+	var failures []error
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
@@ -75,6 +76,7 @@ func ReadAll(domain, profile string) ([]Task, error) {
 		path := filepath.Join(dir, entry.Name())
 		task, err := readTask(path)
 		if err != nil {
+			failures = append(failures, fmt.Errorf("read kanban task %s: %w", path, err))
 			continue
 		}
 		task.Path = path
@@ -85,7 +87,7 @@ func ReadAll(domain, profile string) ([]Task, error) {
 		return tasks[i].Title < tasks[j].Title
 	})
 
-	return tasks, nil
+	return tasks, errors.Join(failures...)
 }
 
 // KanbanDir returns the kanban directory for the given profile+domain.

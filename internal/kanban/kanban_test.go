@@ -51,6 +51,31 @@ func TestReadTaskParsesSubstatus(t *testing.T) {
 	}
 }
 
+func TestReadAllReturnsValidTasksAndPathSpecificErrors(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const (
+		profile = "read-all-partial"
+		domain  = "read-all-partial"
+	)
+	dir := KanbanDir(domain, profile)
+	validPath := writeTaskFile(t, dir, "valid.md", "Readable task", "todo")
+	invalidPath := filepath.Join(dir, "invalid.md")
+	if err := os.WriteFile(invalidPath, []byte("---\ntitle: Invalid\nstatus: in_review\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := ReadAll(domain, profile)
+	if !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("ReadAll error = %v, want ErrInvalidStatus", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), invalidPath) {
+		t.Fatalf("ReadAll error lacks invalid file path: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Path != validPath || tasks[0].Title != "Readable task" {
+		t.Fatalf("partial tasks = %#v, want the readable task", tasks)
+	}
+}
+
 func TestUpdateStatusPreservesNestedYAMLFrontmatter(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested.md")

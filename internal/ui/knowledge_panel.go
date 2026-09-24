@@ -2,6 +2,8 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/fsnotify/fsnotify"
 	warp "github.com/starframe-dev/warp"
 
@@ -69,9 +72,11 @@ type KnowledgePanel struct {
 	contextReader *akcontext.CachedReader
 	jobsReader    *akjobs.CachedReader
 
-	// Settings state for header buttons
-	autoContinue bool
-	dual         bool
+	// Settings state for header buttons.
+	autoContinue   bool
+	dual           bool
+	settingsError  string
+	settingsWriter func(path string, data []byte) error
 
 	// Current task title (from kanban) shown before plans
 	currentTask     string
@@ -222,49 +227,185 @@ func (k *KnowledgePanel) attachKnowledgeWatcherIfMissing() {
 	k.knowledgeWatcherPath = watchPath
 }
 
-// readSettings loads autoContinue and dual from settings.json.
+// readSettings loads and validates known settings without treating malformed
+// files as an empty object.
 func (k *KnowledgePanel) readSettings() {
 	k.autoContinue = false
 	k.dual = false
+	k.settingsError = ""
 	if k.sessionID == "" {
 		return
 	}
-	settingsPath := k.settingsPath()
-	data, err := os.ReadFile(settingsPath)
+	data, err := os.ReadFile(k.settingsPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
 	if err != nil {
+		k.setSettingsError(fmt.Errorf("read settings: %w", err))
 		return
 	}
-	var s struct {
-		AutoContinue bool `json:"autoContinue"`
-		Dual         bool `json:"dual"`
-	}
-	if err := json.Unmarshal(data, &s); err != nil {
+	_, autoContinue, dual, err := decodeSettings(data)
+	if err != nil {
+		k.setSettingsError(err)
 		return
 	}
-	k.autoContinue = s.AutoContinue
-	k.dual = s.Dual
+	k.autoContinue = autoContinue
+	k.dual = dual
 }
 
-// writeSettings saves autoContinue and dual to settings.json.
-func (k *KnowledgePanel) writeSettings() {
+func decodeSettings(data []byte) (map[string]json.RawMessage, bool, bool, error) {
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, false, false, fmt.Errorf("decode settings: %w", err)
+	}
+	if settings == nil {
+		return nil, false, false, fmt.Errorf("settings must be a JSON object")
+	}
+	readBool := func(key string) (bool, error) {
+		raw, exists := settings[key]
+		if !exists {
+			return false, nil
+		}
+		var value *bool
+		if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+			if err == nil {
+				err = fmt.Errorf("value must be a boolean")
+			}
+			return false, fmt.Errorf("settings.%s: %w", key, err)
+		}
+		return *value, nil
+	}
+	autoContinue, err := readBool("autoContinue")
+	if err != nil {
+		return nil, false, false, err
+	}
+	dual, err := readBool("dual")
+	if err != nil {
+		return nil, false, false, err
+	}
+	return settings, autoContinue, dual, nil
+}
+
+// writeSettings atomically updates known settings while preserving unknown keys.
+func (k *KnowledgePanel) writeSettings() error {
 	if k.sessionID == "" {
-		return
+		return fmt.Errorf("cannot write settings without a session")
+	}
+	if k.autoContinue && k.dual {
+		err := fmt.Errorf("autoContinue and dual settings are mutually exclusive")
+		k.setSettingsError(err)
+		return err
 	}
 	settingsPath := k.settingsPath()
-
-	var s map[string]interface{}
-	if data, err := os.ReadFile(settingsPath); err == nil {
-		json.Unmarshal(data, &s)
+	settings := make(map[string]json.RawMessage)
+	current, err := os.ReadFile(settingsPath)
+	if err == nil {
+		settings, _, _, err = decodeSettings(current)
+		if err != nil {
+			k.setSettingsError(err)
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		err = fmt.Errorf("read settings before update: %w", err)
+		k.setSettingsError(err)
+		return err
 	}
-	if s == nil {
-		s = make(map[string]interface{})
+	autoContinue, err := json.Marshal(k.autoContinue)
+	if err != nil {
+		k.setSettingsError(err)
+		return err
 	}
-	s["autoContinue"] = k.autoContinue
-	s["dual"] = k.dual
+	dual, err := json.Marshal(k.dual)
+	if err != nil {
+		k.setSettingsError(err)
+		return err
+	}
+	settings["autoContinue"] = autoContinue
+	settings["dual"] = dual
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		err = fmt.Errorf("encode settings: %w", err)
+		k.setSettingsError(err)
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		err = fmt.Errorf("create settings directory: %w", err)
+		k.setSettingsError(err)
+		return err
+	}
+	writer := k.settingsWriter
+	if writer == nil {
+		writer = writeSettingsAtomic
+	}
+	if err := writer(settingsPath, data); err != nil {
+		k.setSettingsError(err)
+		return err
+	}
+	k.settingsError = ""
+	return nil
+}
 
-	os.MkdirAll(filepath.Dir(settingsPath), 0755)
-	data, _ := json.MarshalIndent(s, "", "  ")
-	os.WriteFile(settingsPath, data, 0644)
+func (k *KnowledgePanel) setSettingsError(err error) {
+	if err == nil {
+		k.settingsError = ""
+		return
+	}
+	k.settingsError = err.Error()
+	log.Printf("automata: settings for %q: %v", k.sessionID, err)
+}
+
+type committedSettingsWriteError struct {
+	path string
+	err  error
+}
+
+func (e *committedSettingsWriteError) Error() string {
+	return fmt.Sprintf("settings committed to %s but directory sync failed: %v", e.path, e.err)
+}
+
+func (e *committedSettingsWriteError) Unwrap() error { return e.err }
+
+func settingsWriteWasCommitted(err error) bool {
+	var committed *committedSettingsWriteError
+	return errors.As(err, &committed)
+}
+
+func writeSettingsAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	temporary, err := os.CreateTemp(dir, ".settings-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary settings: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o644); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("chmod temporary settings: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("write temporary settings: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sync temporary settings: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close temporary settings: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace settings: %w", err)
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return &committedSettingsWriteError{path: path, err: err}
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil || closeErr != nil {
+		return &committedSettingsWriteError{path: path, err: errors.Join(syncErr, closeErr)}
+	}
+	return nil
 }
 
 // settingsPath returns the path to settings.json for the current session.
@@ -489,8 +630,7 @@ func (k *KnowledgePanel) refreshCurrentTask() {
 	}
 	tasks, err := kanban.ReadAll(domain, k.profile)
 	if err != nil {
-		k.currentTask = ""
-		return
+		log.Printf("automata: read Kanban domain %q for current task: %v", domain, err)
 	}
 	for _, t := range tasks {
 		if t.AssignedTo == k.sessionID && t.Status == "progress" {
@@ -507,19 +647,25 @@ func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) {
 		// Header: " Knowledge  [✓ auto] [× dual]"
 		// auto button starts at column 12, dual at column 22
 		if msg.X >= 12 && msg.X < 20 {
+			oldAutoContinue, oldDual := k.autoContinue, k.dual
 			k.autoContinue = !k.autoContinue
 			if k.autoContinue {
 				k.dual = false
 			}
-			k.writeSettings()
+			if err := k.writeSettings(); err != nil && !settingsWriteWasCommitted(err) {
+				k.autoContinue, k.dual = oldAutoContinue, oldDual
+			}
 			return
 		}
 		if msg.X >= 22 && msg.X < 30 {
+			oldAutoContinue, oldDual := k.autoContinue, k.dual
 			k.dual = !k.dual
 			if k.dual {
 				k.autoContinue = false
 			}
-			k.writeSettings()
+			if err := k.writeSettings(); err != nil && !settingsWriteWasCommitted(err) {
+				k.autoContinue, k.dual = oldAutoContinue, oldDual
+			}
 			return
 		}
 	}
@@ -594,10 +740,21 @@ func (k *KnowledgePanel) View(width, height int) string {
 	if k.height < 2 {
 		return header
 	}
-	body := akui.ViewWithTheme(k.width, k.height-1, k.data, k.jobs, k.currentTask, k.palette)
-	lines := strings.Split(body, "\n")
-	if len(lines) > k.height-1 {
-		maxOffset := len(lines) - (k.height - 1)
+	bodyHeight := k.height - 1
+	warning := ""
+	if k.settingsError != "" {
+		warning = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error)).Render(
+			ansi.Truncate("Settings error: "+k.settingsError, k.width, "…"),
+		)
+		bodyHeight--
+	}
+	lines := []string{}
+	if bodyHeight > 0 {
+		body := akui.ViewWithTheme(k.width, bodyHeight, k.data, k.jobs, k.currentTask, k.palette)
+		lines = strings.Split(body, "\n")
+	}
+	if len(lines) > bodyHeight {
+		maxOffset := len(lines) - bodyHeight
 		if k.scrollOffset > maxOffset {
 			k.scrollOffset = maxOffset
 		}
@@ -605,14 +762,22 @@ func (k *KnowledgePanel) View(width, height int) string {
 			k.scrollOffset = 0
 		}
 		lines = lines[k.scrollOffset:]
-		if len(lines) > k.height-1 {
-			lines = lines[:k.height-1]
+		if len(lines) > bodyHeight {
+			lines = lines[:bodyHeight]
 		}
 	} else {
 		k.scrollOffset = 0
 	}
-	for len(lines) < k.height-1 {
+	for len(lines) < bodyHeight {
 		lines = append(lines, strings.Repeat(" ", k.width))
 	}
-	return header + "\n" + strings.Join(lines, "\n")
+	content := strings.Join(lines, "\n")
+	if warning != "" {
+		if content != "" {
+			content = warning + "\n" + content
+		} else {
+			content = warning
+		}
+	}
+	return header + "\n" + content
 }

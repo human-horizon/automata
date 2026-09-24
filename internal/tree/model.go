@@ -129,9 +129,9 @@ type Tree struct {
 	inputMode   bool
 	inputPrompt string
 	inputValue  string
-	inputCursor int               // rune cursor position within inputValue
-	inputDone   func(name string) // called on Enter with the typed name
-	inputError  string            // validation or operation error shown in the modal
+	inputCursor int                     // rune cursor position within inputValue
+	inputDone   func(name string) error // called on Enter with the typed name
+	inputError  string                  // validation or operation error shown in the modal
 
 	// Delete confirmation mode
 	confirmMode bool
@@ -180,9 +180,10 @@ type Tree struct {
 	// Callback when the user requests to stop an active session
 	onStopSession func(*Item)
 
-	// Callback before an item (or folder subtree) is deleted. Returning an
-	// error aborts the tree mutation so runtime cleanup can fail closed.
-	onBeforeDelete func(*Item) error
+	// Delete callbacks split side-effect-free preflight from post-commit cleanup.
+	onBeforeDelete    func(*Item) error
+	onDeleteCommitted func(*Item) error
+	onDeleteAborted   func(*Item)
 
 	// Callback fired after the active theme changes.
 	onThemeChange func(string)
@@ -216,6 +217,8 @@ type Tree struct {
 
 	// saveStateOverride is a test seam for persistence failure ordering.
 	saveStateOverride func() error
+	stateLoadErr      error
+	lastActionError   error
 
 	// ActiveSessions holds the set of currently running session IDs (keyed by
 	// the same identifier used to create the emulator).
@@ -242,6 +245,10 @@ type Tree struct {
 	saveMu sync.Mutex
 }
 
+func canonicalSiblingKey(name string) string {
+	return slug.Slug(strings.TrimSpace(name))
+}
+
 func generateID() string {
 	return uuid.New().String()
 }
@@ -258,43 +265,172 @@ func New() *Tree {
 }
 
 // AddFolder adds a root-level folder and returns the tree for chaining.
+// Use CreateFolder when the caller needs to handle validation or persistence errors.
 func (t *Tree) AddFolder(name string) *Tree {
-	item := &Item{
-		Name:     name,
-		IsFolder: true,
-		Children: nil,
-		Expanded: true,
-		ID:       generateID(),
-	}
-	t.root = append(t.root, item)
-	t.rebuildFlat()
-	t.autoSave()
+	_, _ = t.CreateFolder(name)
 	return t
 }
 
 // AddChat adds a root-level chat and returns the tree for chaining.
+// Use CreateChat when the caller needs to handle validation or persistence errors.
 func (t *Tree) AddChat(name string) *Tree {
-	item := &Item{
-		Name: name,
-		ID:   generateID(),
-	}
-	t.root = append(t.root, item)
-	t.rebuildFlat()
-	t.autoSave()
+	_, _ = t.CreateChat(name)
 	return t
 }
 
 // AddTerminal adds a root-level terminal and returns the tree for chaining.
+// Use CreateTerminal when the caller needs to handle validation or persistence errors.
 func (t *Tree) AddTerminal(name string) *Tree {
-	item := &Item{
-		Name:       name,
-		IsTerminal: true,
-		ID:         generateID(),
-	}
-	t.root = append(t.root, item)
-	t.rebuildFlat()
-	t.autoSave()
+	_, _ = t.CreateTerminal(name)
 	return t
+}
+
+// CreateFolder creates a unique root-level folder and persists the new tree.
+func (t *Tree) CreateFolder(name string) (*Item, error) {
+	return t.createItem(nil, &Item{IsFolder: true, Expanded: true, ID: generateID()}, name)
+}
+
+// CreateChat creates a unique root-level chat and persists the new tree.
+func (t *Tree) CreateChat(name string) (*Item, error) {
+	return t.createItem(nil, &Item{ID: generateID()}, name)
+}
+
+// CreateTerminal creates a unique root-level terminal and persists the new tree.
+func (t *Tree) CreateTerminal(name string) (*Item, error) {
+	return t.createItem(nil, &Item{IsTerminal: true, ID: generateID()}, name)
+}
+
+// CreateChildFolder creates a unique folder under parent and persists the new tree.
+func (t *Tree) CreateChildFolder(parent *Item, name string) (*Item, error) {
+	return t.createItem(parent, &Item{IsFolder: true, Expanded: true, ID: generateID()}, name)
+}
+
+// CreateChildChat creates a unique chat under parent and persists the new tree.
+func (t *Tree) CreateChildChat(parent *Item, name string) (*Item, error) {
+	return t.createItem(parent, &Item{ID: generateID()}, name)
+}
+
+// CreateChildTerminal creates a unique terminal under parent and persists the new tree.
+func (t *Tree) CreateChildTerminal(parent *Item, name string) (*Item, error) {
+	return t.createItem(parent, &Item{IsTerminal: true, ID: generateID()}, name)
+}
+
+func (t *Tree) createItem(parent, item *Item, name string) (*Item, error) {
+	displayName := strings.TrimSpace(name)
+	key := canonicalSiblingKey(displayName)
+	if key == "" {
+		return nil, t.recordActionError(fmt.Errorf("name must contain a letter or digit"))
+	}
+	if parent != nil && (!parent.IsFolder || !t.containsItem(parent)) {
+		return nil, t.recordActionError(fmt.Errorf("parent must be a folder in this tree"))
+	}
+	siblings := t.root
+	if parent != nil {
+		siblings = parent.Children
+	}
+	if err := validateSiblingIdentity(siblings, key, nil); err != nil {
+		return nil, t.recordActionError(err)
+	}
+
+	oldRoot := append([]*Item(nil), t.root...)
+	var oldChildren []*Item
+	oldExpanded := false
+	if parent != nil {
+		oldChildren = append([]*Item(nil), parent.Children...)
+		oldExpanded = parent.Expanded
+	}
+	oldSelection := t.SelectedItem()
+	oldSelectedIndex := t.selected
+	oldScroll := t.scroll
+
+	item.Name = displayName
+	if parent == nil {
+		t.root = append(t.root, item)
+	} else {
+		item.parent = parent
+		parent.Children = append(parent.Children, item)
+		parent.Expanded = true
+	}
+	t.rebuildFlat()
+	t.reselectItem(oldSelection)
+
+	if err := t.SaveState(); err != nil {
+		if stateCommitWasApplied(err) {
+			return item, t.recordActionError(err)
+		}
+		t.root = oldRoot
+		if parent != nil {
+			parent.Children = oldChildren
+			parent.Expanded = oldExpanded
+		}
+		item.parent = nil
+		t.rebuildFlat()
+		t.selected = oldSelectedIndex
+		t.scroll = oldScroll
+		if oldSelection != nil {
+			t.reselectItem(oldSelection)
+		}
+		return nil, t.recordActionError(err)
+	}
+	t.lastActionError = nil
+	return item, nil
+}
+
+func validateSiblingIdentity(siblings []*Item, key string, ignore *Item) error {
+	for _, sibling := range siblings {
+		if sibling == nil || sibling == ignore {
+			continue
+		}
+		if canonicalSiblingKey(sibling.Name) == key {
+			return fmt.Errorf("name conflicts with sibling %q", sibling.Name)
+		}
+	}
+	return nil
+}
+
+func (t *Tree) containsItem(target *Item) bool {
+	if target == nil {
+		return false
+	}
+	var visit func([]*Item) bool
+	visit = func(items []*Item) bool {
+		for _, item := range items {
+			if item == target {
+				return true
+			}
+			if item != nil && item.IsFolder && visit(item.Children) {
+				return true
+			}
+		}
+		return false
+	}
+	return visit(t.root)
+}
+
+// LastActionError returns the most recent Tree operation warning or failure.
+func (t *Tree) LastActionError() error { return t.lastActionError }
+
+// StateLoadError returns the startup snapshot error that blocks persistence.
+func (t *Tree) StateLoadError() error { return t.stateLoadErr }
+
+func (t *Tree) recordActionError(err error) error {
+	t.lastActionError = err
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "automata: tree operation: %v\n", err)
+	}
+	return err
+}
+
+func (t *Tree) persistMutation(rollback func()) error {
+	err := t.SaveState()
+	if err == nil {
+		t.lastActionError = nil
+		return nil
+	}
+	if !stateCommitWasApplied(err) && rollback != nil {
+		rollback()
+	}
+	return t.recordActionError(err)
 }
 
 // Reset removes all items from the tree (root and descendants) and rebuilds
@@ -385,8 +521,8 @@ func (t *Tree) MoveSelectedUp() bool {
 		siblings = parent.Children
 	}
 	idx := -1
-	for i, s := range siblings {
-		if s == sel {
+	for i, sibling := range siblings {
+		if sibling == sel {
 			idx = i
 			break
 		}
@@ -394,11 +530,25 @@ func (t *Tree) MoveSelectedUp() bool {
 	if idx <= 0 {
 		return false
 	}
+	oldSiblings := append([]*Item(nil), siblings...)
+	oldSelection, oldSelectedIndex, oldScroll := t.SelectedItem(), t.selected, t.scroll
 	siblings[idx-1], siblings[idx] = siblings[idx], siblings[idx-1]
 	t.rebuildFlat()
 	t.reselectItem(sel)
-	t.autoSave()
-	return true
+	err := t.persistMutation(func() {
+		if parent == nil {
+			t.root = oldSiblings
+		} else {
+			parent.Children = oldSiblings
+		}
+		t.rebuildFlat()
+		t.selected = oldSelectedIndex
+		t.scroll = oldScroll
+		if oldSelection != nil {
+			t.reselectItem(oldSelection)
+		}
+	})
+	return err == nil || stateCommitWasApplied(err)
 }
 
 // MoveSelectedDown moves the selected item one position down among its
@@ -414,8 +564,8 @@ func (t *Tree) MoveSelectedDown() bool {
 		siblings = parent.Children
 	}
 	idx := -1
-	for i, s := range siblings {
-		if s == sel {
+	for i, sibling := range siblings {
+		if sibling == sel {
 			idx = i
 			break
 		}
@@ -423,11 +573,25 @@ func (t *Tree) MoveSelectedDown() bool {
 	if idx < 0 || idx >= len(siblings)-1 {
 		return false
 	}
+	oldSiblings := append([]*Item(nil), siblings...)
+	oldSelection, oldSelectedIndex, oldScroll := t.SelectedItem(), t.selected, t.scroll
 	siblings[idx], siblings[idx+1] = siblings[idx+1], siblings[idx]
 	t.rebuildFlat()
 	t.reselectItem(sel)
-	t.autoSave()
-	return true
+	err := t.persistMutation(func() {
+		if parent == nil {
+			t.root = oldSiblings
+		} else {
+			parent.Children = oldSiblings
+		}
+		t.rebuildFlat()
+		t.selected = oldSelectedIndex
+		t.scroll = oldScroll
+		if oldSelection != nil {
+			t.reselectItem(oldSelection)
+		}
+	})
+	return err == nil || stateCommitWasApplied(err)
 }
 
 // MoveSelectedOut moves the selected element one level up: out of its
@@ -442,33 +606,46 @@ func (t *Tree) MoveSelectedDown() bool {
 // If the selected element is already at the root level (no parent), this
 // returns false.
 func (t *Tree) MoveSelectedOut() bool {
+	moved, _ := t.MoveSelectedOutChecked()
+	return moved
+}
+
+// MoveSelectedOutChecked moves the selected item one level up and reports
+// identity, preflight, or persistence failures to the caller.
+func (t *Tree) MoveSelectedOutChecked() (bool, error) {
 	sel := t.SelectedItem()
 	if sel == nil || sel.parent == nil {
-		return false
+		return false, nil
 	}
 	parent := sel.parent
 	grandparent := parent.parent
+	siblings := t.root
+	if grandparent != nil {
+		siblings = grandparent.Children
+	}
+	if err := validateSiblingIdentity(siblings, canonicalSiblingKey(sel.Name), sel); err != nil {
+		return false, t.recordActionError(err)
+	}
+
 	oldID := t.sessionIDOf(sel)
-	newParent := grandparent
-	newID := t.sessionIDOfWithParent(sel, newParent)
+	newID := t.sessionIDOfWithParent(sel, grandparent)
 	var rollback func() error
 	if oldID != newID && t.onBeforeItemMoved != nil {
 		var err error
-		rollback, err = t.onBeforeItemMoved(sel, newParent)
+		rollback, err = t.onBeforeItemMoved(sel, grandparent)
 		if err != nil {
-			return false
+			return false, t.recordActionError(err)
 		}
 	}
 
 	oldRoot := append([]*Item(nil), t.root...)
 	oldParentChildren := append([]*Item(nil), parent.Children...)
-	var oldTargetChildren []*Item
-	if grandparent != nil && grandparent != parent {
-		oldTargetChildren = append([]*Item(nil), grandparent.Children...)
-	}
+	oldTargetChildren := append([]*Item(nil), siblings...)
 	oldArchived := sel.Archived
+	oldSelectedItem := t.SelectedItem()
+	oldSelectedIndex := t.selected
+	oldScroll := t.scroll
 
-	// Remove sel from parent.Children.
 	remaining := make([]*Item, 0, len(parent.Children))
 	for _, child := range parent.Children {
 		if child != sel {
@@ -477,89 +654,79 @@ func (t *Tree) MoveSelectedOut() bool {
 	}
 	parent.Children = remaining
 
-	// Decide target list and insertion anchor.
-	var siblings []*Item
-	var anchor *Item
-	if grandparent == nil {
-		siblings = t.root
-	} else {
-		siblings = grandparent.Children
-	}
-	anchor = parent
-
-	// Append sel after anchor in siblings.
-	inserted := false
-	for i, s := range siblings {
-		if s == anchor {
-			siblings = append(siblings[:i+1], append([]*Item{sel}, siblings[i+1:]...)...)
-			sel.parent = grandparent
-			inserted = true
+	anchorIndex := -1
+	for i, sibling := range siblings {
+		if sibling == parent {
+			anchorIndex = i
 			break
 		}
 	}
-	if !inserted {
-		// Anchor lost (shouldn't happen) — restore parent state.
+	if anchorIndex < 0 {
 		parent.Children = oldParentChildren
-		sel.parent = parent
-		return false
+		if rollback != nil {
+			if rollbackErr := rollback(); rollbackErr != nil {
+				return false, t.recordActionError(fmt.Errorf("move preflight failed; rollback: %v", rollbackErr))
+			}
+		}
+		return false, t.recordActionError(fmt.Errorf("move target parent is no longer attached"))
 	}
+	siblings = append(siblings, nil)
+	copy(siblings[anchorIndex+2:], siblings[anchorIndex+1:])
+	siblings[anchorIndex+1] = sel
+	sel.parent = grandparent
 	if grandparent == nil {
 		t.root = siblings
 	} else {
 		grandparent.Children = siblings
 	}
 
-	// Archive flag for folders, mirroring moveItem.
 	if sel.IsFolder {
-		firstArchived := -1
-		for i, s := range siblings {
-			if s.IsFolder && s.Archived {
+		firstArchived, itemIndex := -1, -1
+		for i, sibling := range siblings {
+			if sibling == sel {
+				itemIndex = i
+			}
+			if firstArchived < 0 && sibling.IsFolder && sibling.Archived {
 				firstArchived = i
-				break
 			}
 		}
-		myIdx := -1
-		for i, s := range siblings {
-			if s == sel {
-				myIdx = i
-				break
-			}
-		}
-		if firstArchived >= 0 && myIdx >= firstArchived {
-			sel.Archived = true
-		} else {
-			sel.Archived = false
-		}
+		sel.Archived = firstArchived >= 0 && itemIndex >= firstArchived
 	}
 
 	t.rebuildFlat()
 	t.reselectItem(sel)
 	if err := t.SaveState(); err != nil {
-		t.root = oldRoot
-		parent.Children = oldParentChildren
-		if grandparent != nil && grandparent != parent {
-			grandparent.Children = oldTargetChildren
+		if !stateCommitWasApplied(err) {
+			t.root = oldRoot
+			parent.Children = oldParentChildren
+			if grandparent == nil {
+				t.root = oldTargetChildren
+			} else {
+				grandparent.Children = oldTargetChildren
+			}
+			sel.parent = parent
+			sel.Archived = oldArchived
+			t.rebuildFlat()
+			t.selected = oldSelectedIndex
+			t.scroll = oldScroll
+			if oldSelectedItem != nil {
+				t.reselectItem(oldSelectedItem)
+			}
+			if rollback != nil {
+				if rollbackErr := rollback(); rollbackErr != nil {
+					err = fmt.Errorf("%w; rollback moved data: %v", err, rollbackErr)
+				}
+			}
+			return false, t.recordActionError(err)
 		}
-		sel.parent = parent
-		sel.Archived = oldArchived
-		t.rebuildFlat()
-		t.reselectItem(sel)
-		var rollbackErr error
-		if rollback != nil {
-			rollbackErr = rollback()
-		}
-		if persistErr := t.SaveState(); persistErr != nil {
-			_, _ = fmt.Fprintln(os.Stderr, "Failed to restore tree state after move:", persistErr)
-		}
-		if rollbackErr != nil {
-			_, _ = fmt.Fprintln(os.Stderr, "Failed to rollback moved data:", rollbackErr)
-		}
-		return false
+		t.recordActionError(err)
+	} else {
+		t.lastActionError = nil
 	}
-	if t.onItemMoved != nil && oldID != newID {
+	if oldID != newID && t.onItemMoved != nil {
 		t.onItemMoved(sel, oldID, newID)
 	}
-	return true
+	return true, nil
 }
 
 // reselectItem sets t.selected to the flat index of `item`, if visible.
@@ -769,30 +936,30 @@ func indent(depth int) string {
 // otherwise adds to the root.
 func (t *Tree) AddFolderToSelected(name string) {
 	if sel := t.SelectedItem(); sel != nil && sel.IsFolder {
-		t.addChildFolder(sel, name)
+		_, _ = t.CreateChildFolder(sel, name)
 		return
 	}
-	t.AddFolder(name)
+	_, _ = t.CreateFolder(name)
 }
 
 // AddChatToSelected adds a chat to the selected item if it's a folder,
 // otherwise adds to the root.
 func (t *Tree) AddChatToSelected(name string) {
 	if sel := t.SelectedItem(); sel != nil && sel.IsFolder {
-		t.addChildChat(sel, name)
+		_, _ = t.CreateChildChat(sel, name)
 		return
 	}
-	t.AddChat(name)
+	_, _ = t.CreateChat(name)
 }
 
 // AddTerminalToSelected adds a terminal to the selected item if it's a folder,
 // otherwise adds to the root.
 func (t *Tree) AddTerminalToSelected(name string) {
 	if sel := t.SelectedItem(); sel != nil && sel.IsFolder {
-		t.addChildTerminal(sel, name)
+		_, _ = t.CreateChildTerminal(sel, name)
 		return
 	}
-	t.AddTerminal(name)
+	_, _ = t.CreateTerminal(name)
 }
 
 // --- Helpers ---
@@ -801,27 +968,43 @@ func (t *Tree) AddTerminalToSelected(name string) {
 // clears the binding. The path is normalised via filepath.Clean and then
 // stat-ed so BoundStale is up to date.
 func (t *Tree) bindFolder(item *Item, path string) {
-	if !item.IsFolder {
-		return
+	_ = t.bindFolderChecked(item, path)
+}
+
+func (t *Tree) bindFolderChecked(item *Item, path string) error {
+	if item == nil || !item.IsFolder || !t.containsItem(item) {
+		return t.recordActionError(fmt.Errorf("bind target must be a folder in this tree"))
 	}
-	path = filepath.Clean(strings.TrimSpace(path))
+	path = strings.TrimSpace(path)
 	if path == "" {
-		t.unbindFolder(item)
-		return
+		return t.unbindFolderChecked(item)
 	}
+	path = filepath.Clean(path)
+	oldPath, oldStale := item.BoundPath, item.BoundStale
 	item.SetBoundPath(path)
 	t.rebuildFlat()
-	t.autoSave()
+	return t.persistMutation(func() {
+		item.BoundPath, item.BoundStale = oldPath, oldStale
+		t.rebuildFlat()
+	})
 }
 
 // unbindFolder removes the filesystem anchor from a folder.
 func (t *Tree) unbindFolder(item *Item) {
-	if !item.IsFolder {
-		return
+	_ = t.unbindFolderChecked(item)
+}
+
+func (t *Tree) unbindFolderChecked(item *Item) error {
+	if item == nil || !item.IsFolder || !t.containsItem(item) {
+		return t.recordActionError(fmt.Errorf("unbind target must be a folder in this tree"))
 	}
+	oldPath, oldStale := item.BoundPath, item.BoundStale
 	item.SetBoundPath("")
 	t.rebuildFlat()
-	t.autoSave()
+	return t.persistMutation(func() {
+		item.BoundPath, item.BoundStale = oldPath, oldStale
+		t.rebuildFlat()
+	})
 }
 
 // revealInFinder opens the bound directory in the system file manager.
@@ -836,28 +1019,19 @@ func revealInFinder(path string) {
 	_ = exec.Command("open", path).Start()
 }
 
-func (t *Tree) addChildFolder(parent *Item, name string) {
-	child := &Item{Name: name, IsFolder: true, Expanded: true, ID: generateID()}
-	parent.AddChild(child)
-	parent.Expanded = true
-	t.rebuildFlat()
-	t.autoSave()
+func (t *Tree) addChildFolder(parent *Item, name string) error {
+	_, err := t.CreateChildFolder(parent, name)
+	return err
 }
 
-func (t *Tree) addChildChat(parent *Item, name string) {
-	child := &Item{Name: name, ID: generateID()}
-	parent.AddChild(child)
-	parent.Expanded = true
-	t.rebuildFlat()
-	t.autoSave()
+func (t *Tree) addChildChat(parent *Item, name string) error {
+	_, err := t.CreateChildChat(parent, name)
+	return err
 }
 
-func (t *Tree) addChildTerminal(parent *Item, name string) {
-	child := &Item{Name: name, IsTerminal: true, ID: generateID()}
-	parent.AddChild(child)
-	parent.Expanded = true
-	t.rebuildFlat()
-	t.autoSave()
+func (t *Tree) addChildTerminal(parent *Item, name string) error {
+	_, err := t.CreateChildTerminal(parent, name)
+	return err
 }
 
 // sortChildrenAlphabetically reorders parent.Children in place: folders
@@ -867,13 +1041,28 @@ func (t *Tree) addChildTerminal(parent *Item, name string) {
 // names are unique. The folder itself, its position in the parent list,
 // and any deeper hierarchy are not touched.
 func (t *Tree) sortChildrenAlphabetically(parent *Item) {
-	if parent == nil || len(parent.Children) < 2 {
+	if parent == nil || !parent.IsFolder || !t.containsItem(parent) || len(parent.Children) < 2 {
 		return
 	}
+	oldChildren := append([]*Item(nil), parent.Children...)
+	oldExpanded := parent.Expanded
+	oldSelection, oldSelectedIndex, oldScroll := t.SelectedItem(), t.selected, t.scroll
 	sortItemsAlphabetically(parent.Children)
 	parent.Expanded = true
 	t.rebuildFlat()
-	t.autoSave()
+	if oldSelection != nil {
+		t.reselectItem(oldSelection)
+	}
+	_ = t.persistMutation(func() {
+		parent.Children = oldChildren
+		parent.Expanded = oldExpanded
+		t.rebuildFlat()
+		t.selected = oldSelectedIndex
+		t.scroll = oldScroll
+		if oldSelection != nil {
+			t.reselectItem(oldSelection)
+		}
+	})
 }
 
 // sortRootByName reorders only active root items by name. Archived folders
@@ -896,8 +1085,8 @@ func (t *Tree) sortRoot(sortItems func([]*Item)) {
 	if len(t.root) < 2 {
 		return
 	}
-
-	selected := t.SelectedItem()
+	oldRoot := append([]*Item(nil), t.root...)
+	selected, oldSelectedIndex, oldScroll := t.SelectedItem(), t.selected, t.scroll
 	active := make([]*Item, 0, len(t.root))
 	archived := make([]*Item, 0)
 	for _, item := range t.root {
@@ -914,7 +1103,15 @@ func (t *Tree) sortRoot(sortItems func([]*Item)) {
 	if selected != nil {
 		t.reselectItem(selected)
 	}
-	t.autoSave()
+	_ = t.persistMutation(func() {
+		t.root = oldRoot
+		t.rebuildFlat()
+		t.selected = oldSelectedIndex
+		t.scroll = oldScroll
+		if selected != nil {
+			t.reselectItem(selected)
+		}
+	})
 }
 
 // sortRootAlphabetically preserves the historical type-first root sort.
@@ -961,19 +1158,12 @@ func (t *Tree) renameItem(item *Item, name string) error {
 	}
 
 	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("name cannot be empty")
+	key := canonicalSiblingKey(name)
+	if key == "" {
+		return t.recordActionError(fmt.Errorf("name must contain a letter or digit"))
 	}
-	if slug.Slug(name) == "" {
-		return fmt.Errorf("name must contain a letter or digit")
-	}
-	for _, sibling := range t.siblings(item) {
-		if sibling == item {
-			continue
-		}
-		if slug.Slug(sibling.Name) == slug.Slug(name) {
-			return fmt.Errorf("name conflicts with %q", sibling.Name)
-		}
+	if err := validateSiblingIdentity(t.siblings(item), key, item); err != nil {
+		return t.recordActionError(err)
 	}
 	if item.Name == name {
 		return nil
@@ -996,21 +1186,25 @@ func (t *Tree) renameItem(item *Item, name string) error {
 	item.Name = name
 	t.rebuildFlat()
 	if err := t.SaveState(); err != nil {
+		if stateCommitWasApplied(err) {
+			t.recordActionError(err)
+			if t.onRenameCommitted != nil {
+				t.onRenameCommitted(item, oldName, name)
+			}
+			return nil
+		}
 		item.Name = oldName
 		t.rebuildFlat()
 		var rollbackErr error
 		if rollback != nil {
 			rollbackErr = rollback()
 		}
-		persistErr := t.SaveState()
 		if rollbackErr != nil {
-			return fmt.Errorf("save renamed tree: %w; rollback: %v", err, rollbackErr)
+			return t.recordActionError(fmt.Errorf("save renamed tree: %w; rollback: %v", err, rollbackErr))
 		}
-		if persistErr != nil {
-			return fmt.Errorf("save renamed tree: %w; restore old state: %v", err, persistErr)
-		}
-		return err
+		return t.recordActionError(err)
 	}
+	t.lastActionError = nil
 	if t.onRenameCommitted != nil {
 		t.onRenameCommitted(item, oldName, name)
 	}
@@ -1028,29 +1222,35 @@ func (t *Tree) siblings(item *Item) []*Item {
 }
 
 func (t *Tree) deleteItem(item *Item) {
-	if item == nil {
-		return
+	_ = t.DeleteItem(item)
+}
+
+// DeleteItem removes an item after a side-effect-free runtime preflight, then
+// runs cleanup only after the tree snapshot commits.
+func (t *Tree) DeleteItem(item *Item) error {
+	if item == nil || !t.containsItem(item) {
+		return nil
 	}
 	if t.onBeforeDelete != nil {
 		if err := t.onBeforeDelete(item); err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, "Failed to delete tree item:", err)
-			return
+			if t.onDeleteAborted != nil {
+				t.onDeleteAborted(item)
+			}
+			return t.recordActionError(err)
 		}
 	}
 
 	oldRoot := append([]*Item(nil), t.root...)
-	oldSelected := t.SelectedItem()
-	var oldParent *Item
+	oldSelectedItem, oldSelectedIndex, oldScroll := t.SelectedItem(), t.selected, t.scroll
+	oldParent := item.parent
 	var oldParentChildren []*Item
-	if item.parent != nil {
-		oldParent = item.parent
-		oldParentChildren = append([]*Item(nil), item.parent.Children...)
+	if oldParent != nil {
+		oldParentChildren = append([]*Item(nil), oldParent.Children...)
 	}
-	if item.parent != nil {
-		parent := item.parent
-		for i, child := range parent.Children {
+	if oldParent != nil {
+		for i, child := range oldParent.Children {
 			if child == item {
-				parent.Children = append(parent.Children[:i], parent.Children[i+1:]...)
+				oldParent.Children = append(oldParent.Children[:i], oldParent.Children[i+1:]...)
 				break
 			}
 		}
@@ -1063,32 +1263,55 @@ func (t *Tree) deleteItem(item *Item) {
 		}
 	}
 	t.rebuildFlat()
-	if err := t.SaveState(); err != nil {
+	saveErr := t.SaveState()
+	if saveErr != nil && !stateCommitWasApplied(saveErr) {
 		t.root = oldRoot
 		if oldParent != nil {
 			oldParent.Children = oldParentChildren
 		}
+		item.parent = oldParent
 		t.rebuildFlat()
-		if oldSelected != nil {
-			t.reselectItem(oldSelected)
+		t.selected = oldSelectedIndex
+		t.scroll = oldScroll
+		if oldSelectedItem != nil {
+			t.reselectItem(oldSelectedItem)
 		}
-		_, _ = fmt.Fprintln(os.Stderr, "Failed to persist tree deletion:", err)
+		if t.onDeleteAborted != nil {
+			t.onDeleteAborted(item)
+		}
+		return t.recordActionError(saveErr)
 	}
+	if saveErr != nil {
+		t.recordActionError(saveErr)
+	} else {
+		t.lastActionError = nil
+	}
+	if t.onDeleteCommitted != nil {
+		if err := t.onDeleteCommitted(item); err != nil {
+			if saveErr != nil {
+				err = fmt.Errorf("%w; post-delete cleanup: %v", saveErr, err)
+			}
+			return t.recordActionError(err)
+		}
+	}
+	return saveErr
 }
 
 // MoveItem moves an item relative to a target item using the same guarded
-// path as drag-and-drop. Invalid cycle moves are ignored.
+// path as drag-and-drop.
 func (t *Tree) MoveItem(item, target *Item) {
-	t.moveItem(item, target)
+	_ = t.MoveItemChecked(item, target)
 }
 
-func (t *Tree) moveItem(item, target *Item) {
+// MoveItemChecked moves an item and returns identity, preflight, or persistence errors.
+func (t *Tree) MoveItemChecked(item, target *Item) error {
 	if item == nil || item == target || target == nil {
-		return
+		return nil
+	}
+	if !t.containsItem(item) || !t.containsItem(target) {
+		return t.recordActionError(fmt.Errorf("move source and target must belong to this tree"))
 	}
 
-	// Determine target parent and insertion index before removing item,
-	// because removal shifts indices.
 	var targetParent *Item
 	var targetIndex int
 	if target.IsFolder {
@@ -1113,11 +1336,16 @@ func (t *Tree) moveItem(item, target *Item) {
 		}
 	}
 	if isDescendantOf(targetParent, item) {
-		return
+		return t.recordActionError(fmt.Errorf("cannot move an item into itself or its descendant"))
+	}
+	targetSiblings := t.root
+	if targetParent != nil {
+		targetSiblings = targetParent.Children
+	}
+	if err := validateSiblingIdentity(targetSiblings, canonicalSiblingKey(item.Name), item); err != nil {
+		return t.recordActionError(err)
 	}
 
-	// Capture the session ID before mutating the tree so the callback can
-	// detect cross-parent moves that change the just-pi session id.
 	oldID := t.sessionIDOf(item)
 	newID := t.sessionIDOfWithParent(item, targetParent)
 	var rollback func() error
@@ -1125,33 +1353,32 @@ func (t *Tree) moveItem(item, target *Item) {
 		var err error
 		rollback, err = t.onBeforeItemMoved(item, targetParent)
 		if err != nil {
-			return
+			return t.recordActionError(err)
 		}
 	}
 
 	oldRoot := append([]*Item(nil), t.root...)
-	var oldParent *Item
+	oldParent := item.parent
 	var oldParentChildren []*Item
-	if item.parent != nil {
-		oldParent = item.parent
-		oldParentChildren = append([]*Item(nil), item.parent.Children...)
+	if oldParent != nil {
+		oldParentChildren = append([]*Item(nil), oldParent.Children...)
 	}
 	var oldTargetChildren []*Item
 	if targetParent != nil && targetParent != oldParent {
 		oldTargetChildren = append([]*Item(nil), targetParent.Children...)
 	}
 	oldArchived := item.Archived
+	oldSelectedItem := t.SelectedItem()
+	oldSelectedIndex := t.selected
+	oldScroll := t.scroll
 
-	// Remove item from current parent. If item was in the same parent before
-	// the target index, decrement targetIndex to account for the removal.
-	if item.parent != nil {
-		parent := item.parent
-		for i, child := range parent.Children {
+	if oldParent != nil {
+		for i, child := range oldParent.Children {
 			if child == item {
-				if parent == targetParent && i < targetIndex {
+				if oldParent == targetParent && i < targetIndex {
 					targetIndex--
 				}
-				parent.Children = append(parent.Children[:i], parent.Children[i+1:]...)
+				oldParent.Children = append(oldParent.Children[:i], oldParent.Children[i+1:]...)
 				break
 			}
 		}
@@ -1167,49 +1394,51 @@ func (t *Tree) moveItem(item, target *Item) {
 		}
 	}
 
-	// Decide archived status for folders. Chats and terminals are never archived.
 	if item.IsFolder {
+		siblings := t.root
 		if targetParent != nil {
-			firstArchived := -1
-			for i, child := range targetParent.Children {
-				if child.IsFolder && child.Archived {
-					firstArchived = i
-					break
-				}
-			}
-			if firstArchived >= 0 && targetIndex >= firstArchived {
-				item.Archived = true
-			} else {
-				item.Archived = false
-			}
-		} else {
-			// Root level: archived if dropped after the first archived root folder.
-			firstArchived := -1
-			for i, root := range t.root {
-				if root.IsFolder && root.Archived {
-					firstArchived = i
-					break
-				}
-			}
-			if firstArchived >= 0 && targetIndex >= firstArchived {
-				item.Archived = true
-			} else {
-				item.Archived = false
+			siblings = targetParent.Children
+		}
+		firstArchived := -1
+		for i, sibling := range siblings {
+			if sibling.IsFolder && sibling.Archived {
+				firstArchived = i
+				break
 			}
 		}
+		item.Archived = firstArchived >= 0 && targetIndex >= firstArchived
 	}
-
-	// Insert into target parent.
+	if targetIndex < 0 {
+		targetIndex = 0
+	}
 	if targetParent != nil {
-		targetParent.Children = append(targetParent.Children[:targetIndex], append([]*Item{item}, targetParent.Children[targetIndex:]...)...)
+		if targetIndex > len(targetParent.Children) {
+			targetIndex = len(targetParent.Children)
+		}
+		targetParent.Children = append(targetParent.Children, nil)
+		copy(targetParent.Children[targetIndex+1:], targetParent.Children[targetIndex:])
+		targetParent.Children[targetIndex] = item
 		item.parent = targetParent
 	} else {
-		t.root = append(t.root[:targetIndex], append([]*Item{item}, t.root[targetIndex:]...)...)
+		if targetIndex > len(t.root) {
+			targetIndex = len(t.root)
+		}
+		t.root = append(t.root, nil)
+		copy(t.root[targetIndex+1:], t.root[targetIndex:])
+		t.root[targetIndex] = item
 		item.parent = nil
 	}
 
 	t.rebuildFlat()
+	t.reselectItem(oldSelectedItem)
 	if err := t.SaveState(); err != nil {
+		if stateCommitWasApplied(err) {
+			t.recordActionError(err)
+			if oldID != newID && t.onItemMoved != nil {
+				t.onItemMoved(item, oldID, newID)
+			}
+			return err
+		}
 		t.root = oldRoot
 		if oldParent != nil {
 			oldParent.Children = oldParentChildren
@@ -1220,23 +1449,27 @@ func (t *Tree) moveItem(item, target *Item) {
 		item.parent = oldParent
 		item.Archived = oldArchived
 		t.rebuildFlat()
-		t.reselectItem(item)
-		var rollbackErr error
+		t.selected = oldSelectedIndex
+		t.scroll = oldScroll
+		if oldSelectedItem != nil {
+			t.reselectItem(oldSelectedItem)
+		}
 		if rollback != nil {
-			rollbackErr = rollback()
+			if rollbackErr := rollback(); rollbackErr != nil {
+				err = fmt.Errorf("%w; rollback moved data: %v", err, rollbackErr)
+			}
 		}
-		if persistErr := t.SaveState(); persistErr != nil {
-			_, _ = fmt.Fprintln(os.Stderr, "Failed to restore tree state after move:", persistErr)
-		}
-		if rollbackErr != nil {
-			_, _ = fmt.Fprintln(os.Stderr, "Failed to rollback moved data:", rollbackErr)
-		}
-		return
+		return t.recordActionError(err)
 	}
-
-	if newID != oldID && t.onItemMoved != nil {
+	t.lastActionError = nil
+	if oldID != newID && t.onItemMoved != nil {
 		t.onItemMoved(item, oldID, newID)
 	}
+	return nil
+}
+
+func (t *Tree) moveItem(item, target *Item) {
+	_ = t.MoveItemChecked(item, target)
 }
 
 func isDescendantOf(candidate, ancestor *Item) bool {
@@ -1261,9 +1494,15 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 			archiveLabel = "Unarchive"
 		}
 		items = []warp.PopoverItem{
-			{Name: "New Folder", Action: func() { t.startInput("Folder name:", func(name string) { t.addChildFolder(sel, name) }) }},
-			{Name: "New Chat", Action: func() { t.startInput("Chat name:", func(name string) { t.addChildChat(sel, name) }) }},
-			{Name: "New Terminal", Action: func() { t.startInput("Terminal name:", func(name string) { t.addChildTerminal(sel, name) }) }},
+			{Name: "New Folder", Action: func() {
+				t.startCreateInput("Folder name:", func(name string) (*Item, error) { return t.CreateChildFolder(sel, name) })
+			}},
+			{Name: "New Chat", Action: func() {
+				t.startCreateInput("Chat name:", func(name string) (*Item, error) { return t.CreateChildChat(sel, name) })
+			}},
+			{Name: "New Terminal", Action: func() {
+				t.startCreateInput("Terminal name:", func(name string) (*Item, error) { return t.CreateChildTerminal(sel, name) })
+			}},
 			{Name: "Rename", Action: func() { t.startRename(sel) }},
 			{Name: archiveLabel, Action: func() { t.toggleArchive(sel) }},
 			{Name: "Move up", Action: func() { t.MoveSelectedUp() }},
@@ -1280,7 +1519,7 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 		} else {
 			items = append(items, []warp.PopoverItem{
 				{Name: "Bind to folder…", Action: func() {
-					t.startInput("Bind to path:", func(path string) { t.bindFolder(sel, path) })
+					t.startCheckedInput("Bind to path:", func(path string) error { return t.bindFolderChecked(sel, path) })
 				}},
 			}...)
 		}
@@ -1309,9 +1548,9 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 func (t *Tree) rootMenuItems() []warp.PopoverItem {
 	items := t.rootSortMenuItems()
 	return append(items,
-		warp.PopoverItem{Name: "New Folder", Action: func() { t.startInput("Folder name:", func(name string) { t.AddFolder(name) }) }},
-		warp.PopoverItem{Name: "New Chat", Action: func() { t.startInput("Chat name:", func(name string) { t.AddChat(name) }) }},
-		warp.PopoverItem{Name: "New Terminal", Action: func() { t.startInput("Terminal name:", func(name string) { t.AddTerminal(name) }) }},
+		warp.PopoverItem{Name: "New Folder", Action: func() { t.startCreateInput("Folder name:", t.CreateFolder) }},
+		warp.PopoverItem{Name: "New Chat", Action: func() { t.startCreateInput("Chat name:", t.CreateChat) }},
+		warp.PopoverItem{Name: "New Terminal", Action: func() { t.startCreateInput("Terminal name:", t.CreateTerminal) }},
 	)
 }
 
@@ -1370,9 +1609,17 @@ func (t *Tree) showSettingsMenu(x, y int) {
 // parent so that archived folders stay below the separator line. Chats and
 // terminals cannot be archived.
 func (t *Tree) toggleArchive(item *Item) {
-	if !item.IsFolder {
+	if item == nil || !item.IsFolder || !t.containsItem(item) {
 		return
 	}
+	oldRoot := append([]*Item(nil), t.root...)
+	parent := item.parent
+	var oldChildren []*Item
+	if parent != nil {
+		oldChildren = append([]*Item(nil), parent.Children...)
+	}
+	oldArchived := item.Archived
+	oldSelection, oldSelectedIndex, oldScroll := t.SelectedItem(), t.selected, t.scroll
 	item.Archived = !item.Archived
 	if item.parent == nil {
 		// Root level: sort root items so non-archived folders come first, then
@@ -1418,22 +1665,43 @@ func (t *Tree) toggleArchive(item *Item) {
 		parent.Children = append(active, archived...)
 	}
 	t.rebuildFlat()
-	t.autoSave()
+	if oldSelection != nil {
+		t.reselectItem(oldSelection)
+	}
+	_ = t.persistMutation(func() {
+		t.root = oldRoot
+		if parent != nil {
+			parent.Children = oldChildren
+		}
+		item.Archived = oldArchived
+		t.rebuildFlat()
+		t.selected = oldSelectedIndex
+		t.scroll = oldScroll
+		if oldSelection != nil {
+			t.reselectItem(oldSelection)
+		}
+	})
 }
 
 func (t *Tree) showCreateMenu(parent *Item, x, y int) {
 	var items []warp.PopoverItem
 	if parent != nil {
 		items = []warp.PopoverItem{
-			{Name: "New Folder", Action: func() { t.startInput("Folder name:", func(name string) { t.addChildFolder(parent, name) }) }},
-			{Name: "New Chat", Action: func() { t.startInput("Chat name:", func(name string) { t.addChildChat(parent, name) }) }},
-			{Name: "New Terminal", Action: func() { t.startInput("Terminal name:", func(name string) { t.addChildTerminal(parent, name) }) }},
+			{Name: "New Folder", Action: func() {
+				t.startCreateInput("Folder name:", func(name string) (*Item, error) { return t.CreateChildFolder(parent, name) })
+			}},
+			{Name: "New Chat", Action: func() {
+				t.startCreateInput("Chat name:", func(name string) (*Item, error) { return t.CreateChildChat(parent, name) })
+			}},
+			{Name: "New Terminal", Action: func() {
+				t.startCreateInput("Terminal name:", func(name string) (*Item, error) { return t.CreateChildTerminal(parent, name) })
+			}},
 		}
 	} else {
 		items = []warp.PopoverItem{
-			{Name: "New Folder", Action: func() { t.startInput("Folder name:", func(name string) { t.AddFolder(name) }) }},
-			{Name: "New Chat", Action: func() { t.startInput("Chat name:", func(name string) { t.AddChat(name) }) }},
-			{Name: "New Terminal", Action: func() { t.startInput("Terminal name:", func(name string) { t.AddTerminal(name) }) }},
+			{Name: "New Folder", Action: func() { t.startCreateInput("Folder name:", t.CreateFolder) }},
+			{Name: "New Chat", Action: func() { t.startCreateInput("Chat name:", t.CreateChat) }},
+			{Name: "New Terminal", Action: func() { t.startCreateInput("Terminal name:", t.CreateTerminal) }},
 		}
 	}
 	t.popover = &warp.Popover{
@@ -1500,16 +1768,30 @@ func (t *Tree) HelpOpen() bool {
 	return t.helpMode
 }
 
-// startInput enters input mode with the given prompt and callback.
+// startInput enters input mode with a compatibility callback.
 func (t *Tree) startInput(prompt string, done func(name string)) {
+	t.startCheckedInput(prompt, func(name string) error {
+		done(name)
+		return nil
+	})
+}
+
+func (t *Tree) startCheckedInput(prompt string, done func(name string) error) {
 	t.inputMode = true
 	t.inputPrompt = prompt
 	t.inputValue = ""
 	t.inputCursor = 0
 	t.inputError = ""
 	t.inputDone = done
-
+	t.lastActionError = nil
 	t.updateInputModal()
+}
+
+func (t *Tree) startCreateInput(prompt string, create func(string) (*Item, error)) {
+	t.startCheckedInput(prompt, func(name string) error {
+		_, err := create(name)
+		return err
+	})
 }
 
 // startRename opens the rename modal with the current name pre-filled.
@@ -1522,11 +1804,8 @@ func (t *Tree) startRename(item *Item) {
 	t.inputValue = item.Name
 	t.inputCursor = len([]rune(item.Name))
 	t.inputError = ""
-	t.inputDone = func(name string) {
-		if err := t.renameItem(item, name); err != nil {
-			t.inputError = err.Error()
-			t.updateInputModal()
-		}
+	t.inputDone = func(name string) error {
+		return t.renameItem(item, name)
 	}
 	t.updateInputModal()
 }
@@ -1534,10 +1813,15 @@ func (t *Tree) startRename(item *Item) {
 // confirmInput confirms the current input.
 func (t *Tree) confirmInput() {
 	t.inputError = ""
-	if t.inputDone != nil && t.inputValue != "" {
-		t.inputDone(t.inputValue)
-		if t.inputError != "" {
-			return
+	if t.inputDone != nil {
+		if err := t.inputDone(t.inputValue); err != nil {
+			if stateCommitWasApplied(err) {
+				t.recordActionError(err)
+			} else {
+				t.inputError = err.Error()
+				t.updateInputModal()
+				return
+			}
 		}
 	}
 	t.closeModal()
@@ -1624,10 +1908,20 @@ func (t *Tree) SetOnStopSession(fn func(*Item)) {
 	t.onStopSession = fn
 }
 
-// SetOnBeforeDelete sets the callback invoked before deleting an item or
-// folder subtree. Returning an error keeps the tree unchanged.
+// SetOnBeforeDelete sets a side-effect-free preflight called before persistence.
+// Returning an error leaves the tree and runtime unchanged.
 func (t *Tree) SetOnBeforeDelete(fn func(*Item) error) {
 	t.onBeforeDelete = fn
+}
+
+// SetOnDeleteCommitted registers runtime cleanup after the tree deletion commits.
+func (t *Tree) SetOnDeleteCommitted(fn func(*Item) error) {
+	t.onDeleteCommitted = fn
+}
+
+// SetOnDeleteAborted clears resources prepared by the preflight when deletion aborts.
+func (t *Tree) SetOnDeleteAborted(fn func(*Item)) {
+	t.onDeleteAborted = fn
 }
 
 // SetOnThemeChange registers a callback invoked after a theme is selected.
@@ -1654,7 +1948,11 @@ func (t *Tree) SetTheme(id string) bool {
 	if t.Theme != resolved.ID {
 		t.Theme = resolved.ID
 	}
-	_ = t.SaveState()
+	if err := t.SaveState(); err != nil {
+		t.recordActionError(err)
+	} else {
+		t.lastActionError = nil
+	}
 	if t.onThemeChange != nil {
 		t.onThemeChange(resolved.ID)
 	}
@@ -1773,7 +2071,9 @@ func (t *Tree) SetActiveSessions(ids map[string]struct{}) error {
 	previous := t.activeSessions
 	t.SetActiveSessionsInMemory(ids)
 	if err := t.SaveState(); err != nil {
-		t.SetActiveSessionsInMemory(previous)
+		if !stateCommitWasApplied(err) {
+			t.SetActiveSessionsInMemory(previous)
+		}
 		return err
 	}
 	return nil

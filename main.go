@@ -153,7 +153,9 @@ func newApp(profile, piAgentDir string) (a *App) {
 		}
 	})
 
-	t.LoadState()
+	if err := t.LoadState(); err != nil {
+		log.Printf("automata: load tree state for profile %q: %v", profile, err)
+	}
 
 	sm := &stateManager{tab: tab}
 	tab.SetFocus(t)
@@ -185,6 +187,13 @@ func newApp(profile, piAgentDir string) (a *App) {
 				return err
 			}
 			return nil
+		})
+		cp.SetOnRemoveFamiliar(func(familiarID string, em *portalis.Emulator) error {
+			err := a.cleanupExternallyRemovedFamiliar(familiarID, em)
+			if err != nil {
+				log.Printf("external familiar removal cleanup for %q: %v", familiarID, err)
+			}
+			return err
 		})
 		cp.SetCreateFamiliarEmulator(func(familiarID string) (*portalis.Emulator, []string) {
 			return a.createFamiliarEmulator(familiarID)
@@ -271,8 +280,21 @@ func newApp(profile, piAgentDir string) (a *App) {
 		}
 	})
 
+	pendingDeleteCleanup := make(map[*tree.Item]*preparedDeleteRuntime)
 	t.SetOnBeforeDelete(func(item *tree.Item) error {
-		return a.cleanupDeletedTreeItem(item)
+		plan, err := a.prepareDeletedTreeRuntime(item)
+		if err == nil {
+			pendingDeleteCleanup[item] = plan
+		}
+		return err
+	})
+	t.SetOnDeleteAborted(func(item *tree.Item) {
+		delete(pendingDeleteCleanup, item)
+	})
+	t.SetOnDeleteCommitted(func(item *tree.Item) error {
+		plan := pendingDeleteCleanup[item]
+		delete(pendingDeleteCleanup, item)
+		return a.commitDeletedTreeRuntime(plan)
 	})
 
 	container.SetOnPlanWidthChange(func(w int) {
@@ -971,34 +993,44 @@ func deletedSessionIDs(t *tree.Tree, item *tree.Item) map[string]struct{} {
 	return ids
 }
 
-// cleanupDeletedTreeItem stops every runtime owned by a deleted chat or folder
-// subtree before the tree state is persisted. Job-stop failures are returned
-// before any emulator/cache mutation, so Tree deletion cannot leave a
-// half-cleaned runtime behind.
+// cleanupDeletedTreeItem runs the deletion runtime preflight and cleanup for
+// direct lifecycle callers. Production Tree deletion uses separate callbacks
+// so cleanup runs only after the tree snapshot commits.
 func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
-	if a.tree == nil || item == nil {
-		return nil
+	plan, err := a.prepareDeletedTreeRuntime(item)
+	if err != nil {
+		return err
 	}
-	ids := deletedSessionIDs(a.tree, item)
-	owners := make([]string, 0, len(ids))
-	for sessionID := range ids {
-		owners = append(owners, sessionID)
-	}
-	if err := a.stopSessionRuntimeIDs(owners, stopSessionOptions{
-		stopJobs:        true,
-		stopFamiliars:   true,
-		persistInactive: true,
-	}); err != nil {
+	err = a.commitDeletedTreeRuntime(plan)
+	if err != nil {
 		if !runtimeStopWasCommitted(err) || runtimeStopPersistenceFailed(err) {
 			return err
 		}
 		log.Printf("automata: delete runtime cleanup warning: %v", err)
 	}
-	for _, ownerID := range owners {
-		if a.currentSessionID == ownerID || strings.HasPrefix(a.currentSessionID, ownerID+"__") {
-			a.currentSessionID = ""
-			break
-		}
+	return nil
+}
+
+// cleanupExternallyRemovedFamiliar stops host runtime state after the familiar
+// registry has already been changed. It preserves both the registry and JSONL.
+func (a *App) cleanupExternallyRemovedFamiliar(familiarID string, em *portalis.Emulator) error {
+	stopErr := a.stopSessionRuntime(familiarID, stopSessionOptions{
+		stopJobs:        true,
+		persistInactive: true,
+	})
+	if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
+		return stopErr
+	}
+
+	var failures []error
+	if stopErr != nil {
+		failures = append(failures, stopErr)
+	}
+	if em != nil {
+		em.Stop()
+	}
+	if err := errors.Join(failures...); err != nil {
+		return &ui.CommittedCleanupError{Err: err}
 	}
 	return nil
 }

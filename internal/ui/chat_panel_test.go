@@ -182,6 +182,178 @@ func TestCheckFamiliarsDetectsNew(t *testing.T) {
 	}
 }
 
+func TestCheckFamiliarsRegistryErrorsPreserveKnownAndTabs(t *testing.T) {
+	invalidRegistries := []struct {
+		name string
+		data string
+	}{
+		{name: "malformed JSON", data: `{"id":`},
+		{name: "object instead of array", data: `{"id":"expert"}`},
+		{name: "null instead of array", data: `null`},
+		{name: "missing required fields", data: `[{"id":"expert"}]`},
+		{name: "duplicate id", data: `[{"id":"expert","sessionId":"one"},{"id":"expert","sessionId":"two"}]`},
+	}
+	for _, testCase := range invalidRegistries {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			sessionID := writeFamiliarsJSON(t, home, "", []FamiliarState{{ID: "expert", SessionID: "test__expert"}})
+			cp := &ChatPanel{
+				sessionID: sessionID,
+				known:     map[string]bool{"expert": true},
+				sessions: []*chatSession{
+					{name: "Main", panel: &fakePanel{}},
+					{name: "expert", panel: &fakePanel{}, familiarID: "test__expert"},
+				},
+			}
+			if err := os.WriteFile(cp.familiarStatePath(), []byte(testCase.data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if cmds := cp.checkFamiliars(); len(cmds) != 0 {
+				t.Fatalf("invalid registry produced %d commands", len(cmds))
+			}
+			if !cp.known["expert"] || len(cp.sessions) != 2 {
+				t.Fatalf("invalid registry removed familiar state: known=%v sessions=%v", cp.known, sessionNames(cp.sessions))
+			}
+			if cp.familiarError == "" {
+				t.Fatal("invalid registry did not set diagnostic")
+			}
+			if !strings.Contains(strip(cp.renderTabBar(100)), "! familiar registry:") {
+				t.Fatal("registry failure is not visible in tab bar")
+			}
+
+			if err := os.WriteFile(cp.familiarStatePath(), []byte(`[]`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cmds := cp.checkFamiliars()
+			if cp.familiarError != "" || len(cmds) != 1 {
+				t.Fatalf("valid retry failed to recover: error=%q commands=%d", cp.familiarError, len(cmds))
+			}
+		})
+	}
+}
+
+func TestCheckFamiliarsUnreadableRegistryPreservesKnownAndTabs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sessionID := writeFamiliarsJSON(t, home, "", []FamiliarState{{ID: "expert", SessionID: "test__expert"}})
+	cp := &ChatPanel{
+		sessionID: sessionID,
+		known:     map[string]bool{"expert": true},
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", panel: &fakePanel{}, familiarID: "test__expert"},
+		},
+	}
+	registryPath := cp.familiarStatePath()
+	if err := os.Remove(registryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(registryPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if cmds := cp.checkFamiliars(); len(cmds) != 0 {
+		t.Fatalf("unreadable registry produced %d commands", len(cmds))
+	}
+	if !cp.known["expert"] || len(cp.sessions) != 2 || cp.familiarError == "" {
+		t.Fatalf("unreadable registry changed state: known=%v sessions=%v error=%q", cp.known, sessionNames(cp.sessions), cp.familiarError)
+	}
+}
+
+func TestExternalFamiliarRemovalRetriesCleanupFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sessionID := writeFamiliarsJSON(t, home, "", []FamiliarState{{ID: "expert", SessionID: "test__expert"}})
+	cp := &ChatPanel{
+		sessionID:        sessionID,
+		known:            map[string]bool{"expert": true},
+		familiarSessions: map[string]string{"expert": "test__expert"},
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", panel: &fakePanel{}, familiarID: "test__expert"},
+		},
+		started: true,
+	}
+	registryPath := cp.familiarStatePath()
+	if err := os.WriteFile(registryPath, []byte(`[]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	preflightErr := errors.New("job identity is unknown")
+	calls := 0
+	cp.SetOnRemoveFamiliar(func(familiarID string, _ *portalis.Emulator) error {
+		calls++
+		if familiarID != "test__expert" {
+			t.Fatalf("cleanup familiar ID = %q", familiarID)
+		}
+		if calls == 1 {
+			return preflightErr
+		}
+		return nil
+	})
+
+	cmds := cp.checkFamiliars()
+	if len(cmds) != 1 {
+		t.Fatalf("initial removal commands = %d, want 1", len(cmds))
+	}
+	cp.Update(cmds[0]())
+	if !cp.known["expert"] || len(cp.sessions) != 2 || cp.removalPending["expert"] {
+		t.Fatalf("preflight failure lost tracking/tab: known=%v sessions=%v pending=%v", cp.known, sessionNames(cp.sessions), cp.removalPending)
+	}
+	if cp.familiarCleanupError == "" {
+		t.Fatal("preflight failure is not exposed")
+	}
+	if !strings.Contains(strip(cp.renderTabBar(100)), "cleanup: "+preflightErr.Error()) {
+		t.Fatal("preflight failure is not visible in tab bar")
+	}
+
+	cmds = cp.checkFamiliars()
+	if len(cmds) != 1 {
+		t.Fatalf("retry commands = %d, want 1", len(cmds))
+	}
+	cp.Update(cmds[0]())
+	if calls != 2 || cp.known["expert"] || len(cp.sessions) != 1 || cp.familiarCleanupError != "" {
+		t.Fatalf("retry did not commit cleanup: calls=%d known=%v sessions=%v error=%q", calls, cp.known, sessionNames(cp.sessions), cp.familiarCleanupError)
+	}
+	data, err := os.ReadFile(registryPath)
+	if err != nil || string(data) != `[]` {
+		t.Fatalf("externally updated registry was changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestExternalFamiliarRemovalDropsTabAfterCommittedWarning(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sessionID := writeFamiliarsJSON(t, home, "", []FamiliarState{{ID: "expert", SessionID: "test__expert"}})
+	cp := &ChatPanel{
+		sessionID:        sessionID,
+		known:            map[string]bool{"expert": true},
+		familiarSessions: map[string]string{"expert": "test__expert"},
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", panel: &fakePanel{}, familiarID: "test__expert"},
+		},
+		started: true,
+	}
+	if err := os.WriteFile(cp.familiarStatePath(), []byte(`[]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	warning := errors.New("active-state persistence failed after runtime stop")
+	cp.SetOnRemoveFamiliar(func(string, *portalis.Emulator) error {
+		return &CommittedCleanupError{Err: warning}
+	})
+	cmds := cp.checkFamiliars()
+	if len(cmds) != 1 {
+		t.Fatalf("removal commands = %d, want 1", len(cmds))
+	}
+	cp.Update(cmds[0]())
+	if cp.known["expert"] || len(cp.sessions) != 1 {
+		t.Fatalf("committed cleanup warning retained familiar: known=%v sessions=%v", cp.known, sessionNames(cp.sessions))
+	}
+	if !strings.Contains(cp.familiarCleanupError, warning.Error()) {
+		t.Fatalf("committed cleanup warning not retained: %q", cp.familiarCleanupError)
+	}
+}
+
 func TestCheckFamiliarsDetectsRemoved(t *testing.T) {
 	tempDir := t.TempDir()
 	sessionID := writeFamiliarsJSON(t, tempDir, "", []FamiliarState{})
@@ -441,6 +613,63 @@ func TestRenderTabBarFamiliarHasCloseButton(t *testing.T) {
 
 // TestHandleMouseFamiliarCloseButtonTriggersConfirm clicks the × region
 // of a familiar tab and verifies pendingCloseFamiliar is set.
+func TestHandleMouseUsesTerminalCellWidthsForUnicodeTabs(t *testing.T) {
+	for _, name := range []string{"界", "e\u0301"} {
+		t.Run(name, func(t *testing.T) {
+			cp := &ChatPanel{
+				sessions: []*chatSession{
+					{name: "Main", panel: &fakePanel{}},
+					{name: name, panel: &fakePanel{}, familiarID: "familiar-session"},
+					{name: "Target", panel: &fakePanel{}},
+				},
+				activeIdx: 0,
+				width:     80,
+				height:    10,
+			}
+			targetX := ansi.StringWidth(" Main ") + 1 + ansi.StringWidth(" "+name+" ") + ansi.StringWidth(" ×") + 1
+			cp.handleMouse(tea.MouseMsg{X: targetX, Y: 9, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+			if cp.activeIdx != 2 {
+				t.Fatalf("cell %d after %q selected tab %d, want third tab", targetX, name, cp.activeIdx)
+			}
+		})
+	}
+}
+
+func TestHandleMouseDoesNotHitTruncatedTabsOrWarningText(t *testing.T) {
+	t.Run("truncated tab", func(t *testing.T) {
+		cp := &ChatPanel{
+			sessions: []*chatSession{
+				{name: "Main", panel: &fakePanel{}},
+				{name: "Hidden", panel: &fakePanel{}, familiarID: "familiar-session"},
+			},
+			activeIdx: 0,
+			width:     17,
+			height:    10,
+		}
+		cp.handleMouse(tea.MouseMsg{X: 7, Y: 9, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+		if cp.activeIdx != 0 {
+			t.Fatalf("truncated tab was clickable: activeIdx=%d", cp.activeIdx)
+		}
+	})
+
+	t.Run("warning prefix", func(t *testing.T) {
+		cp := &ChatPanel{
+			sessions: []*chatSession{
+				{name: "Main", panel: &fakePanel{}},
+				{name: "Target", panel: &fakePanel{}},
+			},
+			activeIdx:     1,
+			width:         80,
+			height:        10,
+			familiarError: "registry is malformed",
+		}
+		cp.handleMouse(tea.MouseMsg{X: 0, Y: 9, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+		if cp.activeIdx != 1 {
+			t.Fatalf("warning text selected a tab: activeIdx=%d", cp.activeIdx)
+		}
+	})
+}
+
 func TestHandleMouseFamiliarCloseButtonTriggersConfirm(t *testing.T) {
 	cp := &ChatPanel{
 		sessions: []*chatSession{

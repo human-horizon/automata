@@ -149,6 +149,28 @@ func TestActionAtChat(t *testing.T) {
 	}
 }
 
+func TestActionAtUnicodeNamesUsesTerminalColumns(t *testing.T) {
+	for _, name := range []string{"界面", "e\u0301-chat"} {
+		t.Run(name, func(t *testing.T) {
+			tr := New()
+			chat := &Item{Name: name}
+			tr.root = append(tr.root, chat)
+			tr.rebuildFlat()
+			tr.hoverIdx = 0
+			tr.width = 50
+
+			line := stripANSI(tr.renderItemLine(chat, tr.width, false, true, branchInfo{}, 0))
+			menuX := visualIndexOf(line, "⋮")
+			if menuX < 0 {
+				t.Fatalf("menu icon not found in rendered line: %q", line)
+			}
+			if got := tr.actionAt(menuX, 1); got != "menu" {
+				t.Fatalf("actionAt visual column %d = %q, want menu; line=%q", menuX, got, line)
+			}
+		})
+	}
+}
+
 func TestConfirmModalButtonLine(t *testing.T) {
 	tr := New()
 	tr.width = 80

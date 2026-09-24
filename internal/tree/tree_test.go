@@ -852,8 +852,8 @@ func TestMoveSelectedOutSaveFailureRestoresTargetTreeBeforeRollback(t *testing.T
 	if tr.MoveSelectedOut() {
 		t.Fatal("MoveSelectedOut unexpectedly committed")
 	}
-	if saveCalls != 2 {
-		t.Fatalf("SaveState calls = %d, want 2", saveCalls)
+	if saveCalls != 1 {
+		t.Fatalf("SaveState calls = %d, want 1 (rollback does not rewrite the persisted snapshot)", saveCalls)
 	}
 	if !rollbackSawOldTree {
 		t.Fatal("external rollback did not observe the restored old tree")

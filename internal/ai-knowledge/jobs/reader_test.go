@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -470,6 +471,121 @@ func TestPruneStaleSessionMarksDeadJobs(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected 0 running jobs after prune, got %d", count)
+	}
+}
+
+func TestWriteJSONFailurePreservesPreviousMetadata(t *testing.T) {
+	jobDir := t.TempDir()
+	metaPath := filepath.Join(jobDir, "job.json")
+	original := []byte(`{"id":"job-1","status":"running","pid":0}`)
+	if err := os.WriteFile(metaPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := errors.New("injected atomic rename failure")
+	previousRename := renameJobMetadata
+	renameJobMetadata = func(string, string) error { return writeErr }
+	t.Cleanup(func() { renameJobMetadata = previousRename })
+
+	record := &JobRecord{ID: "job-1", Status: "exited", PID: 0}
+	if err := writeJSON(metaPath, record); !errors.Is(err, writeErr) {
+		t.Fatalf("writeJSON error = %v, want injected failure", err)
+	}
+	got, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("failed atomic write changed existing metadata: %s", got)
+	}
+	entries, err := os.ReadDir(jobDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "job.json" {
+		t.Fatalf("temporary metadata was not cleaned up: %#v", entries)
+	}
+}
+
+func TestWriteJSONPreservesJobExtensionAndUnknownMetadata(t *testing.T) {
+	jobDir := t.TempDir()
+	metaPath := filepath.Join(jobDir, "job.json")
+	original := []byte(`{"id":"job-1","command":"go test","cwd":"/workspace","pid":0,"status":"running","startedAt":"2026-09-24T10:00:00Z","exitCode":null,"sessionID":"chat__worker","taskId":"task-1","lifecycleEventStatus":"completed","lifecycleEventAt":"2026-09-24T10:01:00Z","agent":"tester","future":{"enabled":true}}`)
+	if err := os.WriteFile(metaPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	record.Status = "exited"
+	if err := writeJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"cwd":                  "/workspace",
+		"sessionID":            "chat__worker",
+		"taskId":               "task-1",
+		"lifecycleEventStatus": "completed",
+		"agent":                "tester",
+	} {
+		var got string
+		if err := json.Unmarshal(fields[key], &got); err != nil || got != want {
+			t.Errorf("%s = %q, error = %v, want %q", key, got, err, want)
+		}
+	}
+	if string(fields["exitCode"]) != "null" {
+		t.Errorf("exitCode = %s, want null", fields["exitCode"])
+	}
+	var future map[string]bool
+	if err := json.Unmarshal(fields["future"], &future); err != nil || !future["enabled"] {
+		t.Errorf("unknown metadata was lost: value=%s error=%v", fields["future"], err)
+	}
+	var status string
+	if err := json.Unmarshal(fields["status"], &status); err != nil || status != "exited" {
+		t.Errorf("status = %q, error = %v, want exited", status, err)
+	}
+}
+
+func TestPruneStaleSessionPreservesJobDirectoryOnMetadataWriteFailure(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const (
+		profile   = "metadata-write-failure"
+		sessionID = "metadata-write-failure__chat"
+	)
+	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", "job_stale")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(jobDir, "job.json")
+	original := []byte(`{"id":"job_stale","command":"x","pid":0,"status":"running"}`)
+	if err := os.WriteFile(metaPath, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := errors.New("injected metadata replacement failure")
+	previousRename := renameJobMetadata
+	renameJobMetadata = func(string, string) error { return writeErr }
+	t.Cleanup(func() { renameJobMetadata = previousRename })
+
+	if err := PruneStaleSessionForProfile(profile, sessionID); !errors.Is(err, writeErr) {
+		t.Fatalf("PruneStaleSessionForProfile error = %v, want injected failure", err)
+	}
+	got, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("job metadata was lost: %v", err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("failed prune changed job metadata: %s", got)
+	}
+	if _, err := os.Stat(jobDir); err != nil {
+		t.Fatalf("failed metadata write removed only job directory: %v", err)
 	}
 }
 

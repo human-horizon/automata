@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
+	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/HumanHorizon/automata/internal/ui"
 )
 
@@ -52,6 +53,12 @@ type preparedSessionJobs struct {
 	sessionID string
 	plan      *akjobs.KillPlan
 	injected  bool
+}
+
+type preparedDeleteRuntime struct {
+	ownerIDs   []string
+	sessionIDs []string
+	jobs       []preparedSessionJobs
 }
 
 func (a *App) killSessionForProfile(sessionID string) error {
@@ -107,6 +114,58 @@ func (a *App) persistRuntimeActiveSessions() error {
 		// Runtime has already changed; keep the UI snapshot aligned with reality.
 		a.tree.SetActiveSessionsInMemory(a.activeSessions)
 		return err
+	}
+	return nil
+}
+
+func (a *App) prepareDeletedTreeRuntime(item *tree.Item) (*preparedDeleteRuntime, error) {
+	if a.tree == nil || item == nil {
+		return &preparedDeleteRuntime{}, nil
+	}
+	ownerSet := deletedSessionIDs(a.tree, item)
+	ownerIDs := make([]string, 0, len(ownerSet))
+	for sessionID := range ownerSet {
+		ownerIDs = append(ownerIDs, sessionID)
+	}
+	sort.Strings(ownerIDs)
+	opts := stopSessionOptions{stopJobs: true, stopFamiliars: true, persistInactive: true}
+	sessionIDs := a.expandRuntimeSessionIDs(ownerIDs, opts)
+	jobs, err := a.prepareSessionJobs(sessionIDs)
+	if err != nil {
+		return nil, err
+	}
+	return &preparedDeleteRuntime{ownerIDs: ownerIDs, sessionIDs: sessionIDs, jobs: jobs}, nil
+}
+
+func (a *App) commitDeletedTreeRuntime(plan *preparedDeleteRuntime) error {
+	if plan == nil {
+		return fmt.Errorf("deleted tree runtime preflight is missing")
+	}
+	for _, sessionID := range plan.sessionIDs {
+		a.stopCachedEmulator(sessionID)
+		a.closeSessionWatcher(sessionID)
+		delete(a.runningSessions, sessionID)
+		delete(a.activeSessions, sessionID)
+	}
+	var failures []error
+	persistenceFailed := false
+	if err := a.persistRuntimeActiveSessions(); err != nil {
+		persistenceFailed = true
+		failures = append(failures, fmt.Errorf("persist inactive sessions after delete: %w", err))
+	}
+	for _, jobPlan := range plan.jobs {
+		if err := a.executeSessionJob(jobPlan, jobPlan.sessionID); err != nil {
+			failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
+		}
+	}
+	for _, ownerID := range plan.ownerIDs {
+		if a.currentSessionID == ownerID || strings.HasPrefix(a.currentSessionID, ownerID+"__") {
+			a.currentSessionID = ""
+			break
+		}
+	}
+	if err := errors.Join(failures...); err != nil {
+		return &stopSessionError{committed: true, persistence: persistenceFailed, err: err}
 	}
 	return nil
 }

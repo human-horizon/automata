@@ -18,14 +18,70 @@ import (
 
 // JobRecord matches the structure written by the pi job extension.
 type JobRecord struct {
-	ID        string `json:"id"`
-	Command   string `json:"command"`
-	PID       int    `json:"pid"`
-	Status    string `json:"status"`
-	StartedAt string `json:"startedAt"`
-	StoppedAt string `json:"stoppedAt,omitempty"`
-	ExitCode  *int   `json:"exitCode,omitempty"`
-	Agent     string `json:"agent,omitempty"`
+	ID                   string `json:"id"`
+	Command              string `json:"command"`
+	CWD                  string `json:"cwd,omitempty"`
+	PID                  int    `json:"pid"`
+	Status               string `json:"status"`
+	StartedAt            string `json:"startedAt"`
+	StoppedAt            string `json:"stoppedAt,omitempty"`
+	ExitCode             *int   `json:"exitCode,omitempty"`
+	SessionID            string `json:"sessionID,omitempty"`
+	TaskID               string `json:"taskId,omitempty"`
+	LifecycleEventStatus string `json:"lifecycleEventStatus,omitempty"`
+	LifecycleEventAt     string `json:"lifecycleEventAt,omitempty"`
+	Agent                string `json:"agent,omitempty"`
+	extraFields          map[string]json.RawMessage
+	exitCodePresent      bool
+}
+
+var jobRecordKnownFields = map[string]struct{}{
+	"id": {}, "command": {}, "cwd": {}, "pid": {}, "status": {},
+	"startedAt": {}, "stoppedAt": {}, "exitCode": {}, "sessionID": {},
+	"taskId": {}, "lifecycleEventStatus": {}, "lifecycleEventAt": {}, "agent": {},
+}
+
+func (record *JobRecord) UnmarshalJSON(data []byte) error {
+	type plainJobRecord JobRecord
+	var plain plainJobRecord
+	if err := json.Unmarshal(data, &plain); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	extra := make(map[string]json.RawMessage)
+	for key, value := range fields {
+		if _, known := jobRecordKnownFields[key]; !known {
+			extra[key] = value
+		}
+	}
+	*record = JobRecord(plain)
+	record.extraFields = extra
+	_, record.exitCodePresent = fields["exitCode"]
+	return nil
+}
+
+func (record JobRecord) MarshalJSON() ([]byte, error) {
+	type plainJobRecord JobRecord
+	data, err := json.Marshal(plainJobRecord(record))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for key, value := range record.extraFields {
+		if _, known := jobRecordKnownFields[key]; !known {
+			fields[key] = value
+		}
+	}
+	if record.exitCodePresent && record.ExitCode == nil {
+		fields["exitCode"] = json.RawMessage("null")
+	}
+	return json.Marshal(fields)
 }
 
 type Job struct {
@@ -151,13 +207,54 @@ func runPs(runner psRunner, pid int) (string, error) {
 	return runner(pid)
 }
 
-// writeJSON writes a JobRecord back to disk.
+var (
+	renameJobMetadata        = os.Rename
+	syncJobMetadataDirectory = func(path string) error {
+		directory, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		syncErr := directory.Sync()
+		closeErr := directory.Close()
+		return errors.Join(syncErr, closeErr)
+	}
+)
+
+// writeJSON atomically replaces a JobRecord and reports every durability error.
 func writeJSON(path string, rec *JobRecord) error {
 	data, err := json.MarshalIndent(rec, "", "    ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	dir := filepath.Dir(path)
+	temporary, err := os.CreateTemp(dir, ".job-metadata-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary job metadata: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o644); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("chmod temporary job metadata: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("write temporary job metadata: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sync temporary job metadata: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close temporary job metadata: %w", err)
+	}
+	if err := renameJobMetadata(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace job metadata: %w", err)
+	}
+	if err := syncJobMetadataDirectory(dir); err != nil {
+		return fmt.Errorf("job metadata committed but directory sync failed: %w", err)
+	}
+	return nil
 }
 
 // List returns running jobs for the given session. The function is read-only
@@ -242,6 +339,7 @@ func pruneStaleSessionForProfile(profile, sessionID string) error {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	var failures []error
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -260,10 +358,15 @@ func pruneStaleSessionForProfile(profile, sessionID string) error {
 		}
 		rec.Status = "exited"
 		rec.StoppedAt = now
-		_ = writeJSON(metaPath, &rec) // best-effort
-		_ = os.RemoveAll(jobDir)
+		if err := writeJSON(metaPath, &rec); err != nil {
+			failures = append(failures, fmt.Errorf("write stale job %s metadata: %w", rec.ID, err))
+			continue
+		}
+		if err := os.RemoveAll(jobDir); err != nil {
+			failures = append(failures, fmt.Errorf("remove stale job %s directory: %w", rec.ID, err))
+		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 // PruneStaleSession resolves a legacy session before mutation and fails closed
