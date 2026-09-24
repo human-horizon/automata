@@ -45,8 +45,8 @@
 - [x] Ошибка post-commit rename/move cleanup видна пользователю; committed operation остаётся committed.
 - [x] Ранее существующие canonical identity, fail-safe state, transactional rollback/commit, familiar cleanup, atomic settings/jobs, profile isolation, KillPlan/PID safety, legacy ambiguity, Kanban YAML preservation и watcher recovery сохранены.
 - [x] `gofmt -l .`, `go vet ./...`, `go mod verify`, указанные адресные пакеты, collapse E2E ×5, полный `go test ./... -count=1 -p 1`, `git diff --check` и две совпадающие reproducible build hashes успешны.
-- [ ] После коммита рабочее дерево чистое.
-- [ ] Изменения закоммичены прямо в `main`, push отправлен в `origin/main`; local HEAD и remote `main` SHA совпадают, GitHub Actions на этом SHA завершился `success`.
+- [x] После коммита рабочее дерево чистое.
+- [x] Изменения закоммичены прямо в `main`, push отправлен в `origin/main`; local HEAD и remote `main` SHA совпадают, GitHub Actions на этом SHA завершился `success`.
 
 ## Границы
 Работа только в `main`; без feature/corrective веток и PR. Не заменять зафиксированный tracked `automata` бинарник; для E2E использовать свежий временный binary через `AUTOMATA_BIN`. Не ослаблять ранее смёрженные hardening инварианты. Любое расширение scope требует отдельного согласования.
