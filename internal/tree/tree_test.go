@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/HumanHorizon/automata/internal/paths"
@@ -859,6 +860,39 @@ func TestMoveSelectedOutSaveFailureRestoresTargetTreeBeforeRollback(t *testing.T
 	}
 	if chat.parent != inner || len(outer.Children) != 1 || len(inner.Children) != 1 {
 		t.Fatal("tree was not restored after SaveState failure")
+	}
+}
+
+func TestSetActiveSessionsReturnsPersistenceErrorAndRestoresIndependentSnapshot(t *testing.T) {
+	tr := New()
+	previous := map[string]struct{}{"old": {}}
+	tr.SetActiveSessionsInMemory(previous)
+	delete(previous, "old")
+	previous["caller-mutated"] = struct{}{}
+	if !reflect.DeepEqual(tr.ActiveSessionIDs(), []string{"old"}) {
+		t.Fatalf("active sessions aliased input map = %v, want old", tr.ActiveSessionIDs())
+	}
+
+	tr.SetSaveStateFunc(func() error { return errors.New("injected active-session save failure") })
+	updated := map[string]struct{}{"new": {}}
+	if err := tr.SetActiveSessions(updated); err == nil {
+		t.Fatal("SetActiveSessions unexpectedly succeeded")
+	}
+	updated["caller-mutated"] = struct{}{}
+	if !reflect.DeepEqual(tr.ActiveSessionIDs(), []string{"old"}) {
+		t.Fatalf("active sessions after failed save = %v, want old", tr.ActiveSessionIDs())
+	}
+}
+
+func TestDeleteSaveFailureRestoresTree(t *testing.T) {
+	tr := New()
+	tr.AddChat("before")
+	item := tr.root[0]
+	tr.SetSaveStateFunc(func() error { return errors.New("injected delete save failure") })
+
+	tr.deleteItem(item)
+	if len(tr.root) != 1 || tr.root[0] != item {
+		t.Fatal("tree deletion was not rolled back after persistence failure")
 	}
 }
 

@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/charmbracelet/lipgloss"
@@ -98,6 +99,27 @@ func TestRenderCardWidthRespected(t *testing.T) {
 	for i, ln := range lines {
 		if w := lipgloss.Width(ln); w != 24 {
 			t.Errorf("line %d width = %d, want 24 (line=%q)", i, w, stripAnsi(ln))
+		}
+	}
+}
+
+func TestRenderCardUnicodeTruncationPreservesUTF8AndWidth(t *testing.T) {
+	c := newKanbanColPanel(0)
+	c.width = 12
+	c.parent = &KanbanPanel{sessionNames: map[string]string{"owner": "非常に長い名前"}}
+	task := kanban.Task{
+		Title:      "非常に長いタイトル🙂",
+		Status:     "progress",
+		AssignedTo: "owner",
+		Substatus:  "длинный статус",
+		Path:       "/tmp/x.md",
+	}
+	for i, line := range c.renderCard(task, false) {
+		if !utf8.ValidString(line) {
+			t.Fatalf("line %d is invalid UTF-8: %q", i, line)
+		}
+		if width := lipgloss.Width(line); width != c.width {
+			t.Fatalf("line %d width = %d, want %d: %q", i, width, c.width, stripAnsi(line))
 		}
 	}
 }

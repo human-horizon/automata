@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,9 +27,17 @@ import (
 // the UI is event-driven and consumes 0 CPU while idle.
 type knowledgeChangedMsg struct{}
 
+type knowledgeWatcherErrorMsg struct {
+	err error
+}
+
 // jobsChangedMsg is the analogous event for any change inside the session's
 // jobs/ directory (new job, completed job, status flip in job.json).
 type jobsChangedMsg struct{}
+
+type jobsWatcherErrorMsg struct {
+	err error
+}
 
 // sessionDataPath returns the per-session directory that owns status.json,
 // plans.json, settings.json and the jobs/ subdirectory. Notes live one level
@@ -104,8 +113,9 @@ func (k *KnowledgePanel) SetProfile(profile string) {
 	k.profile = profile
 	k.data = nil
 	k.jobs = nil
+	k.contextReader.Invalidate(k.profile, k.sessionID)
+	k.readSettings()
 	if k.sessionID != "" {
-		k.readSettings()
 		k.setupWatchers()
 	}
 }
@@ -136,6 +146,7 @@ func (k *KnowledgePanel) SetSession(sessionID string) {
 	k.sessionID = sessionID
 	k.data = nil
 	k.jobs = nil
+	k.contextReader.Invalidate(k.profile, sessionID)
 	k.readSettings()
 	k.closeWatchers()
 	if sessionID != "" {
@@ -213,6 +224,8 @@ func (k *KnowledgePanel) attachKnowledgeWatcherIfMissing() {
 
 // readSettings loads autoContinue and dual from settings.json.
 func (k *KnowledgePanel) readSettings() {
+	k.autoContinue = false
+	k.dual = false
 	if k.sessionID == "" {
 		return
 	}
@@ -225,10 +238,11 @@ func (k *KnowledgePanel) readSettings() {
 		AutoContinue bool `json:"autoContinue"`
 		Dual         bool `json:"dual"`
 	}
-	if json.Unmarshal(data, &s) == nil {
-		k.autoContinue = s.AutoContinue
-		k.dual = s.Dual
+	if err := json.Unmarshal(data, &s); err != nil {
+		return
 	}
+	k.autoContinue = s.AutoContinue
+	k.dual = s.Dual
 }
 
 // writeSettings saves autoContinue and dual to settings.json.
@@ -298,35 +312,26 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 		k.handleKey(msg)
 	case knowledgeChangedMsg:
 		k.knowledgeWatchPending = false
-		// The session-level watcher fires both for status/plans/settings
-		// changes AND for the creation of the jobs/ subdirectory (which
-		// happens when a new chat boots before its first job). When that
-		// happens we must (re)attach both watchers so subsequent session and
-		// job events reach the panel. Both operations are idempotent.
+		k.refreshKnowledgeData()
+	case knowledgeWatcherErrorMsg:
+		k.knowledgeWatchPending = false
+		if msg.err != nil {
+			log.Printf("automata: knowledge watcher failed: %v", msg.err)
+		}
+		k.resetKnowledgeWatcher()
 		k.attachKnowledgeWatcherIfMissing()
-		k.attachJobsWatcherIfMissing()
-		if d, err := k.contextReader.ReadForProfile(k.profile, k.sessionID); err == nil {
-			k.data = d
-		}
-		if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
-			k.jobs = j
-		}
-		k.readSettings()
-		k.refreshCurrentTask()
-		k.lastRefresh = time.Now()
+		k.refreshKnowledgeData()
 	case jobsChangedMsg:
 		k.jobsWatchPending = false
-		k.attachKnowledgeWatcherIfMissing()
-		k.attachJobsWatcherIfMissing()
-		// PruneStaleSession is the only place that flips running→exited in
-		// job.json. We deliberately do it before re-reading the list so the
-		// updated metadata is what the user sees.
-		if err := akjobs.PruneStaleSessionForProfile(k.profile, k.sessionID); err == nil {
-			if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
-				k.jobs = j
-			}
+		k.refreshJobsData()
+	case jobsWatcherErrorMsg:
+		k.jobsWatchPending = false
+		if msg.err != nil {
+			log.Printf("automata: jobs watcher failed: %v", msg.err)
 		}
-		k.lastRefresh = time.Now()
+		k.resetJobsWatcher()
+		k.attachJobsWatcherIfMissing()
+		k.refreshJobsData()
 	}
 
 	if k.knowledgeWatcher != nil && !k.knowledgeWatchPending {
@@ -343,6 +348,54 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 // attachJobsWatcherIfMissing ensures the per-session jobs/ subdirectory has
 // an active fsnotify watcher. Until jobs/ exists, the session directory is
 // watched so its creation is handled by the next event.
+func (k *KnowledgePanel) resetKnowledgeWatcher() {
+	if k.knowledgeWatcher != nil {
+		_ = k.knowledgeWatcher.Close()
+		k.knowledgeWatcher = nil
+	}
+	k.knowledgeWatcherPath = ""
+}
+
+func (k *KnowledgePanel) resetJobsWatcher() {
+	if k.jobsWatcher != nil {
+		_ = k.jobsWatcher.Close()
+		k.jobsWatcher = nil
+	}
+	k.jobsWatcherPath = ""
+}
+
+func (k *KnowledgePanel) refreshKnowledgeData() {
+	k.contextReader.Invalidate(k.profile, k.sessionID)
+	// The session-level watcher fires both for data changes and for creation
+	// of the jobs/ directory. Reattaching both watchers keeps the chain alive
+	// after either kind of event.
+	k.attachKnowledgeWatcherIfMissing()
+	k.attachJobsWatcherIfMissing()
+	if d, err := k.contextReader.ReadForProfile(k.profile, k.sessionID); err == nil {
+		k.data = d
+	}
+	if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
+		k.jobs = j
+	}
+	k.readSettings()
+	k.refreshCurrentTask()
+	k.lastRefresh = time.Now()
+}
+
+func (k *KnowledgePanel) refreshJobsData() {
+	k.attachKnowledgeWatcherIfMissing()
+	k.attachJobsWatcherIfMissing()
+	// PruneStaleSession is the only place that flips running→exited in
+	// job.json. We deliberately do it before re-reading the list so the
+	// updated metadata is what the user sees.
+	if err := akjobs.PruneStaleSessionForProfile(k.profile, k.sessionID); err == nil {
+		if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
+			k.jobs = j
+		}
+	}
+	k.lastRefresh = time.Now()
+}
+
 func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
 	if k.sessionID == "" {
 		return
@@ -382,14 +435,21 @@ func (k *KnowledgePanel) watchKnowledgeCmd() tea.Cmd {
 	}
 	w := k.knowledgeWatcher
 	return func() tea.Msg {
-		ev, ok := <-w.Events
-		if !ok {
-			return nil
-		}
-		if strings.HasSuffix(ev.Name, ".swp") {
+		select {
+		case ev, ok := <-w.Events:
+			if !ok {
+				return knowledgeWatcherErrorMsg{}
+			}
+			if strings.HasSuffix(ev.Name, ".swp") {
+				return knowledgeChangedMsg{}
+			}
 			return knowledgeChangedMsg{}
+		case err, ok := <-w.Errors:
+			if !ok {
+				return knowledgeWatcherErrorMsg{}
+			}
+			return knowledgeWatcherErrorMsg{err: err}
 		}
-		return knowledgeChangedMsg{}
 	}
 }
 
@@ -401,10 +461,18 @@ func (k *KnowledgePanel) watchJobsCmd() tea.Cmd {
 	}
 	w := k.jobsWatcher
 	return func() tea.Msg {
-		if _, ok := <-w.Events; !ok {
-			return nil
+		select {
+		case _, ok := <-w.Events:
+			if !ok {
+				return jobsWatcherErrorMsg{}
+			}
+			return jobsChangedMsg{}
+		case err, ok := <-w.Errors:
+			if !ok {
+				return jobsWatcherErrorMsg{}
+			}
+			return jobsWatcherErrorMsg{err: err}
 		}
-		return jobsChangedMsg{}
 	}
 }
 

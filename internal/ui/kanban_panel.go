@@ -3,6 +3,7 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/fsnotify/fsnotify"
 	warp "github.com/starframe-dev/warp"
 )
@@ -22,6 +24,11 @@ import (
 // in the kanban directory. We use a single-message Cmd that re-arms itself
 // after every event so the drain loop costs 0 CPU while idle.
 type kanbanChangedMsg struct{}
+
+type kanbanWatcherErrorMsg struct {
+	watcher *fsnotify.Watcher
+	err     error
+}
 
 // ChatInfo describes an AI chat session for the picker.
 type ChatInfo struct {
@@ -84,9 +91,10 @@ type KanbanPanel struct {
 	// directory is created) for file changes without polling.
 	watcher     *fsnotify.Watcher
 	watcherPath string
+	watchErrors <-chan error
 
 	// watchPending is true while a watchKanbanCmd is already in flight — it
-	// blocks on watcher.Events and is re-armed after every event.
+	// blocks on watcher event/error channels and is re-armed after each result.
 	watchPending bool
 
 	// onTaskAssigned is called when a task is assigned to a chat and may
@@ -180,6 +188,7 @@ func (k *KanbanPanel) setupWatcher() {
 	}
 	k.watcher = w
 	k.watcherPath = watchPath
+	k.watchErrors = w.Errors
 }
 
 // closeWatcher stops and releases the file watcher if one is attached.
@@ -189,6 +198,7 @@ func (k *KanbanPanel) closeWatcher() {
 		k.watcher = nil
 	}
 	k.watcherPath = ""
+	k.watchErrors = nil
 }
 
 // Close releases the Kanban filesystem watcher.
@@ -196,32 +206,39 @@ func (k *KanbanPanel) Close() {
 	k.closeWatcher()
 }
 
-// watchKanbanCmd blocks on the fsnotify event channel and returns a single
-// kanbanChangedMsg when an event arrives. Update re-arms it after every
-// event so the watcher stays alive without a busy heartbeat.
+// watchKanbanCmd blocks on fsnotify event/error channels and returns one
+// message. Update re-arms it after every result without a busy heartbeat.
 func (k *KanbanPanel) watchKanbanCmd() tea.Cmd {
 	if k.watcher == nil {
 		return nil
 	}
 	w := k.watcher
+	watchErrors := k.watchErrors
+	if watchErrors == nil {
+		watchErrors = w.Errors
+	}
 	return func() tea.Msg {
-		// Block until *any* fsnotify event lands. This is the only goroutine
-		// inside Bubble Tea we deliberately use, and it sleeps cheaply while
-		// idle — no CPU.
-		ev, ok := <-w.Events
-		if !ok {
-			return nil // watcher closed
-		}
-		if !strings.HasSuffix(ev.Name, ".md") {
-			// Ignore non-md noise (e.g. .swp files) — re-arm to wait for the
-			// next event.
+		// Block until the watcher reports a filesystem event or an error.
+		select {
+		case ev, ok := <-w.Events:
+			if !ok {
+				return kanbanWatcherErrorMsg{watcher: w, err: fmt.Errorf("fsnotify events channel closed")}
+			}
+			if !strings.HasSuffix(ev.Name, ".md") {
+				return kanbanChangedMsg{}
+			}
+			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+				return kanbanChangedMsg{}
+			}
 			return kanbanChangedMsg{}
+		case err, ok := <-watchErrors:
+			if !ok {
+				err = fmt.Errorf("fsnotify errors channel closed")
+			} else if err == nil {
+				err = fmt.Errorf("fsnotify returned an empty watcher error")
+			}
+			return kanbanWatcherErrorMsg{watcher: w, err: err}
 		}
-		if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
-			return kanbanChangedMsg{}
-		}
-		// Permission events, etc. — still a change worth picking up.
-		return kanbanChangedMsg{}
 	}
 }
 
@@ -326,6 +343,16 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 		k.setupWatcher()
 		k.reload()
 		k.lastRefresh = time.Now()
+		baseCmd = nil
+	case kanbanWatcherErrorMsg:
+		if msg.watcher == k.watcher {
+			k.watchPending = false
+			log.Printf("automata: kanban watcher failed: %v", msg.err)
+			k.closeWatcher()
+			k.setupWatcher()
+			k.reload()
+			k.lastRefresh = time.Now()
+		}
 		baseCmd = nil
 	default:
 		baseCmd = k.tab.Update(msg)
@@ -600,7 +627,7 @@ func (k *KanbanPanel) renderPicker(width, height int) string {
 	if k.assignmentErr != "" {
 		errLine := " Ошибка: " + k.assignmentErr
 		if lipgloss.Width(errLine) > width {
-			errLine = errLine[:width]
+			errLine = ansi.Truncate(errLine, width, "")
 		}
 		b.WriteString(errLine)
 		b.WriteString("\n")
@@ -614,7 +641,7 @@ func (k *KanbanPanel) renderPicker(width, height int) string {
 		}
 		line := fmt.Sprintf("  💬 %s", chat.Name)
 		if lipgloss.Width(line) > width {
-			line = line[:width]
+			line = ansi.Truncate(line, width, "")
 		}
 		b.WriteString(style.Render(line))
 		b.WriteString("\n")
@@ -861,9 +888,10 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	wrapLine := func(content string) string {
 		// Pad/truncate the visible content to fit inside the card.
 		if lipgloss.Width(content) > inner {
-			content = content[:inner]
+			content = ansi.Truncate(content, inner, "…")
 		}
-		pad := strings.Repeat(" ", inner-lipgloss.Width(content))
+		contentWidth := lipgloss.Width(content)
+		pad := strings.Repeat(" ", max(0, inner-contentWidth))
 		styled := bgStyle.Render(content + pad)
 		left := borderStyle.Render("│")
 		right := borderStyle.Render("│")
@@ -877,7 +905,7 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	}
 	title := task.Title
 	if lipgloss.Width(title) > titleMax {
-		title = title[:titleMax]
+		title = ansi.Truncate(title, titleMax, "")
 	}
 	titlePad := strings.Repeat(" ", titleMax-lipgloss.Width(title))
 	del := " ×"
@@ -898,8 +926,9 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 			}
 		}
 		assigned := fmt.Sprintf("  👤 %s", name)
-		if lipgloss.Width(assigned) > inner {
-			assigned = assigned[:inner]
+		assignedWidth := max(0, inner-styles.assigned.GetHorizontalPadding())
+		if lipgloss.Width(assigned) > assignedWidth {
+			assigned = ansi.Truncate(assigned, assignedWidth, "")
 		}
 		styled := styles.assigned.Render(assigned)
 		// Pad to fill the inner width after styling.
@@ -916,8 +945,9 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	// has been recorded. Mirrors the tree's status column.
 	if task.Substatus != "" {
 		sub := fmt.Sprintf("  ↳ %s", task.Substatus)
-		if lipgloss.Width(sub) > inner {
-			sub = sub[:inner]
+		subWidth := max(0, inner-styles.substatus.GetHorizontalPadding())
+		if lipgloss.Width(sub) > subWidth {
+			sub = ansi.Truncate(sub, subWidth, "")
 		}
 		styled := styles.substatus.Render(sub)
 		visW := lipgloss.Width(styled)
@@ -953,6 +983,9 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	href := "file://" + task.Path
 	hyperlinked := fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", href, label)
 	link := styles.cardPath.Render(hyperlinked)
+	if lipgloss.Width(link) > inner {
+		link = ansi.Truncate(link, inner, "")
+	}
 	visW := lipgloss.Width(link)
 	pad := ""
 	if visW < inner {
@@ -1333,8 +1366,12 @@ func (voidPanel) View(width, height int) string { return "" }
 func (voidPanel) Update(msg tea.Msg) tea.Cmd    { return nil }
 
 func padOrTruncate(s string, w int) string {
-	if lipgloss.Width(s) >= w {
-		return s[:w]
+	if w <= 0 {
+		return ""
 	}
-	return s + strings.Repeat(" ", w-lipgloss.Width(s))
+	visibleWidth := lipgloss.Width(s)
+	if visibleWidth > w {
+		return ansi.Truncate(s, w, "")
+	}
+	return s + strings.Repeat(" ", w-visibleWidth)
 }

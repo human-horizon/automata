@@ -199,15 +199,41 @@ func FamiliarsJSONLPath(profile, sessionID string) string {
 // the latter as a clean state.
 func ClearFamiliarsJSONL(profile, sessionID string) error {
 	path := FamiliarsJSONLPath(profile, sessionID)
-	dir := filepath.Dir(path)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Dir(path)); os.IsNotExist(err) {
 		return nil
+	} else if err != nil {
+		return err
 	}
-	return os.WriteFile(path, []byte("[]"), 0644)
+	return writeFileAtomic(path, []byte("[]\n"), 0o644)
 }
 
-// FamiliarEntry mirrors the JSON shape stored in familiars.json. Only the
-// fields we care about are parsed; anything else is dropped on rewrite.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".automata-atomic-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(mode); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+// FamiliarEntry mirrors the known fields in familiars.json. Cleanup and
+// rename operations use raw JSON records so unknown metadata survives writes.
 type FamiliarEntry struct {
 	ID        string `json:"id"`
 	SessionID string `json:"sessionId"`
@@ -227,21 +253,27 @@ func RemoveFamiliar(profile, sessionID, familiarID string) error {
 		}
 		return err
 	}
-	var entries []FamiliarEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+	var records []map[string]json.RawMessage
+	if err := json.Unmarshal(data, &records); err != nil {
 		// File exists but isn't a JSON array — leave it alone rather
 		// than silently trampling it. Surface the error so the caller
 		// can log it.
 		return fmt.Errorf("familiars.json at %s is not a JSON array: %w", path, err)
 	}
-	kept := make([]FamiliarEntry, 0, len(entries))
-	for _, e := range entries {
-		if e.SessionID == familiarID {
+	kept := make([]map[string]json.RawMessage, 0, len(records))
+	for _, record := range records {
+		var sessionID string
+		if raw, ok := record["sessionId"]; ok {
+			if err := json.Unmarshal(raw, &sessionID); err != nil {
+				return fmt.Errorf("decode familiar session id in %s: %w", path, err)
+			}
+		}
+		if sessionID == familiarID {
 			continue
 		}
-		kept = append(kept, e)
+		kept = append(kept, record)
 	}
-	if len(kept) == len(entries) {
+	if len(kept) == len(records) {
 		// Nothing to remove — leave the file untouched.
 		return nil
 	}
@@ -249,5 +281,5 @@ func RemoveFamiliar(profile, sessionID, familiarID string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, out, 0644)
+	return writeFileAtomic(path, append(out, '\n'), 0o644)
 }

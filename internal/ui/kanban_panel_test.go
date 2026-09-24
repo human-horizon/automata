@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -353,6 +354,63 @@ func TestKanbanWatchCmdReactsToFsnotifyEvent(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("watchKanbanCmd did not unblock after file change")
+	}
+}
+
+func TestKanbanWatcherErrorRecreatesWatcherAndReloads(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		closeErrors bool
+	}{
+		{name: "reported error"},
+		{name: "closed error channel", closeErrors: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AI_DATA_HOME", t.TempDir())
+			profile := "watch-error"
+			domain := "watch-error-domain"
+			dir := kanban.KanbanDir(domain, profile)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "task.md"), []byte("---\ntitle: Reloaded\nstatus: todo\n---\nbody\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			k := NewKanbanPanel(profile)
+			defer k.Close()
+			k.SetDomain(domain)
+			oldWatcher := k.watcher
+			if oldWatcher == nil {
+				t.Fatal("watcher was not initialized")
+			}
+			k.tasks = nil
+			watchErrors := make(chan error, 1)
+			if test.closeErrors {
+				close(watchErrors)
+			} else {
+				watchErrors <- errors.New("injected watcher failure")
+			}
+			k.watchErrors = watchErrors
+			k.watchPending = true
+
+			msg := k.watchKanbanCmd()()
+			watcherError, ok := msg.(kanbanWatcherErrorMsg)
+			if !ok || watcherError.err == nil {
+				t.Fatalf("watch command returned %T (%v), want watcher error", msg, msg)
+			}
+			k.Update(watcherError)
+
+			if k.watcher == nil || k.watcher == oldWatcher {
+				t.Fatal("watcher error did not create a fresh watcher")
+			}
+			if len(k.tasks) != 1 || k.tasks[0].Title != "Reloaded" {
+				t.Fatalf("tasks after watcher recovery = %+v, want reloaded task", k.tasks)
+			}
+			if !k.watchPending {
+				t.Fatal("watcher was not re-armed after recovery")
+			}
+		})
 	}
 }
 

@@ -516,7 +516,9 @@ func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot, persist bool)
 	if a.tree != nil {
 		a.tree.SetActiveSessionsInMemory(a.activeSessions)
 		if persist {
-			_ = a.tree.SaveState()
+			if err := a.tree.SaveState(); err != nil {
+				return fmt.Errorf("persist restored active sessions: %w", err)
+			}
 		}
 		a.pendingRuntimeCmds = append(a.pendingRuntimeCmds, a.syncSessionWatchers()...)
 	}

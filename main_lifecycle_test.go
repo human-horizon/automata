@@ -57,6 +57,98 @@ func TestStopSessionRuntimeClearsOwnerAndFamiliarState(t *testing.T) {
 	}
 }
 
+func TestStopSessionRuntimeSurfacesActiveSessionPersistenceFailure(t *testing.T) {
+	tr := tree.New()
+	const sessionID = "owner"
+	tr.SetActiveSessionsInMemory(map[string]struct{}{sessionID: {}})
+	persistErr := errors.New("active state unavailable")
+	tr.SetSaveStateFunc(func() error { return persistErr })
+	app := &App{
+		tree:                  tr,
+		profile:               "test",
+		activeSessions:        map[string]struct{}{sessionID: {}},
+		runningSessions:       map[string]struct{}{sessionID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "owner", "", nil)},
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchPending:   make(map[string]bool),
+	}
+
+	err := app.stopSessionRuntime(sessionID, stopSessionOptions{persistInactive: true})
+	if err == nil || !runtimeStopWasCommitted(err) || !errors.Is(err, persistErr) {
+		t.Fatalf("persistence error = %v, committed=%v", err, runtimeStopWasCommitted(err))
+	}
+	if _, ok := app.emulatorCache[sessionID]; ok {
+		t.Fatal("runtime emulator remained after committed stop")
+	}
+	if _, ok := app.activeSessions[sessionID]; ok {
+		t.Fatal("active session remained after committed stop")
+	}
+	if _, ok := app.runningSessions[sessionID]; ok {
+		t.Fatal("running session remained after committed stop")
+	}
+	if got := tr.ActiveSessionIDs(); len(got) != 0 {
+		t.Fatalf("Tree active sessions after committed stop = %v, want none", got)
+	}
+}
+
+func TestStopSessionRuntimeStopsPreparedJobsAfterPersistenceFailure(t *testing.T) {
+	tr := tree.New()
+	persistErr := errors.New("active state unavailable")
+	tr.SetSaveStateFunc(func() error { return persistErr })
+	const sessionID = "owner"
+	app := &App{
+		tree:            tr,
+		profile:         "test",
+		activeSessions:  map[string]struct{}{sessionID: {}},
+		runningSessions: map[string]struct{}{sessionID: {}},
+	}
+	jobErr := errors.New("job finalization failed")
+	jobCalls := 0
+	app.killSessionFn = func(string, string) error {
+		jobCalls++
+		return jobErr
+	}
+
+	err := app.stopSessionRuntime(sessionID, stopSessionOptions{stopJobs: true, persistInactive: true})
+	if err == nil || !runtimeStopWasCommitted(err) || !runtimeStopPersistenceFailed(err) {
+		t.Fatalf("cleanup error = %v, want committed persistence failure", err)
+	}
+	if !errors.Is(err, persistErr) || !errors.Is(err, jobErr) {
+		t.Fatalf("cleanup error = %v, want both persistence and job failures", err)
+	}
+	if jobCalls != 1 {
+		t.Fatalf("job finalization calls = %d, want one after runtime commit", jobCalls)
+	}
+}
+
+func TestCleanupDeletedTreeItemAbortsOnActiveSessionPersistenceFailure(t *testing.T) {
+	tr := tree.New()
+	tr.Profile = "test"
+	tr.AddChat("chat")
+	item := tr.Root()[0]
+	tr.SetSaveStateFunc(func() error { return errors.New("active state unavailable") })
+	sessionID := tr.SessionKeyOf(item)
+	app := &App{
+		tree:                  tr,
+		profile:               "test",
+		currentSessionID:      sessionID,
+		activeSessions:        map[string]struct{}{sessionID: {}},
+		runningSessions:       map[string]struct{}{sessionID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "chat", "", nil)},
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchPending:   make(map[string]bool),
+	}
+
+	if err := app.cleanupDeletedTreeItem(item); err == nil {
+		t.Fatal("cleanup unexpectedly succeeded")
+	}
+	if tr.Root()[0] != item {
+		t.Fatal("tree item was removed after active-session persistence failure")
+	}
+}
+
 func TestCleanupDeletedTreeItemLeavesRuntimeOnJobPreflightFailure(t *testing.T) {
 	tr := tree.New()
 	tr.Profile = "test"

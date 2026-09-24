@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -21,6 +22,31 @@ type FamiliarState struct {
 	ID        string `json:"id"`
 	SessionID string `json:"sessionId"`
 	Created   string `json:"created"`
+}
+
+// CommittedCleanupError reports a cleanup warning after the familiar runtime
+// has already been stopped. The tab can be removed while the caller logs it.
+type CommittedCleanupError struct {
+	Err error
+}
+
+func (e *CommittedCleanupError) Error() string {
+	if e == nil || e.Err == nil {
+		return "familiar cleanup committed with warnings"
+	}
+	return e.Err.Error()
+}
+
+func (e *CommittedCleanupError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func isCommittedCleanupError(err error) bool {
+	var committedErr *CommittedCleanupError
+	return errors.As(err, &committedErr)
 }
 
 // chatSession represents one tab in the chat panel.
@@ -55,9 +81,8 @@ type ChatPanel struct {
 	onClearSession func(sessionID, cwd string) tea.Cmd
 
 	// onCloseFamiliar is called when the user confirms closing a familiar via the
-	// × button on a familiar tab. The handler must complete host cleanup before
-	// the panel removes the tab and returns an error when fail-closed preflight
-	// rejects the operation.
+	// × button on a familiar tab. An uncommitted cleanup error keeps the tab;
+	// CommittedCleanupError removes it while preserving the warning for the caller.
 	//
 	// Synchronous (no tea.Cmd return) on purpose: Modal.Action callbacks and
 	// the Y-key path both fire the close, and Modal.Action is a plain
@@ -428,7 +453,7 @@ func (cp *ChatPanel) openCloseFamiliarModal(name string) {
 
 // closeFamiliarByID asks the host (main.go via onCloseFamiliar) to clean up
 // the underlying emulator, JSONL, and familiars.json entry before removing
-// the tab. A failed host preflight leaves the tab and emulator untouched.
+// the tab. An uncommitted host failure leaves the tab and emulator untouched.
 func (cp *ChatPanel) closeFamiliarByID(familiarID string) {
 	var (
 		idx = -1
@@ -445,7 +470,7 @@ func (cp *ChatPanel) closeFamiliarByID(familiarID string) {
 		return
 	}
 	if cp.onCloseFamiliar != nil {
-		if err := cp.onCloseFamiliar(familiarID, em); err != nil {
+		if err := cp.onCloseFamiliar(familiarID, em); err != nil && !isCommittedCleanupError(err) {
 			return
 		}
 	}

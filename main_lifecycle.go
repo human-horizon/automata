@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 
@@ -18,8 +19,9 @@ type stopSessionOptions struct {
 }
 
 type stopSessionError struct {
-	committed bool
-	err       error
+	committed   bool
+	persistence bool
+	err         error
 }
 
 func (e *stopSessionError) Error() string {
@@ -39,6 +41,11 @@ func (e *stopSessionError) Unwrap() error {
 func runtimeStopWasCommitted(err error) bool {
 	var stopErr *stopSessionError
 	return errors.As(err, &stopErr) && stopErr.committed
+}
+
+func runtimeStopPersistenceFailed(err error) bool {
+	var stopErr *stopSessionError
+	return errors.As(err, &stopErr) && stopErr.persistence
 }
 
 type preparedSessionJobs struct {
@@ -92,6 +99,18 @@ func (a *App) executeSessionJob(jobPlan preparedSessionJobs, sessionID string) e
 	return jobPlan.plan.ExecuteForProfile(a.profile, sessionID)
 }
 
+func (a *App) persistRuntimeActiveSessions() error {
+	if a.tree == nil {
+		return nil
+	}
+	if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
+		// Runtime has already changed; keep the UI snapshot aligned with reality.
+		a.tree.SetActiveSessionsInMemory(a.activeSessions)
+		return err
+	}
+	return nil
+}
+
 func (a *App) stopSessionRuntime(sessionID string, opts stopSessionOptions) error {
 	return a.stopSessionRuntimeIDs([]string{sessionID}, opts)
 }
@@ -115,21 +134,24 @@ func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) 
 			delete(a.activeSessions, sessionID)
 		}
 	}
-	if opts.persistInactive && a.tree != nil {
-		a.tree.SetActiveSessions(a.activeSessions)
+	var failures []error
+	persistenceFailed := false
+	if opts.persistInactive {
+		if err := a.persistRuntimeActiveSessions(); err != nil {
+			persistenceFailed = true
+			failures = append(failures, fmt.Errorf("persist inactive sessions: %w", err))
+		}
 	}
 
-	if !opts.stopJobs {
-		return nil
-	}
-	var failures []error
-	for _, jobPlan := range prepared {
-		if err := a.executeSessionJob(jobPlan, jobPlan.sessionID); err != nil {
-			failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
+	if opts.stopJobs {
+		for _, jobPlan := range prepared {
+			if err := a.executeSessionJob(jobPlan, jobPlan.sessionID); err != nil {
+				failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
+			}
 		}
 	}
 	if err := errors.Join(failures...); err != nil {
-		return &stopSessionError{committed: true, err: err}
+		return &stopSessionError{committed: true, persistence: persistenceFailed, err: err}
 	}
 	return nil
 }
@@ -268,5 +290,7 @@ func (a *App) stopAllRuntimeSessions(persistInactive bool) {
 	for sessionID := range a.sessionWatchers {
 		add(sessionID)
 	}
-	_ = a.stopSessionRuntimeIDs(ids, stopSessionOptions{persistInactive: persistInactive})
+	if err := a.stopSessionRuntimeIDs(ids, stopSessionOptions{persistInactive: persistInactive}); err != nil {
+		log.Printf("automata: stop all runtime sessions: %v", err)
+	}
 }

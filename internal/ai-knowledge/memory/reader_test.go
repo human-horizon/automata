@@ -138,6 +138,35 @@ func TestCachedReaderReadsSections(t *testing.T) {
 	}
 }
 
+func TestReadMissingNotesIsEmptyButCorruptionIsError(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	const domain = "memory-errors"
+
+	missing, err := Read("", domain)
+	if err != nil {
+		t.Fatalf("missing notes returned error: %v", err)
+	}
+	if len(missing.Notes) != 0 {
+		t.Fatalf("missing notes = %+v, want empty", missing.Notes)
+	}
+
+	domainDir := paths.DomainDir("", domain)
+	if err := os.MkdirAll(domainDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(domainDir, "notes.json")
+	if err := os.WriteFile(path, []byte("not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Read("", domain); err == nil {
+		t.Fatal("invalid notes unexpectedly returned empty success")
+	}
+	if _, err := NewCachedReader().Read("", domain); err == nil {
+		t.Fatal("cached invalid notes unexpectedly returned empty success")
+	}
+}
+
 func TestReadUsesCanonicalUnicodeProfileAndIgnoresLegacyPath(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("AI_DATA_HOME", dataHome)
@@ -177,32 +206,19 @@ func TestReadUsesCanonicalUnicodeProfileAndIgnoresLegacyPath(t *testing.T) {
 	}
 }
 
-func TestReadEmptyProfileUsesAIProfileOrDefault(t *testing.T) {
-	tests := []struct {
-		name           string
-		aiProfile      string
-		fixtureProfile string
-		title          string
-	}{
-		{name: "AI_PROFILE", aiProfile: "configured-profile", fixtureProfile: "configured-profile", title: "From environment"},
-		{name: "default", fixtureProfile: "", title: "From default"},
+func TestReadEmptyProfileAlwaysUsesDefault(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("AI_PROFILE", "configured-profile")
+	const domain = "memory"
+	writeNotesFixture(t, dataHome, "", domain, `[{"title":"From default"}]`)
+	writeNotesFixture(t, dataHome, "configured-profile", domain, `[{"title":"From environment"}]`)
+
+	data, err := Read("", domain)
+	if err != nil {
+		t.Fatalf("Read returned error: %v", err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dataHome := t.TempDir()
-			t.Setenv("AI_DATA_HOME", dataHome)
-			t.Setenv("AI_PROFILE", tt.aiProfile)
-			const domain = "memory"
-			writeNotesFixture(t, dataHome, tt.fixtureProfile, domain, `[{"title":"`+tt.title+`"}]`)
-
-			data, err := Read("", domain)
-			if err != nil {
-				t.Fatalf("Read returned error: %v", err)
-			}
-			if len(data.Notes) != 1 || data.Notes[0].Title != tt.title {
-				t.Fatalf("expected %q notes, got %+v", tt.title, data.Notes)
-			}
-		})
+	if len(data.Notes) != 1 || data.Notes[0].Title != "From default" {
+		t.Fatalf("expected default notes, got %+v", data.Notes)
 	}
 }

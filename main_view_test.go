@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -92,11 +95,19 @@ func TestClearRestartsChatWithConfiguredPiAgentDir(t *testing.T) {
 		t.Fatalf("started session = %v, want %q", restarted, sessionID)
 	}
 
-	t.Log("И: эмулятор несёт PI_CODING_AGENT_DIR в startEnv, так что любой Start сохраняет окружение")
-	wantEnv := "PI_CODING_AGENT_DIR=" + piAgentDir
+	t.Log("И: эмулятор несёт PI_CODING_AGENT_DIR и canonical default profile в startEnv")
 	gotEnv := restarted.StartEnv()
-	if len(gotEnv) != 1 || gotEnv[0] != wantEnv {
-		t.Fatalf("start environment = %#v, want [%q]", gotEnv, wantEnv)
+	for _, wantEnv := range []string{
+		"PI_CODING_AGENT_DIR=" + piAgentDir,
+		"AI_PROFILE=default",
+		"AUTOMATA_PROFILE=default",
+	} {
+		if !containsString(gotEnv, wantEnv) {
+			t.Fatalf("start environment = %#v, missing %q", gotEnv, wantEnv)
+		}
+	}
+	if len(gotEnv) != 3 {
+		t.Fatalf("start environment = %#v, want agent dir and both profile variables", gotEnv)
 	}
 }
 
@@ -120,9 +131,10 @@ func TestPiLaunchSetsAgentDirAndProfile(t *testing.T) {
 		t.Fatalf("args = %#v, want [--session-id getic__chat]", args)
 	}
 
-	t.Log("И: env содержит PI_CODING_AGENT_DIR=getic и AUTOMATA_PROFILE=getic")
+	t.Log("И: env содержит PI_CODING_AGENT_DIR=getic и обе canonical profile variables")
 	want := map[string]bool{
 		"PI_CODING_AGENT_DIR=" + geticDir: false,
+		"AI_PROFILE=getic":                false,
 		"AUTOMATA_PROFILE=getic":          false,
 	}
 	for _, e := range env {
@@ -139,6 +151,8 @@ func TestPiLaunchSetsAgentDirAndProfile(t *testing.T) {
 
 func TestPiLaunchHonorsPiCmdOverride(t *testing.T) {
 	t.Setenv("PI_CMD", "/bin/bash")
+	t.Setenv("AI_PROFILE", "wrong-profile")
+	t.Setenv("AUTOMATA_PROFILE", "wrong-profile")
 	app := &App{profile: "Keller", piAgentDir: "/whatever"}
 
 	t.Log("Когда: задан PI_CMD (e2e-режим)")
@@ -153,6 +167,58 @@ func TestPiLaunchHonorsPiCmdOverride(t *testing.T) {
 			t.Fatalf("env must not contain PI_CODING_AGENT_DIR with PI_CMD override, got %#v", env)
 		}
 	}
+	for _, want := range []string{"AI_PROFILE=keller", "AUTOMATA_PROFILE=keller"} {
+		if !containsString(env, want) {
+			t.Fatalf("PI_CMD environment = %#v, missing canonical profile %q", env, want)
+		}
+	}
+}
+
+func TestPiLaunchAlwaysSetsCanonicalProfileEnvironment(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile string
+		want    string
+	}{
+		{name: "default", profile: "", want: "default"},
+		{name: "named", profile: "Getic", want: "getic"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("PI_CMD", "/bin/bash")
+			t.Setenv("AI_PROFILE", "wrong-profile")
+			t.Setenv("AUTOMATA_PROFILE", "wrong-profile")
+			app := &App{profile: test.profile}
+			cmd, _, env := app.piLaunch("chat")
+			if cmd != "/bin/bash" {
+				t.Fatalf("cmd = %q, want PI_CMD /bin/bash", cmd)
+			}
+			for _, key := range []string{"AI_PROFILE", "AUTOMATA_PROFILE"} {
+				wantEnv := key + "=" + test.want
+				count := 0
+				for _, item := range env {
+					if strings.HasPrefix(item, key+"=") {
+						count++
+						if item != wantEnv {
+							t.Fatalf("profile environment = %q, want %q", item, wantEnv)
+						}
+					}
+				}
+				if count != 1 {
+					t.Fatalf("%s entries = %d in %#v, want exactly one", key, count, env)
+				}
+			}
+		})
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCreateChatEmulatorWithoutPiCommandReturnsNil(t *testing.T) {
@@ -228,6 +294,49 @@ func TestRouteCachedEmulatorMessageHandlesAllPTYMessages(t *testing.T) {
 	}
 }
 
+func TestPtyReadyKeepsTreeActiveWhenPersistenceFails(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "ready-save-failure"
+	persistErr := errors.New("active state unavailable")
+	tr := tree.New()
+	tr.SetSaveStateFunc(func() error { return persistErr })
+
+	logs := captureLogOutput(t)
+	app := &App{
+		tree:            tr,
+		activeSessions:  make(map[string]struct{}),
+		runningSessions: make(map[string]struct{}),
+		emulatorCache: map[string]*portalis.Emulator{
+			sessionID: portalis.NewEmulator(sessionID, "Ready", "/bin/sh", nil),
+		},
+	}
+
+	if _, handled := app.routeCachedEmulatorMessage(portalis.PtyReadyMsg{SessionID: sessionID}); !handled {
+		t.Fatal("ready was not routed to cached emulator")
+	}
+	if _, active := app.activeSessions[sessionID]; !active {
+		t.Fatal("App did not retain the started session")
+	}
+	if _, running := app.runningSessions[sessionID]; !running {
+		t.Fatal("runningSessions did not retain the started session")
+	}
+	if got := tr.ActiveSessionIDs(); !reflect.DeepEqual(got, []string{sessionID}) {
+		t.Fatalf("Tree active sessions = %v, want [%s] after persistence failure", got, sessionID)
+	}
+	if !strings.Contains(logs.String(), persistErr.Error()) {
+		t.Fatalf("persistence error was not logged: %q", logs.String())
+	}
+}
+
+func captureLogOutput(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	return &output
+}
+
 func TestPtyReadyActivatesSessionOnlyAfterReady(t *testing.T) {
 	const sessionID = "ready-gated"
 	app := &App{
@@ -250,6 +359,56 @@ func TestPtyReadyActivatesSessionOnlyAfterReady(t *testing.T) {
 	}
 	if _, active := app.activeSessions[sessionID]; !active {
 		t.Fatal("session did not become active after PtyReadyMsg")
+	}
+}
+
+func TestAssignedTaskStartKeepsTreeActiveWhenPersistenceFails(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("PI_CMD", "/bin/sh")
+	tr := tree.New()
+	tr.Profile = "task-start"
+	tr.AddChat("assigned-chat")
+	item := tr.Root()[0]
+	sessionID := tr.SessionKeyOf(item)
+	persistErr := errors.New("active state unavailable")
+	tr.SetSaveStateFunc(func() error { return persistErr })
+
+	logs := captureLogOutput(t)
+	app := &App{
+		tree:            tr,
+		profile:         tr.Profile,
+		piAgentDir:      t.TempDir(),
+		activeSessions:  make(map[string]struct{}),
+		runningSessions: make(map[string]struct{}),
+		emulatorCache:   make(map[string]*portalis.Emulator),
+	}
+	started := false
+	app.startEmulatorSyncFn = func(em *portalis.Emulator, _ []string) error {
+		if em.SessionID != sessionID {
+			t.Fatalf("started session = %q, want %q", em.SessionID, sessionID)
+		}
+		started = true
+		return nil
+	}
+
+	_ = app.startAssignedTaskSession(sessionID)
+	if !started {
+		t.Fatal("task assignment did not start its PTY")
+	}
+	if _, ok := app.emulatorCache[sessionID]; !ok {
+		t.Fatal("started task session is missing from emulator cache")
+	}
+	if _, ok := app.runningSessions[sessionID]; !ok {
+		t.Fatal("started task session is missing from runningSessions")
+	}
+	if _, ok := app.activeSessions[sessionID]; !ok {
+		t.Fatal("started task session is missing from App activeSessions")
+	}
+	if !tr.IsActiveSession(item) {
+		t.Fatal("Tree does not reflect the started task session after persistence failure")
+	}
+	if !strings.Contains(logs.String(), persistErr.Error()) {
+		t.Fatalf("persistence error was not logged: %q", logs.String())
 	}
 }
 
@@ -587,6 +746,68 @@ func TestCloseFamiliarCleansHostState(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].SessionID != mainSID+"__helper" {
 		t.Fatalf("unexpected remaining familiars: %#v", entries)
+	}
+}
+
+func TestCloseFamiliarCompletesHostCleanupAfterCommittedPersistenceFailure(t *testing.T) {
+	dataHome := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	t.Setenv("HOME", home)
+
+	const (
+		profile = "close-familiar-warning"
+		mainSID = "close-familiar-warning__chat"
+		famSID  = "close-familiar-warning__chat__expert"
+		cwd     = "/tmp"
+	)
+	familiarJSONL := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
+	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	panel := ui.NewChatPanel(mainEm, mainSID, profile)
+	familiarsPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(familiarsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(familiarsPath, []byte(`[{"id":"expert","sessionId":"`+famSID+`"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	persistErr := errors.New("active state unavailable")
+	tr := tree.New()
+	tr.Profile = profile
+	tr.SetSaveStateFunc(func() error { return persistErr })
+	app := &App{
+		tree:            tr,
+		container:       ui.NewContainer(panel),
+		profile:         profile,
+		piAgentDir:      filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:  map[string]struct{}{famSID: {}},
+		emulatorCache:   map[string]*portalis.Emulator{famSID: familiarEm},
+		runningSessions: map[string]struct{}{famSID: {}},
+	}
+
+	err := app.closeFamiliar(famSID, familiarEm)
+	if !errors.Is(err, persistErr) {
+		t.Fatalf("close familiar error = %v, want persistence error", err)
+	}
+	var committedErr *ui.CommittedCleanupError
+	if !errors.As(err, &committedErr) {
+		t.Fatalf("close familiar error = %T, want committed cleanup warning", err)
+	}
+	if _, err := os.Stat(familiarJSONL); !os.IsNotExist(err) {
+		t.Fatalf("familiar JSONL remains after committed close: %v", err)
+	}
+	data, err := os.ReadFile(familiarsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []paths.FamiliarEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("familiar registry entries = %#v, want empty after committed close", entries)
 	}
 }
 
@@ -972,6 +1193,97 @@ func TestWatchTreeStatusCmdNilWithoutWatcher(t *testing.T) {
 // Update and confirms a fresh recompute happened (badge appears) plus a
 // re-arm cmd is returned. The recompute works against an on-disk
 // status.json written before the message fires.
+func TestOpenDebugLogAppendsWithoutTruncating(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "automata.log")
+	if err := os.WriteFile(path, []byte("before\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := openDebugLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("after\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "before\nafter\n" {
+		t.Fatalf("debug log contents = %q, want preserved append", contents)
+	}
+}
+
+func TestWatcherRecoveryRecreatesClosedStatusAndSessionWatchers(t *testing.T) {
+	app := newTestApp(t, "")
+	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app.setupStatusWatcher()
+	app.syncSessionWatchers()
+	oldStatus := app.statusWatcher
+	oldSession := app.sessionWatchers[key]
+	if oldStatus == nil || oldSession == nil {
+		t.Fatal("test setup did not create both status watchers")
+	}
+	t.Cleanup(func() { app.Close() })
+
+	statusCmd := app.watchTreeStatusCmd()
+	if statusCmd == nil {
+		t.Fatal("status watcher command is nil")
+	}
+	statusMessages := make(chan tea.Msg, 1)
+	go func() { statusMessages <- statusCmd() }()
+	go func() { oldStatus.Errors <- errors.New("synthetic status watcher error") }()
+	select {
+	case msg := <-statusMessages:
+		errorMsg, ok := msg.(statusWatcherErrorMsg)
+		if !ok || errorMsg.err == nil {
+			t.Fatalf("status watcher error message = %#v", msg)
+		}
+		_, cmd := app.Update(msg)
+		if cmd == nil {
+			t.Fatal("status watcher recovery did not return a re-arm command")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed status watcher did not report recovery")
+	}
+	if app.statusWatcher == nil || app.statusWatcher == oldStatus {
+		t.Fatal("status watcher was not recreated")
+	}
+
+	app.sessionWatchPending[key] = false
+	sessionCmd := app.watchSessionCmd(key)
+	if sessionCmd == nil {
+		t.Fatal("session watcher command is nil")
+	}
+	sessionMessages := make(chan tea.Msg, 1)
+	go func() { sessionMessages <- sessionCmd() }()
+	go func() { oldSession.Errors <- errors.New("synthetic session watcher error") }()
+	select {
+	case msg := <-sessionMessages:
+		errorMsg, ok := msg.(sessionWatcherErrorMsg)
+		if !ok || errorMsg.err == nil {
+			t.Fatalf("session watcher error message = %#v", msg)
+		}
+		_, cmd := app.Update(msg)
+		if cmd == nil {
+			t.Fatal("session watcher recovery did not return a re-arm command")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed session watcher did not report recovery")
+	}
+	if app.sessionWatchers[key] == nil || app.sessionWatchers[key] == oldSession {
+		t.Fatal("session watcher was not recreated")
+	}
+}
+
 func TestTreeStatusChangedMsgTriggersRefresh(t *testing.T) {
 	app := newTestApp(t, "")
 	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])
