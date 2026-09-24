@@ -11,33 +11,8 @@ import (
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
-// profileFromSessionID extracts the already canonical profile slug from the
-// leading `profile__` prefix baked into session IDs.
-func profileFromSessionID(sessionID string) string {
-	const sep = "__"
-	idx := strings.Index(sessionID, sep)
-	if idx <= 0 {
-		return ""
-	}
-	return sessionID[:idx]
-}
-
 func sessionDirForProfile(profile, sessionID string) string {
 	return paths.SessionDir(profile, sessionID)
-}
-
-// legacyProfileForSession preserves the environment fallback for the
-// convenience API that receives only an unprefixed session ID.
-func legacyProfileForSession(sessionID string) string {
-	profile := profileFromSessionID(sessionID)
-	if profile == "" {
-		return os.Getenv("AI_PROFILE")
-	}
-	return profile
-}
-
-func sessionDir(sessionID string) string {
-	return sessionDirForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 type IntentionState struct {
@@ -169,10 +144,14 @@ func readForProfile(profile, sessionID string) (*Data, error) {
 	return data, nil
 }
 
-// Read returns context data using the profile encoded in the session ID or
-// AI_PROFILE for legacy unprefixed IDs.
+// Read resolves legacy sessions through existing profile directories, then
+// falls back to the session prefix, AI_PROFILE and canonical default.
 func Read(sessionID string) (*Data, error) {
-	return readForProfile(legacyProfileForSession(sessionID), sessionID)
+	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
+	if err != nil {
+		return nil, err
+	}
+	return readForProfile(profile, sessionID)
 }
 
 // ReadForProfile returns context data using the explicit canonical profile.
@@ -241,7 +220,11 @@ func (r *CachedReader) Invalidate(profile, sessionID string) {
 // Read returns the context data for a session, cached by the complete
 // existence/size/mtime signature of plans.json, status.json and settings.json.
 func (r *CachedReader) Read(sessionID string) (*Data, error) {
-	return r.ReadForProfile(legacyProfileForSession(sessionID), sessionID)
+	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
+	if err != nil {
+		return nil, err
+	}
+	return r.ReadForProfile(profile, sessionID)
 }
 
 // ReadForProfile reads and caches context data under an explicit profile.

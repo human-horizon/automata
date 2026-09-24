@@ -40,35 +40,8 @@ func dataHome() string {
 	return paths.BaseDir()
 }
 
-// profileFromSessionID extracts the already canonical profile slug from the
-// leading `profile__` prefix baked into session IDs.
-func profileFromSessionID(sessionID string) string {
-	const sep = "__"
-	idx := strings.Index(sessionID, sep)
-	if idx <= 0 {
-		return ""
-	}
-	return sessionID[:idx]
-}
-
 func sessionDirForProfile(profile, sessionID string) string {
 	return paths.SessionDir(profile, sessionID)
-}
-
-// legacyProfileForSession preserves the environment fallback for convenience
-// APIs that receive only an unprefixed session ID. Explicit profile APIs never
-// call this helper.
-func legacyProfileForSession(sessionID string) string {
-	profile := profileFromSessionID(sessionID)
-	if profile == "" {
-		return os.Getenv("AI_PROFILE")
-	}
-	return profile
-}
-
-// sessionDir returns the session data directory for the legacy convenience API.
-func sessionDir(sessionID string) string {
-	return sessionDirForProfile(legacyProfileForSession(sessionID), sessionID)
 }
 
 // pidStartSkewTolerance is the maximum allowed difference between the job's
@@ -239,10 +212,14 @@ func listForProfile(profile, sessionID string) ([]Job, error) {
 	return jobs, nil
 }
 
-// List returns running jobs using the profile encoded in the session ID or
-// AI_PROFILE for legacy unprefixed IDs.
+// List resolves a legacy session by existing profile directories, then uses
+// the session-prefix, AI_PROFILE and default fallback order.
 func List(sessionID string) ([]Job, error) {
-	return listForProfile(legacyProfileForSession(sessionID), sessionID)
+	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
+	if err != nil {
+		return nil, err
+	}
+	return listForProfile(profile, sessionID)
 }
 
 // ListForProfile returns running jobs under an explicit canonical profile.
@@ -289,10 +266,14 @@ func pruneStaleSessionForProfile(profile, sessionID string) error {
 	return nil
 }
 
-// PruneStaleSession marks dead jobs using the profile encoded in the session
-// ID or AI_PROFILE for legacy unprefixed IDs.
+// PruneStaleSession resolves a legacy session before mutation and fails closed
+// when its directory exists under multiple candidate profiles.
 func PruneStaleSession(sessionID string) error {
-	return pruneStaleSessionForProfile(legacyProfileForSession(sessionID), sessionID)
+	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileDestructive)
+	if err != nil {
+		return err
+	}
+	return pruneStaleSessionForProfile(profile, sessionID)
 }
 
 // PruneStaleSessionForProfile marks dead jobs under an explicit profile.
@@ -329,10 +310,14 @@ func runningCountForProfile(profile, sessionID string) (int, error) {
 	return count, nil
 }
 
-// RunningCount returns the number of running job records using the profile
-// encoded in the session ID or AI_PROFILE for legacy unprefixed IDs.
+// RunningCount resolves a legacy session by existing profile directories,
+// then uses the session-prefix, AI_PROFILE and default fallback order.
 func RunningCount(sessionID string) (int, error) {
-	return runningCountForProfile(legacyProfileForSession(sessionID), sessionID)
+	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
+	if err != nil {
+		return 0, err
+	}
+	return runningCountForProfile(profile, sessionID)
 }
 
 // RunningCountForProfile returns the number of running records under an
@@ -386,10 +371,14 @@ func materializeStaleJob(jobDir, metaPath string, rec *JobRecord) error {
 	return os.RemoveAll(jobDir)
 }
 
-// KillSession uses the profile encoded in the session ID for compatibility
-// with the legacy command-line API.
+// KillSession resolves the legacy session directory and fails closed when
+// multiple candidate profiles contain it.
 func KillSession(sessionID string) error {
-	return KillSessionForProfile(legacyProfileForSession(sessionID), sessionID)
+	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileDestructive)
+	if err != nil {
+		return err
+	}
+	return KillSessionForProfile(profile, sessionID)
 }
 
 type killCandidate struct {
@@ -637,7 +626,11 @@ func jobsSignature(jobsDir string) string {
 }
 
 func (r *CachedReader) List(sessionID string) ([]Job, error) {
-	return r.ListForProfile(legacyProfileForSession(sessionID), sessionID)
+	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
+	if err != nil {
+		return nil, err
+	}
+	return r.ListForProfile(profile, sessionID)
 }
 
 func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) {

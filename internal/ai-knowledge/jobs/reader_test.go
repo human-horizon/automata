@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,10 @@ import (
 
 	"github.com/HumanHorizon/automata/internal/paths"
 )
+
+func sessionDir(sessionID string) string {
+	return paths.SessionDir("test", sessionID)
+}
 
 func TestCachedReaderNoticesNestedJobMetadataChange(t *testing.T) {
 	dataHome := t.TempDir()
@@ -183,6 +188,140 @@ func TestLegacyJobReadersResolveProfilePrefixEnvironmentAndDefault(t *testing.T)
 	writeRunningJob("", "default-chat", "default-job")
 	writeRunningJob("wrong-profile", "default-chat", "environment-decoy")
 	assertSession("default-chat", "default-job", 1)
+}
+
+func TestLegacyReadersAndKillResolveDefaultFamiliarSession(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "")
+	const (
+		sessionID = "chat__expert"
+		jobID     = "default-familiar-job"
+	)
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	jobDir, metaPath := writeScopedJobRecord(t, "", sessionID, jobID, os.Getpid(), startedAt)
+	if _, err := os.Stat(paths.SessionDir("chat", sessionID)); !os.IsNotExist(err) {
+		t.Fatalf("unexpected profile-chat session directory: %v", err)
+	}
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+	})
+	signals := 0
+	processSignal = func(int, syscall.Signal) error {
+		signals++
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+	processProbeFn = func(int) bool { return false }
+
+	listed, err := List(sessionID)
+	if err != nil || len(listed) != 1 || listed[0].ID != jobID {
+		t.Fatalf("List(%q) = %#v, err=%v, want default familiar job", sessionID, listed, err)
+	}
+	cached, err := NewCachedReader().List(sessionID)
+	if err != nil || len(cached) != 1 || cached[0].ID != jobID {
+		t.Fatalf("CachedReader.List(%q) = %#v, err=%v, want default familiar job", sessionID, cached, err)
+	}
+	count, err := RunningCount(sessionID)
+	if err != nil || count != 1 {
+		t.Fatalf("RunningCount(%q) = %d, err=%v, want 1", sessionID, count, err)
+	}
+	if err := KillSession(sessionID); err != nil {
+		t.Fatalf("KillSession(%q): %v", sessionID, err)
+	}
+	if signals != 1 {
+		t.Fatalf("signals = %d, want exactly one default-profile job signal", signals)
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "exited" {
+		t.Fatalf("default familiar job status = %q, want exited", record.Status)
+	}
+	if _, err := os.Stat(jobDir); err != nil {
+		t.Fatalf("default familiar job directory was not preserved: %v", err)
+	}
+}
+
+func TestLegacyDestructiveResolutionRejectsAmbiguousFamiliarSession(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "")
+	const sessionID = "foo__bar"
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	fooJobDir, fooMetaPath := writeScopedJobRecord(t, "foo", sessionID, "foo-job", os.Getpid(), startedAt)
+	defaultJobDir, defaultMetaPath := writeScopedJobRecord(t, "", sessionID, "default-job", os.Getpid(), startedAt)
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+	})
+	signals := 0
+	processSignal = func(int, syscall.Signal) error {
+		signals++
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+	processProbeFn = func(int) bool { return false }
+
+	if err := KillSession(sessionID); !errors.Is(err, paths.ErrAmbiguousLegacySessionProfile) {
+		t.Fatalf("KillSession error = %v, want ambiguous-profile error", err)
+	}
+	if signals != 0 {
+		t.Fatalf("ambiguous KillSession sent %d signals, want zero", signals)
+	}
+	assertRunningRecord := func(metaPath string) {
+		t.Helper()
+		var record JobRecord
+		if err := readJSON(metaPath, &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Status != "running" {
+			t.Fatalf("job %q status = %q, want unchanged running", record.ID, record.Status)
+		}
+	}
+	assertRunningRecord(fooMetaPath)
+	assertRunningRecord(defaultMetaPath)
+
+	_, fooMetaPath = writeScopedJobRecord(t, "foo", sessionID, "foo-job", 0, "")
+	_, defaultMetaPath = writeScopedJobRecord(t, "", sessionID, "default-job", 0, "")
+	if err := PruneStaleSession(sessionID); !errors.Is(err, paths.ErrAmbiguousLegacySessionProfile) {
+		t.Fatalf("PruneStaleSession error = %v, want ambiguous-profile error", err)
+	}
+	assertRunningRecord(fooMetaPath)
+	assertRunningRecord(defaultMetaPath)
+	for _, jobDir := range []string{fooJobDir, defaultJobDir} {
+		if _, err := os.Stat(jobDir); err != nil {
+			t.Fatalf("ambiguous prune removed job directory %q: %v", jobDir, err)
+		}
+	}
+}
+
+func writeScopedJobRecord(t *testing.T, profile, sessionID, jobID string, pid int, startedAt string) (string, string) {
+	t.Helper()
+	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", jobID)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(jobDir, "job.json")
+	record := `{"id":"` + jobID + `","pid":` + strconv.Itoa(pid) + `,"status":"running"`
+	if startedAt != "" {
+		record += `,"startedAt":"` + startedAt + `"`
+	}
+	record += "}"
+	if err := os.WriteFile(metaPath, []byte(record), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return jobDir, metaPath
 }
 
 func TestListKeepsLiveJobWithoutStartedAt(t *testing.T) {

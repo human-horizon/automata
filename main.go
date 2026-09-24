@@ -131,31 +131,8 @@ func newApp(profile, piAgentDir string) (a *App) {
 
 	container := ui.NewContainer(tp)
 	container.SetProfile(profile)
-	container.SetOnTaskAssigned(func(sessionID, taskTitle string) tea.Cmd {
-		// Ensure the emulator is running for this chat. The returned Listen
-		// command must reach Bubble Tea; dropping it leaves the PTY silent.
-		if _, ok := a.emulatorCache[sessionID]; ok {
-			return nil
-		}
-		em := a.createChatEmulator(sessionID)
-		if em == nil {
-			return nil
-		}
-		// Start synchronously so the PTY is ready immediately. The env is
-		// already recorded on the emulator via SetStartEnv.
-		if err := em.StartSync(nil); err != nil {
-			return nil
-		}
-		a.emulatorCache[sessionID] = em
-		if a.runningSessions == nil {
-			a.runningSessions = make(map[string]struct{})
-		}
-		a.runningSessions[sessionID] = struct{}{}
-		a.activeSessions[sessionID] = struct{}{}
-		if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
-			log.Printf("automata: persist assigned task session %q: %v", sessionID, err)
-		}
-		return em.Listen()
+	container.SetOnTaskAssigned(func(sessionID, _ string) tea.Cmd {
+		return a.startAssignedTaskSession(sessionID)
 	})
 
 	w.SetTabPosition(warp.TabNone)
@@ -675,7 +652,7 @@ func (a *App) restoreSessions() tea.Cmd {
 
 // piLaunch resolves how to spawn a pi session: binary, arguments and extra
 // environment. It is the single place deciding PI_CODING_AGENT_DIR and
-// AUTOMATA_PROFILE, so every launch path (tree click, session restore,
+// canonical profile variables, so every launch path (tree click, session restore,
 // clear-restart, task assign, familiar) produces an identical result.
 //
 // Priority:
@@ -686,7 +663,8 @@ func (a *App) restoreSessions() tea.Cmd {
 // Returns cmd == "" when nothing is available; callers must NOT fall back
 // to a shell for pi sessions.
 func (a *App) piLaunch(sessionID string) (cmd string, args []string, env []string) {
-	env = append(env, "AUTOMATA_PROFILE="+paths.ProfileSlug(a.profile))
+	profile := paths.ProfileSlug(a.profile)
+	env = append(env, "AI_PROFILE="+profile, "AUTOMATA_PROFILE="+profile)
 	if configured := strings.TrimSpace(os.Getenv("PI_CMD")); configured != "" {
 		path, err := exec.LookPath(configured)
 		if err != nil {
@@ -762,6 +740,36 @@ func (a *App) createChatEmulator(sessionID string) *portalis.Emulator {
 	}
 
 	return em
+}
+
+// startAssignedTaskSession starts and tracks the chat PTY for an assigned task.
+func (a *App) startAssignedTaskSession(sessionID string) tea.Cmd {
+	if _, ok := a.emulatorCache[sessionID]; ok {
+		return nil
+	}
+	em := a.createChatEmulator(sessionID)
+	if em == nil {
+		return nil
+	}
+	if err := a.startEmulatorSync(em, nil); err != nil {
+		return nil
+	}
+	if a.emulatorCache == nil {
+		a.emulatorCache = make(map[string]*portalis.Emulator)
+	}
+	a.emulatorCache[sessionID] = em
+	if a.runningSessions == nil {
+		a.runningSessions = make(map[string]struct{})
+	}
+	a.runningSessions[sessionID] = struct{}{}
+	if a.activeSessions == nil {
+		a.activeSessions = make(map[string]struct{})
+	}
+	a.activeSessions[sessionID] = struct{}{}
+	if err := a.persistRuntimeActiveSessions(); err != nil {
+		log.Printf("automata: persist assigned task session %q: %v", sessionID, err)
+	}
+	return em.Listen()
 }
 
 // createFamiliarEmulator builds an emulator for a familiar tab.
@@ -845,10 +853,8 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 		}
 		if _, alreadyActive := a.activeSessions[sessionID]; !alreadyActive {
 			a.activeSessions[sessionID] = struct{}{}
-			if a.tree != nil {
-				if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
-					log.Printf("automata: persist active session %q: %v", sessionID, err)
-				}
+			if err := a.persistRuntimeActiveSessions(); err != nil {
+				log.Printf("automata: persist active session %q: %v", sessionID, err)
 			}
 		}
 	}

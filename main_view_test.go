@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -97,14 +99,15 @@ func TestClearRestartsChatWithConfiguredPiAgentDir(t *testing.T) {
 	gotEnv := restarted.StartEnv()
 	for _, wantEnv := range []string{
 		"PI_CODING_AGENT_DIR=" + piAgentDir,
+		"AI_PROFILE=default",
 		"AUTOMATA_PROFILE=default",
 	} {
 		if !containsString(gotEnv, wantEnv) {
 			t.Fatalf("start environment = %#v, missing %q", gotEnv, wantEnv)
 		}
 	}
-	if len(gotEnv) != 2 {
-		t.Fatalf("start environment = %#v, want exactly both profile variables", gotEnv)
+	if len(gotEnv) != 3 {
+		t.Fatalf("start environment = %#v, want agent dir and both profile variables", gotEnv)
 	}
 }
 
@@ -128,9 +131,10 @@ func TestPiLaunchSetsAgentDirAndProfile(t *testing.T) {
 		t.Fatalf("args = %#v, want [--session-id getic__chat]", args)
 	}
 
-	t.Log("И: env содержит PI_CODING_AGENT_DIR=getic и AUTOMATA_PROFILE=getic")
+	t.Log("И: env содержит PI_CODING_AGENT_DIR=getic и обе canonical profile variables")
 	want := map[string]bool{
 		"PI_CODING_AGENT_DIR=" + geticDir: false,
+		"AI_PROFILE=getic":                false,
 		"AUTOMATA_PROFILE=getic":          false,
 	}
 	for _, e := range env {
@@ -147,6 +151,8 @@ func TestPiLaunchSetsAgentDirAndProfile(t *testing.T) {
 
 func TestPiLaunchHonorsPiCmdOverride(t *testing.T) {
 	t.Setenv("PI_CMD", "/bin/bash")
+	t.Setenv("AI_PROFILE", "wrong-profile")
+	t.Setenv("AUTOMATA_PROFILE", "wrong-profile")
 	app := &App{profile: "Keller", piAgentDir: "/whatever"}
 
 	t.Log("Когда: задан PI_CMD (e2e-режим)")
@@ -161,8 +167,10 @@ func TestPiLaunchHonorsPiCmdOverride(t *testing.T) {
 			t.Fatalf("env must not contain PI_CODING_AGENT_DIR with PI_CMD override, got %#v", env)
 		}
 	}
-	if !containsString(env, "AUTOMATA_PROFILE=keller") {
-		t.Fatalf("PI_CMD environment = %#v, want canonical profile", env)
+	for _, want := range []string{"AI_PROFILE=keller", "AUTOMATA_PROFILE=keller"} {
+		if !containsString(env, want) {
+			t.Fatalf("PI_CMD environment = %#v, missing canonical profile %q", env, want)
+		}
 	}
 }
 
@@ -179,23 +187,26 @@ func TestPiLaunchAlwaysSetsCanonicalProfileEnvironment(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv("PI_CMD", "/bin/bash")
 			t.Setenv("AI_PROFILE", "wrong-profile")
+			t.Setenv("AUTOMATA_PROFILE", "wrong-profile")
 			app := &App{profile: test.profile}
 			cmd, _, env := app.piLaunch("chat")
 			if cmd != "/bin/bash" {
 				t.Fatalf("cmd = %q, want PI_CMD /bin/bash", cmd)
 			}
-			wantEnv := "AUTOMATA_PROFILE=" + test.want
-			count := 0
-			for _, item := range env {
-				if strings.HasPrefix(item, "AUTOMATA_PROFILE=") {
-					count++
-					if item != wantEnv {
-						t.Fatalf("profile environment = %q, want %q", item, wantEnv)
+			for _, key := range []string{"AI_PROFILE", "AUTOMATA_PROFILE"} {
+				wantEnv := key + "=" + test.want
+				count := 0
+				for _, item := range env {
+					if strings.HasPrefix(item, key+"=") {
+						count++
+						if item != wantEnv {
+							t.Fatalf("profile environment = %q, want %q", item, wantEnv)
+						}
 					}
 				}
-			}
-			if count != 1 {
-				t.Fatalf("AUTOMATA_PROFILE entries = %d in %#v, want exactly one", count, env)
+				if count != 1 {
+					t.Fatalf("%s entries = %d in %#v, want exactly one", key, count, env)
+				}
 			}
 		})
 	}
@@ -283,6 +294,49 @@ func TestRouteCachedEmulatorMessageHandlesAllPTYMessages(t *testing.T) {
 	}
 }
 
+func TestPtyReadyKeepsTreeActiveWhenPersistenceFails(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "ready-save-failure"
+	persistErr := errors.New("active state unavailable")
+	tr := tree.New()
+	tr.SetSaveStateFunc(func() error { return persistErr })
+
+	logs := captureLogOutput(t)
+	app := &App{
+		tree:            tr,
+		activeSessions:  make(map[string]struct{}),
+		runningSessions: make(map[string]struct{}),
+		emulatorCache: map[string]*portalis.Emulator{
+			sessionID: portalis.NewEmulator(sessionID, "Ready", "/bin/sh", nil),
+		},
+	}
+
+	if _, handled := app.routeCachedEmulatorMessage(portalis.PtyReadyMsg{SessionID: sessionID}); !handled {
+		t.Fatal("ready was not routed to cached emulator")
+	}
+	if _, active := app.activeSessions[sessionID]; !active {
+		t.Fatal("App did not retain the started session")
+	}
+	if _, running := app.runningSessions[sessionID]; !running {
+		t.Fatal("runningSessions did not retain the started session")
+	}
+	if got := tr.ActiveSessionIDs(); !reflect.DeepEqual(got, []string{sessionID}) {
+		t.Fatalf("Tree active sessions = %v, want [%s] after persistence failure", got, sessionID)
+	}
+	if !strings.Contains(logs.String(), persistErr.Error()) {
+		t.Fatalf("persistence error was not logged: %q", logs.String())
+	}
+}
+
+func captureLogOutput(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	return &output
+}
+
 func TestPtyReadyActivatesSessionOnlyAfterReady(t *testing.T) {
 	const sessionID = "ready-gated"
 	app := &App{
@@ -305,6 +359,56 @@ func TestPtyReadyActivatesSessionOnlyAfterReady(t *testing.T) {
 	}
 	if _, active := app.activeSessions[sessionID]; !active {
 		t.Fatal("session did not become active after PtyReadyMsg")
+	}
+}
+
+func TestAssignedTaskStartKeepsTreeActiveWhenPersistenceFails(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("PI_CMD", "/bin/sh")
+	tr := tree.New()
+	tr.Profile = "task-start"
+	tr.AddChat("assigned-chat")
+	item := tr.Root()[0]
+	sessionID := tr.SessionKeyOf(item)
+	persistErr := errors.New("active state unavailable")
+	tr.SetSaveStateFunc(func() error { return persistErr })
+
+	logs := captureLogOutput(t)
+	app := &App{
+		tree:            tr,
+		profile:         tr.Profile,
+		piAgentDir:      t.TempDir(),
+		activeSessions:  make(map[string]struct{}),
+		runningSessions: make(map[string]struct{}),
+		emulatorCache:   make(map[string]*portalis.Emulator),
+	}
+	started := false
+	app.startEmulatorSyncFn = func(em *portalis.Emulator, _ []string) error {
+		if em.SessionID != sessionID {
+			t.Fatalf("started session = %q, want %q", em.SessionID, sessionID)
+		}
+		started = true
+		return nil
+	}
+
+	_ = app.startAssignedTaskSession(sessionID)
+	if !started {
+		t.Fatal("task assignment did not start its PTY")
+	}
+	if _, ok := app.emulatorCache[sessionID]; !ok {
+		t.Fatal("started task session is missing from emulator cache")
+	}
+	if _, ok := app.runningSessions[sessionID]; !ok {
+		t.Fatal("started task session is missing from runningSessions")
+	}
+	if _, ok := app.activeSessions[sessionID]; !ok {
+		t.Fatal("started task session is missing from App activeSessions")
+	}
+	if !tr.IsActiveSession(item) {
+		t.Fatal("Tree does not reflect the started task session after persistence failure")
+	}
+	if !strings.Contains(logs.String(), persistErr.Error()) {
+		t.Fatalf("persistence error was not logged: %q", logs.String())
 	}
 }
 

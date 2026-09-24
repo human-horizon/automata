@@ -59,9 +59,10 @@ func TestStopSessionRuntimeClearsOwnerAndFamiliarState(t *testing.T) {
 
 func TestStopSessionRuntimeSurfacesActiveSessionPersistenceFailure(t *testing.T) {
 	tr := tree.New()
+	const sessionID = "owner"
+	tr.SetActiveSessionsInMemory(map[string]struct{}{sessionID: {}})
 	persistErr := errors.New("active state unavailable")
 	tr.SetSaveStateFunc(func() error { return persistErr })
-	const sessionID = "owner"
 	app := &App{
 		tree:                  tr,
 		profile:               "test",
@@ -82,6 +83,12 @@ func TestStopSessionRuntimeSurfacesActiveSessionPersistenceFailure(t *testing.T)
 	}
 	if _, ok := app.activeSessions[sessionID]; ok {
 		t.Fatal("active session remained after committed stop")
+	}
+	if _, ok := app.runningSessions[sessionID]; ok {
+		t.Fatal("running session remained after committed stop")
+	}
+	if got := tr.ActiveSessionIDs(); len(got) != 0 {
+		t.Fatalf("Tree active sessions after committed stop = %v, want none", got)
 	}
 }
 

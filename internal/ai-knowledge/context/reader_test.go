@@ -238,6 +238,32 @@ func TestLegacyReadResolvesProfilePrefixEnvironmentAndDefault(t *testing.T) {
 	}
 }
 
+func TestLegacyReadResolvesDefaultFamiliarSessionID(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "")
+	const sessionID = "chat__expert"
+	dir := paths.SessionDir("", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"text":"default familiar"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, read := range map[string]func(string) (*Data, error){
+		"direct": Read,
+		"cached": NewCachedReader().Read,
+	} {
+		data, err := read(sessionID)
+		if err != nil {
+			t.Fatalf("%s read: %v", name, err)
+		}
+		if data.Status == nil || data.Status.Text != "default familiar" {
+			t.Fatalf("%s status = %#v, want default familiar session", name, data.Status)
+		}
+	}
+}
+
 func TestReadForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	t.Setenv("AI_PROFILE", "wrong-profile")
 	profile := "Explicit Profile"

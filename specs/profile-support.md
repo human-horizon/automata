@@ -45,6 +45,18 @@ automata --profile "Human Horizon"
 - `Item.Domain(profile)` в `internal/tree/model.go` отвечает за это
   формирование.
 
+### Explicit и legacy profile contracts
+- Explicit API с пустым `profile` использует `profiles/default`; переменная
+  `AI_PROFILE` не может переопределить явный аргумент.
+- Legacy API, которому передан только `sessionID`, использует общий
+  filesystem-aware resolver. Разделитель `__` сам по себе не доказывает, что
+  префикс является профилем: тот же разделитель встречается в familiar IDs,
+  например `chat__expert`.
+- При нескольких существующих candidate directories read-only wrappers
+  сохраняют legacy priority `prefix → AI_PROFILE → default`; destructive
+  wrappers `KillSession` и `PruneStaleSession` завершаются ошибкой ambiguity
+  до destructive side effects.
+
 #### Контракт фазы 1
 - `internal/ai-knowledge/memory` и `internal/ui/ContextPanel` разрешают
   каталоги доменов только через каноническую `paths.DomainDir`.
@@ -52,8 +64,14 @@ automata --profile "Human Horizon"
   проверка `profile != ""` не должна пропускать чтение памяти профиля по
   умолчанию.
 - Область реализации: `internal/ui/container.go`.
-- Для пустого имени профиля сохраняется порядок разрешения: `AI_PROFILE` →
-  `default`, если `AI_PROFILE` не задан или пуст.
+- Явно переданный пустой профиль (`profile == ""`) всегда означает
+  канонический `default` и не разрешается через окружение.
+- Только legacy convenience APIs используют `AI_PROFILE` как fallback. Они
+  проверяют каталоги `profiles/<candidate>/sessions/<sessionID>` для кандидатов
+  `profile-prefix → AI_PROFILE → default`; при отсутствии каталогов сохраняют
+  этот же fallback-порядок. Для read-only неоднозначности применяется порядок
+  кандидатов, а destructive legacy API при нескольких существующих каталогах
+  возвращает ошибку неоднозначности до чтения/мутации job records и сигналов.
 - Приёмка должна покрывать профиль с Unicode/кириллицей, пользовательский
   `AI_DATA_HOME` и путь watcher'а; во всех случаях используется
   канонический каталог домена.
@@ -68,8 +86,13 @@ automata --profile "Human Horizon"
   `~/.automata/`.
 - `internal/tree/render.go`: заголовок окна показывает оригинальное имя
   профиля.
-- `main.go`: `sessionName = slug.Slug(sm.Profile) + "__" + sessionName` и
-  передача `AI_PROFILE` / `AUTOMATA_SESSION_ID` в PTY.
+- `main.go`: `sessionName = slug.Slug(sm.Profile) + "__" + sessionName`; `piLaunch`
+  передаёт Pi child canonical `AI_PROFILE` и `AUTOMATA_PROFILE` (для пустого
+  профиля обе переменные равны `default`) после inherited environment, поэтому
+  они перекрывают конфликтующие значения родителя. `PI_CMD` меняет executable,
+  но не profile environment.
+- Portalis устанавливает `AUTOMATA_SESSION_ID` из `Emulator.SessionID`; этот
+  session identity не заменяет profile variables.
 
 ## Критерии приёмки
 - [x] `--profile "Human Horizon"` использует папку

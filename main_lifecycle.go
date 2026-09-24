@@ -99,6 +99,18 @@ func (a *App) executeSessionJob(jobPlan preparedSessionJobs, sessionID string) e
 	return jobPlan.plan.ExecuteForProfile(a.profile, sessionID)
 }
 
+func (a *App) persistRuntimeActiveSessions() error {
+	if a.tree == nil {
+		return nil
+	}
+	if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
+		// Runtime has already changed; keep the UI snapshot aligned with reality.
+		a.tree.SetActiveSessionsInMemory(a.activeSessions)
+		return err
+	}
+	return nil
+}
+
 func (a *App) stopSessionRuntime(sessionID string, opts stopSessionOptions) error {
 	return a.stopSessionRuntimeIDs([]string{sessionID}, opts)
 }
@@ -124,8 +136,8 @@ func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) 
 	}
 	var failures []error
 	persistenceFailed := false
-	if opts.persistInactive && a.tree != nil {
-		if err := a.tree.SetActiveSessions(a.activeSessions); err != nil {
+	if opts.persistInactive {
+		if err := a.persistRuntimeActiveSessions(); err != nil {
 			persistenceFailed = true
 			failures = append(failures, fmt.Errorf("persist inactive sessions: %w", err))
 		}
