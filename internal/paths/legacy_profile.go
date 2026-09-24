@@ -25,14 +25,14 @@ var ErrAmbiguousLegacySessionProfile = errors.New("ambiguous legacy session prof
 // multiple directories exist, read-only callers use candidate order while
 // destructive callers fail closed.
 func ResolveLegacySessionProfile(sessionID string, mode LegacySessionProfileMode) (string, error) {
+	if err := ValidateSessionID(sessionID); err != nil {
+		return "", err
+	}
 	if mode != LegacySessionProfileReadOnly && mode != LegacySessionProfileDestructive {
 		return "", fmt.Errorf("invalid legacy session profile mode %d", mode)
 	}
 
 	candidates := legacySessionProfileCandidates(sessionID)
-	if sessionID == "" {
-		return candidates[0], nil
-	}
 
 	matches := make([]string, 0, len(candidates))
 	for _, profile := range candidates {

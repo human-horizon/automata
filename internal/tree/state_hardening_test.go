@@ -44,6 +44,71 @@ func TestLoadStateAcceptsSupportedVersions(t *testing.T) {
 	}
 }
 
+func TestLoadStateDropsActiveSessionsMissingFromTree(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		profile     string
+		wantSession string
+	}{
+		{name: "default profile", wantSession: "real"},
+		{name: "named profile uses canonical full session key", profile: "Getic", wantSession: "getic__real"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AI_DATA_HOME", t.TempDir())
+			state := TreeState{
+				Version: 2,
+				Items:   []*StateItem{{Name: "real"}},
+				ActiveSessions: []string{
+					"ghost",
+					"real",
+					test.wantSession,
+				},
+			}
+			if test.profile == "" {
+				state.ActiveSessions = []string{"ghost", "real"}
+			}
+			data, err := json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			statePath := paths.StatePath(test.profile)
+			if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(statePath, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			tr := New()
+			tr.Profile = test.profile
+			if err := tr.LoadState(); err != nil {
+				t.Fatalf("LoadState rejected healthy Tree with ghost active ID: %v", err)
+			}
+			if got := tr.ActiveSessionIDs(); !reflect.DeepEqual(got, []string{test.wantSession}) {
+				t.Fatalf("active IDs = %v, want only canonical Tree session %q", got, test.wantSession)
+			}
+			if tr.LastActionError() == nil || !strings.Contains(tr.LastActionError().Error(), "ghost") {
+				t.Fatalf("discarded ID warning = %v, want a visible ghost diagnostic", tr.LastActionError())
+			}
+
+			if err := tr.SaveState(); err != nil {
+				t.Fatalf("SaveState after filtering ghost: %v", err)
+			}
+			persisted, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var saved TreeState
+			if err := json.Unmarshal(persisted, &saved); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(saved.ActiveSessions, []string{test.wantSession}) {
+				t.Fatalf("persisted active IDs = %v, want [%s]", saved.ActiveSessions, test.wantSession)
+			}
+		})
+	}
+}
+
 func TestLoadStateRejectsInvalidSnapshotWithoutReplacingTreeOrFile(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	tr := New()

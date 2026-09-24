@@ -123,7 +123,7 @@ func assertCompleteSGRSequences(t *testing.T, value string) {
 // returns the session ID. profile can be empty for the canonical default path.
 func writeFamiliarsJSON(t *testing.T, dir, profile string, familiars []FamiliarState) string {
 	t.Helper()
-	sessionID := "test-session"
+	sessionID := "test"
 	if profile == "" {
 		profile = "default"
 	}
@@ -191,7 +191,10 @@ func TestCheckFamiliarsRegistryErrorsPreserveKnownAndTabs(t *testing.T) {
 		{name: "object instead of array", data: `{"id":"expert"}`},
 		{name: "null instead of array", data: `null`},
 		{name: "missing required fields", data: `[{"id":"expert"}]`},
-		{name: "duplicate id", data: `[{"id":"expert","sessionId":"one"},{"id":"expert","sessionId":"two"}]`},
+		{name: "duplicate id", data: `[{"id":"expert","sessionId":"test__one"},{"id":"expert","sessionId":"test__two"}]`},
+		{name: "foreign session", data: `[{"id":"expert","sessionId":"other__expert"}]`},
+		{name: "path-like session", data: `[{"id":"expert","sessionId":"test__../outside"}]`},
+		{name: "owner reused as familiar", data: `[{"id":"expert","sessionId":"test"}]`},
 	}
 	for _, testCase := range invalidRegistries {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -386,8 +389,65 @@ func TestCheckFamiliarsDetectsRemoved(t *testing.T) {
 	}
 }
 
+func TestFamiliarOwnershipRejectsExternalActions(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	cp := &ChatPanel{
+		sessionID: "owner",
+		known:     map[string]bool{"expert": true},
+		familiarSessions: map[string]string{
+			"expert": "foreign__expert",
+		},
+		removalPending: map[string]bool{"expert": true},
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", panel: &fakePanel{}, familiarID: "foreign__expert"},
+		},
+	}
+	registryPath := cp.familiarStatePath()
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, []byte(`[]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	createCalls, closeCalls, removeCalls := 0, 0, 0
+	cp.SetCreateFamiliarEmulator(func(string) (*portalis.Emulator, []string) {
+		createCalls++
+		return nil, nil
+	})
+	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) error {
+		closeCalls++
+		return nil
+	})
+	cp.SetOnRemoveFamiliar(func(string, *portalis.Emulator) error {
+		removeCalls++
+		return nil
+	})
+
+	if cmd := cp.addFamiliar("other", "foreign__other"); cmd != nil {
+		t.Fatal("foreign familiar produced a command")
+	}
+	if createCalls != 0 || len(cp.sessions) != 2 || cp.familiarError == "" {
+		t.Fatalf("invalid add changed state: creates=%d sessions=%v error=%q", createCalls, sessionNames(cp.sessions), cp.familiarError)
+	}
+	if !strings.Contains(strip(cp.renderTabBar(100)), "! familiar registry:") {
+		t.Fatal("invalid familiar add did not show a diagnostic")
+	}
+
+	cp.closeFamiliarByID("foreign__expert")
+	if closeCalls != 0 || len(cp.sessions) != 2 {
+		t.Fatalf("invalid close invoked cleanup or removed tab: closes=%d sessions=%v", closeCalls, sessionNames(cp.sessions))
+	}
+
+	cp.handleExternalFamiliarRemoval(familiarRemovedMsg{id: "expert", familiarID: "foreign__expert"})
+	if removeCalls != 0 || len(cp.sessions) != 2 || cp.familiarCleanupError == "" {
+		t.Fatalf("invalid external removal changed state: removes=%d sessions=%v error=%q", removeCalls, sessionNames(cp.sessions), cp.familiarCleanupError)
+	}
+}
+
 func TestAddFamiliarCreatesTab(t *testing.T) {
 	cp := &ChatPanel{
+		sessionID: "test",
 		sessions: []*chatSession{
 			{name: "Main", panel: &fakePanel{}},
 		},
@@ -700,9 +760,10 @@ func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 	var capturedID string
 	var capturedEm *portalis.Emulator
 	cp := &ChatPanel{
+		sessionID: "owner",
 		sessions: []*chatSession{
 			{name: "Main"},
-			{name: "expert", familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil), panel: &fakePanel{}},
+			{name: "expert", familiarID: "owner__f1", em: portalis.NewEmulator("owner__f1", "owner__f1", "/bin/sh", nil), panel: &fakePanel{}},
 		},
 		activeIdx: 0,
 		started:   true,
@@ -713,7 +774,7 @@ func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 		capturedEm = em
 		return nil
 	})
-	cp.pendingCloseFamiliar = "f1"
+	cp.pendingCloseFamiliar = "owner__f1"
 	cp.openCloseFamiliarModal("expert")
 
 	// closeFamiliarByID is now synchronous; Update may return nil or a
@@ -731,8 +792,8 @@ func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 	if cp.closeFamiliarModal != nil {
 		t.Error("closeFamiliarModal should be cleared")
 	}
-	if capturedID != "f1" {
-		t.Errorf("onCloseFamiliar called with %q, want f1", capturedID)
+	if capturedID != "owner__f1" {
+		t.Errorf("onCloseFamiliar called with %q, want owner__f1", capturedID)
 	}
 	if capturedEm == nil {
 		t.Error("onCloseFamiliar should receive the familiar's emulator")
@@ -740,11 +801,12 @@ func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 }
 
 func TestConfirmYesRemovesTabAfterCommittedCleanupWarning(t *testing.T) {
-	familiar := portalis.NewEmulator("f1", "f1", "/bin/sh", nil)
+	familiar := portalis.NewEmulator("owner__f1", "owner__f1", "/bin/sh", nil)
 	cp := &ChatPanel{
+		sessionID: "owner",
 		sessions: []*chatSession{
 			{name: "Main", panel: &fakePanel{}},
-			{name: "expert", familiarID: "f1", em: familiar, panel: &fakePanel{}},
+			{name: "expert", familiarID: "owner__f1", em: familiar, panel: &fakePanel{}},
 		},
 		activeIdx: 0,
 		started:   true,
@@ -756,7 +818,7 @@ func TestConfirmYesRemovesTabAfterCommittedCleanupWarning(t *testing.T) {
 		observedErr = &CommittedCleanupError{Err: cleanupErr}
 		return observedErr
 	})
-	cp.pendingCloseFamiliar = "f1"
+	cp.pendingCloseFamiliar = "owner__f1"
 	cp.openCloseFamiliarModal("expert")
 
 	_ = cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
@@ -769,11 +831,12 @@ func TestConfirmYesRemovesTabAfterCommittedCleanupWarning(t *testing.T) {
 }
 
 func TestConfirmYesKeepsTabWhenHostCleanupFails(t *testing.T) {
-	familiar := portalis.NewEmulator("f1", "f1", "/bin/sh", nil)
+	familiar := portalis.NewEmulator("owner__f1", "owner__f1", "/bin/sh", nil)
 	cp := &ChatPanel{
+		sessionID: "owner",
 		sessions: []*chatSession{
 			{name: "Main", panel: &fakePanel{}},
-			{name: "expert", familiarID: "f1", em: familiar, panel: &fakePanel{}},
+			{name: "expert", familiarID: "owner__f1", em: familiar, panel: &fakePanel{}},
 		},
 		activeIdx: 0,
 		started:   true,
@@ -783,14 +846,14 @@ func TestConfirmYesKeepsTabWhenHostCleanupFails(t *testing.T) {
 	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) error {
 		return cleanupErr
 	})
-	cp.pendingCloseFamiliar = "f1"
+	cp.pendingCloseFamiliar = "owner__f1"
 	cp.openCloseFamiliarModal("expert")
 
 	_ = cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	if len(cp.sessions) != 2 {
 		t.Fatalf("sessions after failed cleanup = %d, want 2", len(cp.sessions))
 	}
-	if cp.sessions[1].em != familiar || cp.sessions[1].familiarID != "f1" {
+	if cp.sessions[1].em != familiar || cp.sessions[1].familiarID != "owner__f1" {
 		t.Fatal("familiar tab/emulator was removed after failed cleanup")
 	}
 	if !cp.known["expert"] {

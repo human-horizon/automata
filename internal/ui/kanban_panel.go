@@ -64,11 +64,12 @@ var statusTransitions = map[string][]transition{
 
 // KanbanPanel renders a full kanban board using warp layout.
 type KanbanPanel struct {
-	profile string
-	domain  string
-	palette apptheme.Theme
-	tasks   []kanban.Task
-	tab     *warp.Tab
+	profile     string
+	domain      string
+	palette     apptheme.Theme
+	tasks       []kanban.Task
+	readWarning string
+	tab         *warp.Tab
 
 	btnPanel  *kanbanBtnPanel
 	colPanels []*kanbanColPanel
@@ -258,12 +259,14 @@ func (k *KanbanPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string) tea
 
 func (k *KanbanPanel) reload() {
 	k.tasks = nil
+	k.readWarning = ""
 	if k.domain == "" {
 		return
 	}
 	tasks, err := kanban.ReadAll(k.domain, k.profile)
 	k.tasks = tasks
 	if err != nil {
+		k.readWarning = strings.ReplaceAll(err.Error(), "\n", "; ")
 		log.Printf("automata: read Kanban domain %q: %v", k.domain, err)
 	}
 	k.distribute()
@@ -566,6 +569,11 @@ func (k *KanbanPanel) View(width, height int) string {
 	topPad := strings.Repeat(" ", width)
 	btnLine := k.btnPanel.View(width, 1)
 	boardTopPad := strings.Repeat(" ", width)
+	if k.readWarning != "" {
+		warning := "⚠ Не все Kanban-задачи загружены: " + k.readWarning
+		warning = ansi.Truncate(warning, width, "…")
+		boardTopPad = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error)).Render(warning)
+	}
 
 	colHeight := height - reserved
 	colW := k.colWidth()

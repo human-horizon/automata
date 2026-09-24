@@ -60,6 +60,80 @@ func TestMigrateLegacyData(t *testing.T) {
 	}
 }
 
+func TestMigrateLegacyDataIsScopedToSelectedProfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	legacyDir := filepath.Join(home, ".automata")
+	profileDir := filepath.Join(legacyDir, "Profile A")
+	if err := os.MkdirAll(profileDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "state.json"), []byte(`{"version":1,"items":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedDir := filepath.Join(legacyDir, "Profile B")
+	if err := os.MkdirAll(filepath.Join(unrelatedDir, "state.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(legacyDir, "state.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrateLegacyData("profile a"); err != nil {
+		t.Fatalf("migrate selected profile: %v", err)
+	}
+	selectedDir := paths.ProfileDir("profile a")
+	if _, err := os.Stat(filepath.Join(selectedDir, migrationMarkerName)); err != nil {
+		t.Fatalf("selected profile marker missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(paths.ProfileDir("profile b"), migrationMarkerName)); !os.IsNotExist(err) {
+		t.Fatalf("unrelated profile was migrated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(paths.ProfileDir(""), migrationMarkerName)); !os.IsNotExist(err) {
+		t.Fatalf("default profile was migrated by named-profile request: %v", err)
+	}
+	selected := New()
+	selected.Profile = "profile a"
+	if err := selected.LoadState(); err != nil {
+		t.Fatalf("unrelated legacy corruption blocked selected profile startup: %v", err)
+	}
+	if err := migrateLegacyData("profile b"); err != nil {
+		t.Fatalf("selecting corrupted profile migration: %v", err)
+	}
+	corrupted := New()
+	corrupted.Profile = "profile b"
+	if err := corrupted.LoadState(); err == nil {
+		t.Fatal("loading corrupted selected profile unexpectedly succeeded")
+	}
+}
+
+func TestMigrateLegacyDataDefaultDoesNotMigrateNamedProfiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	legacyDir := filepath.Join(home, ".automata")
+	if err := os.MkdirAll(filepath.Join(legacyDir, "Profile A"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "state.json"), []byte(`{"version":1,"items":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "Profile A", "state.json"), []byte(`{"version":1,"items":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrateLegacyData(""); err != nil {
+		t.Fatalf("migrate default profile: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(paths.ProfileDir(""), migrationMarkerName)); err != nil {
+		t.Fatalf("default profile marker missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(paths.ProfileDir("profile a"), migrationMarkerName)); !os.IsNotExist(err) {
+		t.Fatalf("named profile was migrated by default request: %v", err)
+	}
+}
+
 func TestMigrateLegacyDataResumesPartialProfileWithoutOverwritingDestination(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)

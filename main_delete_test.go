@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/tree"
@@ -135,7 +136,9 @@ func TestCleanupDeletedTreeItemStopsRuntimeAndRemovesGhostState(t *testing.T) {
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(`{"id":"job-stale","pid":2147483647,"status":"running"}`), 0o644); err != nil {
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	jobRecord := `{"id":"job-stale","pid":2147483647,"status":"running","startedAt":"` + startedAt + `"}`
+	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(jobRecord), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

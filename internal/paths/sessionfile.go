@@ -59,7 +59,7 @@ func EncodeCwdDir(cwd string) string {
 // empty the search falls back to all known roots (discovered by SessionRoots),
 // which is the legacy behaviour used by tools and tests.
 func FindSessionJSONL(sessionID, cwd, agentDir string) string {
-	if sessionID == "" {
+	if ValidateSessionID(sessionID) != nil {
 		return ""
 	}
 
@@ -169,6 +169,9 @@ func readSessionID(path string) string {
 // Clear must always know which agent it's clearing, otherwise it could
 // delete another profile's session by accident.
 func DeleteSessionJSONL(sessionID, cwd, agentDir string) (string, error) {
+	if err := ValidateSessionID(sessionID); err != nil {
+		return "", err
+	}
 	if agentDir == "" {
 		return "", fmt.Errorf("agentDir is required for safe deletion")
 	}
@@ -198,6 +201,9 @@ func FamiliarsJSONLPath(profile, sessionID string) string {
 // ChatPanel distinguishes "no file" from "explicit empty list" and uses
 // the latter as a clean state.
 func ClearFamiliarsJSONL(profile, sessionID string) error {
+	if err := ValidateSessionID(sessionID); err != nil {
+		return err
+	}
 	path := FamiliarsJSONLPath(profile, sessionID)
 	if _, err := os.Stat(filepath.Dir(path)); os.IsNotExist(err) {
 		return nil
@@ -245,6 +251,9 @@ type FamiliarEntry struct {
 // entries. A missing file or a missing entry is a no-op (returns nil).
 // Used by ChatPanel when the user closes a familiar via the × button.
 func RemoveFamiliar(profile, sessionID, familiarID string) error {
+	if err := ValidateFamiliarSessionID(sessionID, familiarID); err != nil {
+		return err
+	}
 	path := FamiliarsJSONLPath(profile, sessionID)
 	data, err := os.ReadFile(path)
 	if err != nil {

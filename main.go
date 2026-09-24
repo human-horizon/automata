@@ -63,6 +63,10 @@ type App struct {
 	// fail-closed job preflight before any runtime state is changed.
 	prepareJobSessionFn func(profile, sessionID string) error
 
+	// createChatEmulatorFn is injectable so restore tests can assert that
+	// stale active-session metadata never reaches emulator creation.
+	createChatEmulatorFn func(sessionID string) *portalis.Emulator
+
 	// mouseEnabled toggles mouse capture. When disabled, mouse events are
 	// not captured, allowing text selection in the terminal. Toggle with F8.
 	mouseEnabled bool
@@ -170,7 +174,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 		// Reuse existing emulator if available.
 		em, ok := a.emulatorCache[sessionID]
 		if !ok {
-			em = a.createChatEmulator(sessionID)
+			em = a.newChatEmulator(sessionID)
 			if em == nil {
 				return
 			}
@@ -655,8 +659,14 @@ func (a *App) restoreSessions() tea.Cmd {
 			// The current session is already open; don't duplicate it.
 			continue
 		}
+		if a.tree.FindItemBySessionID(sessionID) == nil {
+			warning := fmt.Errorf("discarded active session %q because it has no Tree item", sessionID)
+			log.Printf("automata: %v", warning)
+			a.tree.RecordActionWarning(warning)
+			continue
+		}
 
-		em := a.createChatEmulator(sessionID)
+		em := a.newChatEmulator(sessionID)
 		if em == nil {
 			continue
 		}
@@ -710,7 +720,17 @@ func (a *App) piLaunch(sessionID string) (cmd string, args []string, env []strin
 // a plain shell; pi sessions get the binary/env from piLaunch. The env is
 // recorded via SetStartEnv so any later Start variant keeps it. Returns nil
 // when no pi command is available.
+func (a *App) newChatEmulator(sessionID string) *portalis.Emulator {
+	if a.createChatEmulatorFn != nil {
+		return a.createChatEmulatorFn(sessionID)
+	}
+	return a.createChatEmulator(sessionID)
+}
+
 func (a *App) createChatEmulator(sessionID string) *portalis.Emulator {
+	if a.tree == nil {
+		return nil
+	}
 	item := a.tree.FindItemBySessionID(sessionID)
 
 	var cmd string
@@ -769,7 +789,7 @@ func (a *App) startAssignedTaskSession(sessionID string) tea.Cmd {
 	if _, ok := a.emulatorCache[sessionID]; ok {
 		return nil
 	}
-	em := a.createChatEmulator(sessionID)
+	em := a.newChatEmulator(sessionID)
 	if em == nil {
 		return nil
 	}
@@ -800,6 +820,10 @@ func (a *App) startAssignedTaskSession(sessionID string) tea.Cmd {
 // Returns the emulator and its launch env for StartWithEnv (ChatPanel
 // appends PI_OWNER_SESSION before starting).
 func (a *App) createFamiliarEmulator(sessionID string) (*portalis.Emulator, []string) {
+	if err := paths.ValidateSessionID(sessionID); err != nil {
+		log.Printf("automata: reject familiar session %q: %v", sessionID, err)
+		return nil, nil
+	}
 	if a.familiarEmulatorCache == nil {
 		a.familiarEmulatorCache = make(map[string]*portalis.Emulator)
 	}
@@ -946,7 +970,7 @@ func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.
 		}
 
 		// Recreate the emulator with the same session id so pi starts fresh
-		newEm := a.createChatEmulator(sessionID)
+		newEm := a.newChatEmulator(sessionID)
 		if newEm != nil {
 			if err := a.startEmulatorSync(newEm, nil); err != nil {
 				newEm.Stop()
@@ -1014,6 +1038,9 @@ func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
 // cleanupExternallyRemovedFamiliar stops host runtime state after the familiar
 // registry has already been changed. It preserves both the registry and JSONL.
 func (a *App) cleanupExternallyRemovedFamiliar(familiarID string, em *portalis.Emulator) error {
+	if err := paths.ValidateSessionID(familiarID); err != nil {
+		return fmt.Errorf("invalid familiar session ID: %w", err)
+	}
 	stopErr := a.stopSessionRuntime(familiarID, stopSessionOptions{
 		stopJobs:        true,
 		persistInactive: true,
@@ -1039,8 +1066,12 @@ func (a *App) cleanupExternallyRemovedFamiliar(familiarID string, em *portalis.E
 // uncommitted runtime preflight failure leaves host data and the tab intact;
 // committed cleanup warnings are returned after every host cleanup is tried.
 func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
+	ownerSessionID := a.activeChatSessionID()
+	if err := paths.ValidateFamiliarSessionID(ownerSessionID, familiarID); err != nil {
+		return fmt.Errorf("invalid familiar session ID: %w", err)
+	}
 	log.Printf("closeFamiliar: start familiarID=%q em=%v profile=%q activeChat=%q",
-		familiarID, em != nil, a.profile, a.activeChatSessionID())
+		familiarID, em != nil, a.profile, ownerSessionID)
 	stopErr := a.stopSessionRuntime(familiarID, stopSessionOptions{
 		stopJobs:        true,
 		persistInactive: true,
@@ -1063,7 +1094,7 @@ func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 			}
 		}
 	}
-	if err := paths.RemoveFamiliar(a.profile, a.activeChatSessionID(), familiarID); err != nil {
+	if err := paths.RemoveFamiliar(a.profile, ownerSessionID, familiarID); err != nil {
 		cleanupFailures = append(cleanupFailures, fmt.Errorf("remove familiar %q from registry: %w", familiarID, err))
 	}
 

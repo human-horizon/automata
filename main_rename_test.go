@@ -13,6 +13,126 @@ import (
 	"github.com/Starframe/portalis"
 )
 
+func newRenameWarningTestApp(t *testing.T, profile string) (*App, *tree.Tree) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	tr := tree.New()
+	tr.Profile = profile
+	app := &App{
+		tree:                  tr,
+		profile:               profile,
+		piAgentDir:            filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:        make(map[string]struct{}),
+		runningSessions:       make(map[string]struct{}),
+		emulatorCache:         make(map[string]*portalis.Emulator),
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		killSessionFn: func(_, _ string) error {
+			return errors.New("injected post-commit job cleanup failure")
+		},
+	}
+	return app, tr
+}
+
+func TestRenameCleanupWarningsRemainVisibleWithoutRollback(t *testing.T) {
+	t.Run("legacy direct callback", func(t *testing.T) {
+		app, tr := newRenameWarningTestApp(t, "direct-warning")
+		app.tree.AddChat("old")
+		item := tr.Root()[0]
+		tr.SetOnRename(app.renameTreeItem)
+
+		if err := tr.RenameItem(item, "new"); err != nil {
+			t.Fatalf("RenameItem: %v", err)
+		}
+		if item.Name != "new" {
+			t.Fatalf("committed rename was rolled back: %q", item.Name)
+		}
+		if warning := tr.LastActionError(); warning == nil || !strings.Contains(warning.Error(), "runtime cleanup is incomplete") {
+			t.Fatalf("post-commit cleanup warning = %v", warning)
+		}
+	})
+
+	t.Run("committed rename callback", func(t *testing.T) {
+		app, tr := newRenameWarningTestApp(t, "callback-warning")
+		tr.AddChat("old")
+		item := tr.Root()[0]
+		app.pendingRenamePlans = make(map[*tree.Item]*renamePlan)
+		tr.SetOnBeforeRename(func(item *tree.Item, newName string) (func() error, error) {
+			plan, err := buildRenamePlan(item, newName, app.profile)
+			if err != nil {
+				return nil, err
+			}
+			rollback, err := app.applyRenamePlan(plan)
+			if err != nil {
+				return nil, err
+			}
+			app.pendingRenamePlans[item] = plan
+			return func() error {
+				delete(app.pendingRenamePlans, item)
+				return rollback()
+			}, nil
+		})
+		tr.SetOnRenameCommitted(func(item *tree.Item, _, _ string) {
+			plan := app.pendingRenamePlans[item]
+			delete(app.pendingRenamePlans, item)
+			app.applyRenameMappings(plan)
+			app.finalizeRenamePlan(plan)
+		})
+
+		if err := tr.RenameItem(item, "new"); err != nil {
+			t.Fatalf("RenameItem: %v", err)
+		}
+		if item.Name != "new" {
+			t.Fatalf("committed rename was rolled back: %q", item.Name)
+		}
+		if warning := tr.LastActionError(); warning == nil || !strings.Contains(warning.Error(), "runtime cleanup is incomplete") {
+			t.Fatalf("post-commit cleanup warning = %v", warning)
+		}
+	})
+
+	t.Run("committed move callback", func(t *testing.T) {
+		app, tr := newRenameWarningTestApp(t, "move-warning")
+		tr.AddFolder("source")
+		tr.AddFolder("target")
+		source, target := tr.Root()[0], tr.Root()[1]
+		item := &tree.Item{Name: "chat"}
+		source.AddChild(item)
+		app.pendingMovePlans = make(map[*tree.Item]*renamePlan)
+		tr.SetOnBeforeItemMoved(func(item, newParent *tree.Item) (func() error, error) {
+			plan, err := buildMovePlan(item, newParent, app.profile)
+			if err != nil {
+				return nil, err
+			}
+			rollback, err := app.applyRenamePlan(plan)
+			if err != nil {
+				return nil, err
+			}
+			app.pendingMovePlans[item] = plan
+			return func() error {
+				delete(app.pendingMovePlans, item)
+				return rollback()
+			}, nil
+		})
+		tr.SetOnItemMoved(func(item *tree.Item, _, _ string) {
+			plan := app.pendingMovePlans[item]
+			delete(app.pendingMovePlans, item)
+			app.applyRenameMappings(plan)
+			app.finalizeRenamePlan(plan)
+		})
+
+		if err := tr.MoveItemChecked(item, target); err != nil {
+			t.Fatalf("MoveItemChecked: %v", err)
+		}
+		if got, want := tr.SessionKeyOf(item), "move-warning__target.chat"; got != want {
+			t.Fatalf("committed move session = %q, want %q", got, want)
+		}
+		if warning := tr.LastActionError(); warning == nil || !strings.Contains(warning.Error(), "runtime cleanup is incomplete") {
+			t.Fatalf("post-commit cleanup warning = %v", warning)
+		}
+	})
+}
+
 func TestRenameFolderMigratesContextsAndJSONL(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

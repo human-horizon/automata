@@ -1,9 +1,11 @@
 package tree
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestKeyboardNavigationUsesArrowsAndPages(t *testing.T) {
@@ -105,6 +107,31 @@ func TestRootToolbarAndFooterAreKeyboardAccessibleByMouse(t *testing.T) {
 	})
 	if !tr.HelpOpen() {
 		t.Fatal("footer Help button did not open help")
+	}
+}
+
+func TestHeaderKeepsToolbarVisibleWithLongProfile(t *testing.T) {
+	tr := New()
+	tr.Profile = "cue-test-plan"
+	tr.NoColor = true
+	const width = 30
+	view := tr.View(width, 5)
+	header := strings.Split(view, "\n")[0]
+	if got := ansi.StringWidth(header); got != width {
+		t.Fatalf("header width = %d, want %d: %q", got, width, header)
+	}
+	if !strings.Contains(header, "⋮") || !strings.Contains(header, "+") {
+		t.Fatalf("long profile hid toolbar controls: %q", header)
+	}
+
+	tr.handleMouse(tea.MouseMsg{
+		X:      width - 2,
+		Y:      0,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	if tr.popover == nil || len(tr.popover.Items) < 2 || tr.popover.Items[1].Name != "+ Chat" {
+		t.Fatalf("visible + toolbar did not open create menu: %+v", tr.popover)
 	}
 }
 

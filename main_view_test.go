@@ -1078,6 +1078,44 @@ func TestClearReplacesPanelEmulator(t *testing.T) {
 	}
 }
 
+func TestRestoreSessionsNeverCreatesAnEmulatorForGhostActiveID(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	tr := tree.New()
+	tr.Profile = "Getic"
+	tr.SetProfile("Getic")
+	tr.AddChat("real")
+	const ghostID = "getic__ghost"
+	tr.SetActiveSessionsInMemory(map[string]struct{}{ghostID: {}})
+
+	createCalls := 0
+	app := &App{
+		tree:           tr,
+		profile:        "Getic",
+		activeSessions: map[string]struct{}{ghostID: {}},
+		emulatorCache:  make(map[string]*portalis.Emulator),
+		createChatEmulatorFn: func(sessionID string) *portalis.Emulator {
+			createCalls++
+			return portalis.NewEmulator(sessionID, sessionID, "/bin/sh", nil)
+		},
+	}
+
+	if cmd := app.restoreSessions(); cmd != nil {
+		t.Fatal("restore returned a start command for a ghost session")
+	}
+	if createCalls != 0 {
+		t.Fatalf("emulator factory called %d times for ghost session", createCalls)
+	}
+	if len(app.emulatorCache) != 0 {
+		t.Fatalf("ghost emulator was cached: %v", app.emulatorCache)
+	}
+	if len(app.activeSessions) != 0 || len(tr.ActiveSessionIDs()) != 0 {
+		t.Fatalf("ghost active state survived restore: app=%v tree=%v", app.activeSessions, tr.ActiveSessionIDs())
+	}
+	if tr.LastActionError() == nil || !strings.Contains(tr.LastActionError().Error(), ghostID) {
+		t.Fatalf("ghost-session warning = %v", tr.LastActionError())
+	}
+}
+
 // newTestApp builds a minimal App for watcher/badge tests. It points the
 // session base dir at a fresh temp HOME so the test never touches the
 // user's real ~/.ai/automata. The Tree, status reader and per-session

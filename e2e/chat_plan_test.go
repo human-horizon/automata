@@ -3,9 +3,11 @@ package e2e
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/starframe-dev/cue-tty/pkg/cue"
 )
 
@@ -38,6 +40,10 @@ func TestChatOpensWithPlanPane(t *testing.T) {
 	page.WaitStable(100 * time.Millisecond)
 	page.EnableMouse()
 	page.WaitStable(500 * time.Millisecond)
+	if err := page.WaitFor("Automata", 5*time.Second); err != nil {
+		text, _ := page.Text()
+		t.Fatalf("Automata header did not render: %v\n%s", err, text)
+	}
 
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -47,12 +53,37 @@ func TestChatOpensWithPlanPane(t *testing.T) {
 		}
 	})
 
-	// Create a chat via the "+" button (after title, approx x=17).
-	// Clicking it opens a popover at (17, 0); then click the "+ Chat" option
-	// (second item, at x=18, y=2).
-	page.MouseClick(17, 0)
-	page.WaitStable(200 * time.Millisecond)
-	page.MouseClick(18, 2)
+	// Find the visible toolbar button and menu item from terminal output so a
+	// long profile name cannot invalidate fixed screen coordinates.
+	lines, err := page.Lines()
+	if err != nil || len(lines) == 0 {
+		t.Fatalf("read Automata header: lines=%v, err=%v", lines, err)
+	}
+	plusByteColumn := strings.LastIndex(lines[0], "+")
+	if plusByteColumn < 0 {
+		t.Fatalf("toolbar + button is missing from header:\n%s", strings.Join(lines, "\n"))
+	}
+	plusColumn := ansi.StringWidth(lines[0][:plusByteColumn])
+	page.MouseClick(plusColumn, 0)
+	if err := page.WaitFor("+ Chat", 2*time.Second); err != nil {
+		text, _ := page.Text()
+		t.Fatalf("chat creation menu did not open: %v\n%s", err, text)
+	}
+	lines, err = page.Lines()
+	if err != nil {
+		t.Fatalf("read chat creation menu: %v", err)
+	}
+	chatRow, chatColumn := -1, -1
+	for row, line := range lines {
+		if byteColumn := strings.Index(line, "+ Chat"); byteColumn >= 0 {
+			chatRow, chatColumn = row, ansi.StringWidth(line[:byteColumn])
+			break
+		}
+	}
+	if chatRow < 0 {
+		t.Fatalf("+ Chat option is missing from menu:\n%s", strings.Join(lines, "\n"))
+	}
+	page.MouseClick(chatColumn+1, chatRow)
 	if err := page.WaitFor("Chat name", 2*time.Second); err != nil {
 		t.Fatalf("chat creation modal did not open: %v", err)
 	}

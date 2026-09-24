@@ -245,7 +245,7 @@ func TestRemoveFamiliarUpdatesFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	const sessionID = "owner__sid"
+	const sessionID = "familiar"
 	const keepSID = "familiar__keep"
 	const dropSID = "familiar__drop"
 
@@ -284,7 +284,7 @@ func TestRemoveFamiliarUpdatesFile(t *testing.T) {
 func TestRemoveFamiliarPreservesUnknownMetadataAtomically(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	const profile = "test"
-	const owner = "owner__sid"
+	const owner = "familiar"
 	path := FamiliarsJSONLPath(profile, owner)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
@@ -340,7 +340,7 @@ func TestRemoveFamiliarMissingFileNoOp(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	if err := RemoveFamiliar("test", "no-such-session", "any-familiar"); err != nil {
+	if err := RemoveFamiliar("test", "missing", "missing__familiar"); err != nil {
 		t.Fatalf("missing file should be no-op, got error: %v", err)
 	}
 }
@@ -349,7 +349,7 @@ func TestRemoveFamiliarMissingEntryLeavesFileUntouched(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	const sessionID = "owner__sid"
+	const sessionID = "familiar"
 	path := FamiliarsJSONLPath("test", sessionID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -384,7 +384,7 @@ func TestRemoveFamiliarProfileSlugged(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	const sessionID = "owner__sid"
+	const sessionID = "familiar"
 	const keepSID = "familiar__keep"
 	const dropSID = "familiar__drop"
 

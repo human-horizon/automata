@@ -13,6 +13,39 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+func TestKanbanPanelShowsPartialReadWarningAndValidTasks(t *testing.T) {
+	profile := "Partial Read"
+	domain := "partial-read"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	dir := kanban.KanbanDir(domain, profile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "valid.md"), []byte("---\ntitle: Keep this task\nstatus: todo\n---\nvalid body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "broken.md"), []byte("not YAML frontmatter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	panel := NewKanbanPanel(profile)
+	defer panel.Close()
+	panel.SetDomain(domain)
+	if len(panel.tasks) != 1 || panel.tasks[0].Title != "Keep this task" {
+		t.Fatalf("valid tasks were not retained after partial read: %#v", panel.tasks)
+	}
+	if panel.readWarning == "" {
+		t.Fatal("partial read did not retain a diagnostic")
+	}
+	view := strip(panel.View(120, 12))
+	if !strings.Contains(view, "Не все Kanban-задачи загружены") {
+		t.Fatal("partial-read warning is not visible")
+	}
+	if !strings.Contains(view, "Keep this task") {
+		t.Fatal("valid task disappeared from the board after partial read")
+	}
+}
+
 func TestAssignTaskToChatReturnsListenCommandAndWritesBothRecords(t *testing.T) {
 	profile := "Assignment Profile"
 	domain := "assignment-domain"

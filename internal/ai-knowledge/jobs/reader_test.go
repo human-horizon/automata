@@ -654,7 +654,7 @@ func TestKillSessionDoesNotSignalDeadPIDAndCleansStaleRecord(t *testing.T) {
 		return nil
 	}
 
-	jobDir, _ := writeKillSessionRecord(t, sessionID, 2_147_483_647, "")
+	jobDir, _ := writeKillSessionRecord(t, sessionID, 2_147_483_647, time.Now().UTC().Format(time.RFC3339))
 	if err := KillSession(sessionID); err != nil {
 		t.Fatal(err)
 	}
@@ -1057,6 +1057,183 @@ func TestPrepareKillSessionFailsClosedAcrossAllJobsBeforeSignal(t *testing.T) {
 	}
 	if signals != 0 {
 		t.Fatalf("prepare sent %d signals, want 0", signals)
+	}
+}
+
+func TestKillSessionPreflightRejectsMalformedMetadataBeforeSignalOrMutation(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*JobRecord)
+		missing   bool
+		malformed []byte
+	}{
+		{name: "malformed JSON", malformed: []byte(`{"id":`)},
+		{name: "missing metadata", missing: true},
+		{name: "empty ID", mutate: func(record *JobRecord) { record.ID = "" }},
+		{name: "mismatched ID", mutate: func(record *JobRecord) { record.ID = "other" }},
+		{name: "invalid PID", mutate: func(record *JobRecord) { record.PID = 0 }},
+		{name: "missing start time", mutate: func(record *JobRecord) { record.StartedAt = "" }},
+		{name: "invalid start time", mutate: func(record *JobRecord) { record.StartedAt = "not-a-time" }},
+		{name: "unknown status", mutate: func(record *JobRecord) { record.Status = "queued" }},
+		{name: "malformed stopped record", mutate: func(record *JobRecord) {
+			record.Status = "stopped"
+			record.StartedAt = ""
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AI_DATA_HOME", t.TempDir())
+			const sessionID = "test__malformed-preflight"
+			jobsDir := filepath.Join(sessionDirForProfile("test", sessionID), "jobs")
+			validDir := filepath.Join(jobsDir, "job_valid")
+			invalidDir := filepath.Join(jobsDir, "job_invalid")
+			for _, dir := range []string{validDir, invalidDir} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			startedAt := time.Now().UTC().Format(time.RFC3339Nano)
+			validRecord := JobRecord{ID: "job_valid", Command: "sleep", PID: os.Getpid(), Status: "running", StartedAt: startedAt}
+			validData, err := json.Marshal(validRecord)
+			if err != nil {
+				t.Fatal(err)
+			}
+			validMeta := filepath.Join(validDir, "job.json")
+			if err := os.WriteFile(validMeta, validData, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var invalidData []byte
+			if test.malformed != nil {
+				invalidData = test.malformed
+			} else if !test.missing {
+				record := JobRecord{ID: "job_invalid", Command: "sleep", PID: os.Getpid(), Status: "running", StartedAt: startedAt}
+				if test.mutate != nil {
+					test.mutate(&record)
+				}
+				invalidData, err = json.Marshal(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if invalidData != nil {
+				if err := os.WriteFile(filepath.Join(invalidDir, "job.json"), invalidData, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			previousSignal := processSignal
+			previousPS := psRunnerOverride
+			previousProbe := processProbeFn
+			t.Cleanup(func() {
+				processSignal = previousSignal
+				psRunnerOverride = previousPS
+				processProbeFn = previousProbe
+			})
+			signals := 0
+			processSignal = func(int, syscall.Signal) error {
+				signals++
+				return nil
+			}
+			psRunnerOverride = matchingPSRunner()
+			processProbeFn = func(int) bool { return false }
+
+			if err := KillSessionForProfile("test", sessionID); err == nil {
+				t.Fatal("malformed job metadata unexpectedly allowed kill")
+			}
+			if signals != 0 {
+				t.Fatalf("processSignal called %d times, want 0", signals)
+			}
+			var got JobRecord
+			if err := readJSON(validMeta, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != "running" {
+				t.Fatalf("valid job status changed before complete preflight: %q", got.Status)
+			}
+			if _, err := os.Stat(invalidDir); err != nil {
+				t.Fatalf("malformed job directory was mutated: %v", err)
+			}
+			if invalidData != nil {
+				gotData, err := os.ReadFile(filepath.Join(invalidDir, "job.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(gotData) != string(invalidData) {
+					t.Fatalf("malformed metadata changed: want %q got %q", invalidData, gotData)
+				}
+			}
+		})
+	}
+}
+
+func TestKillSessionSkipsStructurallyValidNonRunningJob(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "test__terminal-job"
+	jobDir := filepath.Join(sessionDirForProfile("test", sessionID), "jobs", "job_exited")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	data, err := json.Marshal(JobRecord{ID: "job_exited", Command: "sleep", PID: os.Getpid(), Status: "exited", StartedAt: startedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(jobDir, "job.json")
+	if err := os.WriteFile(metaPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+	})
+	signals := 0
+	processSignal = func(int, syscall.Signal) error {
+		signals++
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+
+	if err := KillSessionForProfile("test", sessionID); err != nil {
+		t.Fatalf("KillSessionForProfile: %v", err)
+	}
+	if signals != 0 {
+		t.Fatalf("processSignal called %d times for a non-running job", signals)
+	}
+	got, err := os.ReadFile(metaPath)
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("valid non-running record changed: data=%q err=%v", got, err)
+	}
+}
+
+func TestJobSessionAPIsRejectUnsafeIDs(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	for _, test := range []struct {
+		name      string
+		sessionID string
+	}{
+		{name: "empty", sessionID: ""},
+		{name: "traversal", sessionID: "../outside"},
+		{name: "separator", sessionID: `test\\outside`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sessionID := test.sessionID
+			if _, err := ListForProfile("test", sessionID); err == nil {
+				t.Fatal("ListForProfile accepted unsafe session ID")
+			}
+			if _, err := RunningCountForProfile("test", sessionID); err == nil {
+				t.Fatal("RunningCountForProfile accepted unsafe session ID")
+			}
+			if err := PruneStaleSessionForProfile("test", sessionID); err == nil {
+				t.Fatal("PruneStaleSessionForProfile accepted unsafe session ID")
+			}
+			if _, err := PrepareKillSessionForProfile("test", sessionID); err == nil {
+				t.Fatal("PrepareKillSessionForProfile accepted unsafe session ID")
+			}
+		})
 	}
 }
 

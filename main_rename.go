@@ -564,8 +564,12 @@ func (a *App) finalizeRenamePlan(plan *renamePlan) error {
 		}
 	}
 	if err := errors.Join(failures...); err != nil {
-		log.Printf("automata: rename job cleanup warning: %v", err)
-		return err
+		warning := fmt.Errorf("rename/move committed but runtime cleanup is incomplete: %w", err)
+		log.Printf("automata: %v", warning)
+		if a.tree != nil {
+			a.tree.RecordActionWarning(warning)
+		}
+		return warning
 	}
 	return nil
 }

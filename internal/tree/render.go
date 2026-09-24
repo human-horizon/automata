@@ -420,6 +420,13 @@ func (t *Tree) renderHeader(width int) string {
 	rootMenuBtn := " ⋮ "
 	plusBtn := " + "
 
+	// Keep toolbar controls visible by truncating profile text to the remaining cells.
+	maxTitleWidth := width - lipgloss.Width(rootMenuBtn) - lipgloss.Width(plusBtn)
+	if maxTitleWidth < 0 {
+		maxTitleWidth = 0
+	}
+	title = ansi.Truncate(title, maxTitleWidth, "…")
+
 	// Collapse button is rendered by warp on the panel border.
 	nc := t.noColor()
 	styles := t.styles()

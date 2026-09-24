@@ -12,6 +12,7 @@ import (
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // stubPanel is a minimal warp.Panel for tests.
@@ -302,6 +303,73 @@ func TestKnowledgeSettingsNewFileAndMutuallyExclusiveToggle(t *testing.T) {
 	}
 	if settings["dual"] != true || settings["autoContinue"] {
 		t.Fatalf("new settings = %#v", settings)
+	}
+}
+
+func TestKnowledgeHeaderHitboxesMatchRenderedCells(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		width int
+	}{
+		{name: "title only", width: 8},
+		{name: "partial auto", width: 12},
+		{name: "auto edge", width: 18},
+		{name: "separator", width: 19},
+		{name: "partial dual", width: 25},
+		{name: "full header", width: 27},
+		{name: "wide header", width: 80},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AI_DATA_HOME", t.TempDir())
+			k := NewKnowledgePanel()
+			k.profile, k.sessionID = "header-test", "header-test__chat"
+			layout := k.headerLayout(test.width)
+			view := k.View(test.width, 2)
+			header := strings.SplitN(view, "\n", 2)[0]
+			if header != layout.rendered {
+				t.Fatalf("rendered header does not match hitbox layout: got %q want %q", header, layout.rendered)
+			}
+			if got := ansi.StringWidth(header); got > test.width {
+				t.Fatalf("header width = %d, viewport = %d", got, test.width)
+			}
+			for name, hitbox := range map[string]terminalCellRange{
+				"title": layout.title, "auto": layout.auto,
+				"separator": layout.separator, "dual": layout.dual,
+			} {
+				if hitbox.start < 0 || hitbox.end < hitbox.start || hitbox.end > test.width {
+					t.Errorf("%s hitbox is outside viewport: %#v width=%d", name, hitbox, test.width)
+				}
+			}
+
+			click := func(x int) {
+				k.handleMouse(tea.MouseMsg{X: x, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+			}
+			for _, x := range []int{layout.auto.start, layout.auto.end - 1} {
+				if x >= layout.auto.start && x < layout.auto.end {
+					k.autoContinue, k.dual = false, false
+					click(x)
+					if !k.autoContinue || k.dual {
+						t.Fatalf("Auto click at cell %d toggled wrong setting: auto=%v dual=%v", x, k.autoContinue, k.dual)
+					}
+				}
+			}
+			for _, x := range []int{layout.dual.start, layout.dual.end - 1} {
+				if x >= layout.dual.start && x < layout.dual.end {
+					k.autoContinue, k.dual = false, false
+					click(x)
+					if k.autoContinue || !k.dual {
+						t.Fatalf("Dual click at cell %d toggled wrong setting: auto=%v dual=%v", x, k.autoContinue, k.dual)
+					}
+				}
+			}
+			if layout.separator.start < layout.separator.end {
+				k.autoContinue, k.dual = false, false
+				click(layout.separator.start)
+				if k.autoContinue || k.dual {
+					t.Fatalf("separator click toggled a setting: auto=%v dual=%v", k.autoContinue, k.dual)
+				}
+			}
+		})
 	}
 }
 

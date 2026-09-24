@@ -301,6 +301,9 @@ func (cp *ChatPanel) familiarStatePath() string {
 // loadFamiliars reads and validates the familiar registry for this session.
 // A missing file means no familiars; unreadable or malformed files are errors.
 func (cp *ChatPanel) loadFamiliars() ([]FamiliarState, error) {
+	if err := paths.ValidateSessionID(cp.sessionID); err != nil {
+		return nil, fmt.Errorf("invalid owner session ID: %w", err)
+	}
 	path := cp.familiarStatePath()
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -321,6 +324,9 @@ func (cp *ChatPanel) loadFamiliars() ([]FamiliarState, error) {
 	for index, familiar := range familiars {
 		if familiar.ID == "" || familiar.SessionID == "" {
 			return nil, fmt.Errorf("decode familiar registry %q: entry %d is missing id or sessionId", path, index)
+		}
+		if err := paths.ValidateFamiliarSessionID(cp.sessionID, familiar.SessionID); err != nil {
+			return nil, fmt.Errorf("decode familiar registry %q: entry %d: %w", path, index, err)
 		}
 		if _, exists := seenIDs[familiar.ID]; exists {
 			return nil, fmt.Errorf("decode familiar registry %q: duplicate id %q", path, familiar.ID)
@@ -398,6 +404,11 @@ func (cp *ChatPanel) checkFamiliars() []tea.Cmd {
 // addFamiliar creates a new tab for a detected familiar.
 // Uses a TermPanel (Portalis Emulator) like the Main tab — no tmux needed.
 func (cp *ChatPanel) addFamiliar(id, familiarID string) tea.Cmd {
+	if err := paths.ValidateFamiliarSessionID(cp.sessionID, familiarID); err != nil {
+		cp.familiarError = err.Error()
+		log.Printf("automata: reject familiar session %q for owner %q: %v", familiarID, cp.sessionID, err)
+		return nil
+	}
 	// Idempotency: skip if we already track a session with the same
 	// familiarID OR same name (id). The duplicate-by-name check guards
 	// against races where cp.known was cleared but the prior session
@@ -529,6 +540,11 @@ func (cp *ChatPanel) closeFamiliarByID(familiarID string) {
 	if idx < 0 {
 		return
 	}
+	if err := paths.ValidateFamiliarSessionID(cp.sessionID, familiarID); err != nil {
+		cp.familiarError = err.Error()
+		log.Printf("automata: reject familiar close %q for owner %q: %v", familiarID, cp.sessionID, err)
+		return
+	}
 	if cp.onCloseFamiliar != nil {
 		if err := cp.onCloseFamiliar(familiarID, em); err != nil && !isCommittedCleanupError(err) {
 			return
@@ -593,6 +609,12 @@ func (cp *ChatPanel) handleExternalFamiliarRemoval(msg familiarRemovedMsg) {
 		cp.familiarCleanupError = "externally removed familiar has no session ID"
 		delete(cp.removalPending, msg.id)
 		log.Printf("automata: %s %q", cp.familiarCleanupError, msg.id)
+		return
+	}
+	if err := paths.ValidateFamiliarSessionID(cp.sessionID, familiarID); err != nil {
+		cp.familiarCleanupError = err.Error()
+		delete(cp.removalPending, msg.id)
+		log.Printf("automata: reject externally removed familiar %q for owner %q: %v", familiarID, cp.sessionID, err)
 		return
 	}
 

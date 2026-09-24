@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -409,6 +410,18 @@ func (t *Tree) containsItem(target *Item) bool {
 
 // LastActionError returns the most recent Tree operation warning or failure.
 func (t *Tree) LastActionError() error { return t.lastActionError }
+
+// RecordActionWarning stores an observable warning for the Tree footer without
+// changing the outcome of an already committed operation.
+func (t *Tree) RecordActionWarning(err error) {
+	if err == nil {
+		return
+	}
+	if t.lastActionError != nil {
+		err = errors.Join(t.lastActionError, err)
+	}
+	t.recordActionError(err)
+}
 
 // StateLoadError returns the startup snapshot error that blocks persistence.
 func (t *Tree) StateLoadError() error { return t.stateLoadErr }
@@ -1170,6 +1183,7 @@ func (t *Tree) renameItem(item *Item, name string) error {
 	}
 
 	oldName := item.Name
+	t.lastActionError = nil
 	var rollback func() error
 	if t.onBeforeRename != nil {
 		var err error
@@ -1204,7 +1218,6 @@ func (t *Tree) renameItem(item *Item, name string) error {
 		}
 		return t.recordActionError(err)
 	}
-	t.lastActionError = nil
 	if t.onRenameCommitted != nil {
 		t.onRenameCommitted(item, oldName, name)
 	}

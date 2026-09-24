@@ -164,11 +164,33 @@ func (t *Tree) LoadState() error {
 	}
 
 	root := fromStateItems(state.Items)
-	active := make(map[string]struct{}, len(state.ActiveSessions))
-	for _, id := range state.ActiveSessions {
-		if id != "" {
-			active[id] = struct{}{}
+	t.SetProfile(t.Profile)
+	validSessions := make(map[string]struct{})
+	var collectSessions func([]*Item)
+	collectSessions = func(items []*Item) {
+		for _, item := range items {
+			if item == nil {
+				continue
+			}
+			if item.IsFolder {
+				collectSessions(item.Children)
+				continue
+			}
+			validSessions[t.sessionKey(item)] = struct{}{}
 		}
+	}
+	collectSessions(root)
+	active := make(map[string]struct{}, len(state.ActiveSessions))
+	var discardedActive []string
+	for _, id := range state.ActiveSessions {
+		if id == "" {
+			continue
+		}
+		if _, exists := validSessions[id]; !exists {
+			discardedActive = append(discardedActive, id)
+			continue
+		}
+		active[id] = struct{}{}
 	}
 	t.root = root
 	t.treeWidth = state.TreeWidth
@@ -182,6 +204,10 @@ func (t *Tree) LoadState() error {
 	t.rebuildFlat()
 
 	t.stateLoadErr = nil
+	t.lastActionError = nil
+	if len(discardedActive) > 0 {
+		t.recordActionError(fmt.Errorf("discarded active session IDs not present in Tree: %s", strings.Join(discardedActive, ", ")))
+	}
 	return nil
 }
 

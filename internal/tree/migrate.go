@@ -16,8 +16,11 @@ import (
 // - ~/.automata/state.json / sessions / domains -> profiles/default/
 // - ~/.automata/<profile>/ -> profiles/<profile>/
 func migrateLegacyData(profile string) error {
-	if err := migrateDefaultProfile(); err != nil {
-		return fmt.Errorf("migrate default profile: %w", err)
+	if profile == "" {
+		if err := migrateDefaultProfile(); err != nil {
+			return fmt.Errorf("migrate default profile: %w", err)
+		}
+		return nil
 	}
 
 	home, err := os.UserHomeDir()
@@ -35,27 +38,30 @@ func migrateLegacyData(profile string) error {
 	if err != nil {
 		return fmt.Errorf("read legacy dir: %w", err)
 	}
+	profileSlug := paths.ProfileSlug(profile)
+	var legacyProfileDir string
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || entry.Name() == "sessions" || entry.Name() == "domains" {
 			continue
 		}
-		name := entry.Name()
-		if name == "sessions" || name == "domains" {
-			// These belong to the default profile and are handled by migrateDefaultProfile.
+		if slug.Slug(entry.Name()) != profileSlug {
 			continue
 		}
-		legacyProfileDir := filepath.Join(legacyDir, name)
-		// A profile directory must contain a state.json file.
-		if _, err := os.Stat(filepath.Join(legacyProfileDir, "state.json")); os.IsNotExist(err) {
-			continue
-		} else if err != nil {
-			return fmt.Errorf("stat legacy state for %s: %w", name, err)
+		if legacyProfileDir != "" {
+			return fmt.Errorf("multiple legacy directories match profile %q", profile)
 		}
-		profileSlug := slug.Slug(name)
-		newProfileDir := paths.ProfileDir(profileSlug)
-		if err := migrateProfileTree(legacyProfileDir, newProfileDir); err != nil {
-			return fmt.Errorf("migrate legacy profile %s: %w", name, err)
-		}
+		legacyProfileDir = filepath.Join(legacyDir, entry.Name())
+	}
+	if legacyProfileDir == "" {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(legacyProfileDir, "state.json")); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat legacy state for profile %s: %w", profile, err)
+	}
+	if err := migrateProfileTree(legacyProfileDir, paths.ProfileDir(profileSlug)); err != nil {
+		return fmt.Errorf("migrate legacy profile %s: %w", profile, err)
 	}
 	return nil
 }

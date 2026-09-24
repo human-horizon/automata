@@ -52,7 +52,6 @@ func TestResolveLegacySessionProfileFallbackOrder(t *testing.T) {
 		{name: "session prefix", sessionID: "named__chat", env: "legacy", want: "named"},
 		{name: "environment", sessionID: "unprefixed", env: "legacy", want: "legacy"},
 		{name: "default", sessionID: "unprefixed", want: "default"},
-		{name: "empty session uses environment without probing profile roots", env: "legacy", want: "legacy"},
 	}
 
 	for _, test := range tests {
@@ -93,5 +92,13 @@ func TestResolveLegacySessionProfileAmbiguityPolicy(t *testing.T) {
 func TestResolveLegacySessionProfileRejectsInvalidMode(t *testing.T) {
 	if _, err := ResolveLegacySessionProfile("session", LegacySessionProfileMode(99)); err == nil {
 		t.Fatal("invalid mode unexpectedly resolved a profile")
+	}
+}
+
+func TestResolveLegacySessionProfileRejectsUnsafeSessionID(t *testing.T) {
+	for _, sessionID := range []string{"", "../outside", "session\\other"} {
+		if _, err := ResolveLegacySessionProfile(sessionID, LegacySessionProfileReadOnly); err == nil {
+			t.Errorf("unsafe session ID %q unexpectedly resolved", sessionID)
+		}
 	}
 }

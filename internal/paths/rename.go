@@ -55,7 +55,16 @@ func RenameDirectory(oldPath, newPath string) error {
 // The search is restricted to agentDir so one pi agent cannot modify another
 // agent's history.
 func MigrateSessionJSONL(oldID, newID, cwd, agentDir string) (string, error) {
-	if oldID == "" || newID == "" || oldID == newID {
+	if oldID == "" || newID == "" {
+		return "", nil
+	}
+	if err := ValidateSessionID(oldID); err != nil {
+		return "", err
+	}
+	if err := ValidateSessionID(newID); err != nil {
+		return "", err
+	}
+	if oldID == newID {
 		return "", nil
 	}
 	oldPath := FindSessionJSONL(oldID, cwd, agentDir)
@@ -137,6 +146,9 @@ func MigrateSessionJSONL(oldID, newID, cwd, agentDir string) (string, error) {
 // ReadFamiliars returns the familiar records owned by a session. A missing
 // familiars.json is equivalent to an empty list.
 func ReadFamiliars(profile, ownerID string) ([]FamiliarEntry, error) {
+	if err := ValidateSessionID(ownerID); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(FamiliarsJSONLPath(profile, ownerID))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -148,14 +160,51 @@ func ReadFamiliars(profile, ownerID string) ([]FamiliarEntry, error) {
 	if err := json.Unmarshal(data, &entries); err != nil {
 		return nil, fmt.Errorf("decode familiars.json: %w", err)
 	}
+	if len(bytes.TrimSpace(data)) == 0 || bytes.TrimSpace(data)[0] != '[' {
+		return nil, fmt.Errorf("decode familiars.json: expected an array")
+	}
+	if err := validateFamiliarEntries(ownerID, entries); err != nil {
+		return nil, err
+	}
 	return entries, nil
+}
+
+func validateFamiliarEntries(ownerID string, entries []FamiliarEntry) error {
+	seenIDs := make(map[string]struct{}, len(entries))
+	seenSessions := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.ID) == "" {
+			return fmt.Errorf("familiar registry contains an empty ID")
+		}
+		if _, exists := seenIDs[entry.ID]; exists {
+			return fmt.Errorf("familiar registry contains duplicate ID %q", entry.ID)
+		}
+		seenIDs[entry.ID] = struct{}{}
+		if err := ValidateFamiliarSessionID(ownerID, entry.SessionID); err != nil {
+			return err
+		}
+		if _, exists := seenSessions[entry.SessionID]; exists {
+			return fmt.Errorf("familiar registry contains duplicate session ID %q", entry.SessionID)
+		}
+		seenSessions[entry.SessionID] = struct{}{}
+	}
+	return nil
 }
 
 // RewriteFamiliarSessionIDs updates familiar owner-prefixed IDs in place and
 // returns the old-to-new ID mapping. Unknown JSON fields are preserved.
 func RewriteFamiliarSessionIDs(profile, oldOwnerID, newOwnerID string) (map[string]string, error) {
 	mapping := make(map[string]string)
-	if oldOwnerID == "" || newOwnerID == "" || oldOwnerID == newOwnerID {
+	if oldOwnerID == "" || newOwnerID == "" {
+		return nil, fmt.Errorf("owner session IDs are required")
+	}
+	if err := ValidateSessionID(oldOwnerID); err != nil {
+		return nil, err
+	}
+	if err := ValidateSessionID(newOwnerID); err != nil {
+		return nil, err
+	}
+	if oldOwnerID == newOwnerID {
 		return mapping, nil
 	}
 	path := FamiliarsJSONLPath(profile, newOwnerID)
@@ -167,8 +216,20 @@ func RewriteFamiliarSessionIDs(profile, oldOwnerID, newOwnerID string) (map[stri
 		return nil, err
 	}
 
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, fmt.Errorf("decode familiars.json: expected an array")
+	}
+	var entries []FamiliarEntry
+	if err := json.Unmarshal(trimmed, &entries); err != nil {
+		return nil, fmt.Errorf("decode familiars.json: %w", err)
+	}
+	if err := validateFamiliarEntries(oldOwnerID, entries); err != nil {
+		return nil, err
+	}
+
 	var records []map[string]json.RawMessage
-	if err := json.Unmarshal(data, &records); err != nil {
+	if err := json.Unmarshal(trimmed, &records); err != nil {
 		return nil, fmt.Errorf("decode familiars.json: %w", err)
 	}
 	prefix := oldOwnerID + "__"

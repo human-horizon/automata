@@ -641,12 +641,85 @@ func (k *KnowledgePanel) refreshCurrentTask() {
 	k.currentTask = ""
 }
 
+type terminalCellRange struct {
+	start int
+	end   int
+}
+
+func (r terminalCellRange) contains(x int) bool {
+	return x >= r.start && x < r.end
+}
+
+type knowledgeHeaderLayout struct {
+	rendered  string
+	title     terminalCellRange
+	auto      terminalCellRange
+	separator terminalCellRange
+	dual      terminalCellRange
+}
+
+func visibleCellRange(start, width, viewportWidth int) terminalCellRange {
+	if start >= viewportWidth {
+		return terminalCellRange{start: viewportWidth, end: viewportWidth}
+	}
+	end := start + width
+	if end > viewportWidth {
+		end = viewportWidth
+	}
+	return terminalCellRange{start: start, end: end}
+}
+
+func (k *KnowledgePanel) headerLayout(width int) knowledgeHeaderLayout {
+	if width < 0 {
+		width = 0
+	}
+	autoLabel := "[× auto]"
+	autoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error))
+	if k.autoContinue {
+		autoLabel = "[✓ auto]"
+		autoStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Success))
+	}
+	dualLabel := "[× dual]"
+	dualStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error))
+	if k.dual {
+		dualLabel = "[✓ dual]"
+		dualStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Success))
+	}
+	title := lipgloss.NewStyle().Bold(true).
+		Foreground(lipgloss.Color(k.palette.TextStrong)).
+		Render("Knowledge ")
+	auto := autoStyle.Render(autoLabel)
+	separator := " "
+	dual := dualStyle.Render(dualLabel)
+
+	cursor := 0
+	titleWidth := ansi.StringWidth(title)
+	autoStart := cursor + titleWidth
+	autoWidth := ansi.StringWidth(auto)
+	separatorStart := autoStart + autoWidth
+	separatorWidth := ansi.StringWidth(separator)
+	dualStart := separatorStart + separatorWidth
+	dualWidth := ansi.StringWidth(dual)
+	layout := knowledgeHeaderLayout{
+		title:     visibleCellRange(cursor, titleWidth, width),
+		auto:      visibleCellRange(autoStart, autoWidth, width),
+		separator: visibleCellRange(separatorStart, separatorWidth, width),
+		dual:      visibleCellRange(dualStart, dualWidth, width),
+	}
+	if width > 0 {
+		layout.rendered = ansi.Truncate(title+auto+separator+dual, width, "")
+	}
+	return layout
+}
+
 func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) {
-	// Check header button clicks
 	if msg.Y == 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-		// Header: " Knowledge  [✓ auto] [× dual]"
-		// auto button starts at column 12, dual at column 22
-		if msg.X >= 12 && msg.X < 20 {
+		width := k.width
+		if width <= 0 {
+			width = 80
+		}
+		layout := k.headerLayout(width)
+		if layout.auto.contains(msg.X) {
 			oldAutoContinue, oldDual := k.autoContinue, k.dual
 			k.autoContinue = !k.autoContinue
 			if k.autoContinue {
@@ -657,7 +730,7 @@ func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) {
 			}
 			return
 		}
-		if msg.X >= 22 && msg.X < 30 {
+		if layout.dual.contains(msg.X) {
 			oldAutoContinue, oldDual := k.autoContinue, k.dual
 			k.dual = !k.dual
 			if k.dual {
@@ -716,26 +789,7 @@ func (k *KnowledgePanel) View(width, height int) string {
 		k.height = 24
 	}
 
-	// Build header with auto/dual buttons.
-	autoLabel := "[× auto]"
-	autoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error))
-	if k.autoContinue {
-		autoLabel = "[✓ auto]"
-		autoStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Success))
-	}
-	dualLabel := "[× dual]"
-	dualStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error))
-	if k.dual {
-		dualLabel = "[✓ dual]"
-		dualStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Success))
-	}
-
-	title := lipgloss.NewStyle().Bold(true).
-		Foreground(lipgloss.Color(k.palette.TextStrong)).
-		Render("Knowledge ")
-
-	buttons := autoStyle.Render(autoLabel) + " " + dualStyle.Render(dualLabel)
-	header := title + buttons
+	header := k.headerLayout(k.width).rendered
 
 	if k.height < 2 {
 		return header

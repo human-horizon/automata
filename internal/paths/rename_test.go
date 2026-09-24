@@ -86,6 +86,58 @@ func TestMigrateSessionJSONLRejectsTargetHistory(t *testing.T) {
 	}
 }
 
+func TestReadFamiliarsRejectsUnownedOrUnsafeSessionIDs(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "foreign owner", data: `[{"id":"expert","sessionId":"other__expert"}]`},
+		{name: "path-like suffix", data: `[{"id":"expert","sessionId":"profile__chat__../outside"}]`},
+		{name: "owner as child", data: `[{"id":"expert","sessionId":"profile__chat"}]`},
+		{name: "duplicate session", data: `[{"id":"expert","sessionId":"profile__chat__one"},{"id":"helper","sessionId":"profile__chat__one"}]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AI_DATA_HOME", t.TempDir())
+			const owner = "profile__chat"
+			path := FamiliarsJSONLPath("test", owner)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(test.data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadFamiliars("test", owner); err == nil {
+				t.Fatal("ReadFamiliars accepted invalid ownership metadata")
+			}
+		})
+	}
+}
+
+func TestRewriteFamiliarSessionIDsRejectsMalformedChildBeforeWrite(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const (
+		profile  = "test"
+		oldOwner = "profile__old-chat"
+		newOwner = "profile__new-chat"
+	)
+	path := FamiliarsJSONLPath(profile, newOwner)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte(`[{"id":"expert","sessionId":"profile__old-chat__../outside","extra":true}]`)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RewriteFamiliarSessionIDs(profile, oldOwner, newOwner); err == nil {
+		t.Fatal("RewriteFamiliarSessionIDs accepted path-like familiar ID")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("malformed familiar registry changed: data=%q err=%v", got, err)
+	}
+}
+
 func TestRewriteFamiliarSessionIDsPreservesUnknownFields(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("AI_DATA_HOME", dataHome)

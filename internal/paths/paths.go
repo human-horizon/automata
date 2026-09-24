@@ -112,6 +112,9 @@ func EnsureProfileDir(profile string) error {
 
 // EnsureSessionDir creates the session directory tree if it does not exist.
 func EnsureSessionDir(profile, sessionID string) error {
+	if err := ValidateSessionID(sessionID); err != nil {
+		return err
+	}
 	return os.MkdirAll(SessionDir(profile, sessionID), 0o755)
 }
 

@@ -263,6 +263,9 @@ func writeJSON(path string, rec *JobRecord) error {
 // keeps panel reads cheap and prevents a transient `ps` hiccup from erasing
 // the metadata of a job that is still legitimately running.
 func listForProfile(profile, sessionID string) ([]Job, error) {
+	if err := paths.ValidateSessionID(sessionID); err != nil {
+		return nil, err
+	}
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
@@ -329,6 +332,9 @@ func ListForProfile(profile, sessionID string) ([]Job, error) {
 // record directory. It is the only path that mutates running→exited in
 // job.json, which makes the cleanup behaviour easy to test in isolation.
 func pruneStaleSessionForProfile(profile, sessionID string) error {
+	if err := paths.ValidateSessionID(sessionID); err != nil {
+		return err
+	}
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
@@ -389,6 +395,9 @@ func PruneStaleSessionForProfile(profile, sessionID string) error {
 // cheap probe for callers that want to know "is there anything to look at?"
 // before doing the more expensive pidIsSameProcess sweep.
 func runningCountForProfile(profile, sessionID string) (int, error) {
+	if err := paths.ValidateSessionID(sessionID); err != nil {
+		return 0, err
+	}
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
@@ -500,11 +509,38 @@ type KillPlan struct {
 	candidates []killCandidate
 }
 
-// PrepareKillSessionForProfile reads and verifies every running job under an
-// explicit profile without sending signals or mutating metadata. Unknown
-// identity fails closed, so callers can prepare several sessions before any
-// destructive commit begins.
+func validateKillJobRecord(directoryName string, record JobRecord) error {
+	if strings.TrimSpace(record.ID) == "" {
+		return fmt.Errorf("job ID is empty")
+	}
+	if record.ID != directoryName {
+		return fmt.Errorf("job ID %q does not match directory %q", record.ID, directoryName)
+	}
+	if record.PID <= 0 {
+		return fmt.Errorf("job %s has invalid PID %d", record.ID, record.PID)
+	}
+	if strings.TrimSpace(record.StartedAt) == "" {
+		return fmt.Errorf("job %s has no start time", record.ID)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, record.StartedAt); err != nil {
+		return fmt.Errorf("job %s has invalid start time %q: %w", record.ID, record.StartedAt, err)
+	}
+	switch record.Status {
+	case "running", "stopped", "exited":
+		return nil
+	default:
+		return fmt.Errorf("job %s has unknown status %q", record.ID, record.Status)
+	}
+}
+
+// PrepareKillSessionForProfile reads and verifies every job under an explicit
+// profile before sending any signals or mutating metadata. Malformed records
+// and unknown running-process identities fail closed, so callers can prepare
+// several sessions before any destructive commit begins.
 func PrepareKillSessionForProfile(profile, sessionID string) (*KillPlan, error) {
+	if err := paths.ValidateSessionID(sessionID); err != nil {
+		return nil, err
+	}
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	plan := &KillPlan{profile: profile, sessionID: sessionID}
 	entries, err := os.ReadDir(jobsDir)
@@ -522,8 +558,11 @@ func PrepareKillSessionForProfile(profile, sessionID string) (*KillPlan, error) 
 		}
 		metaPath := filepath.Join(jobsDir, entry.Name(), "job.json")
 		var rec JobRecord
-		if err := readJSON(metaPath, &rec); err != nil || rec.ID == "" {
-			continue
+		if err := readJSON(metaPath, &rec); err != nil {
+			return nil, fmt.Errorf("read job %s metadata: %w", entry.Name(), err)
+		}
+		if err := validateKillJobRecord(entry.Name(), rec); err != nil {
+			return nil, fmt.Errorf("invalid job %s metadata: %w", entry.Name(), err)
 		}
 		if rec.Status != "running" {
 			continue
@@ -557,6 +596,9 @@ func (p *KillPlan) Execute() error {
 func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
 	if p == nil {
 		return nil
+	}
+	if err := paths.ValidateSessionID(sessionID); err != nil {
+		return err
 	}
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	var failures []error
