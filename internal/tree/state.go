@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 )
@@ -64,24 +64,7 @@ func stateFilePath(profile string) (string, error) {
 	return paths.StatePath(profile), nil
 }
 
-var (
-	createStateTemp = os.CreateTemp
-	writeStateTemp  = func(file *os.File, data []byte) error {
-		_, err := file.Write(data)
-		return err
-	}
-	syncStateTemp  = func(file *os.File) error { return file.Sync() }
-	closeStateTemp = func(file *os.File) error { return file.Close() }
-	renameState    = os.Rename
-	syncStateDir   = func(path string) error {
-		dir, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer dir.Close()
-		return dir.Sync()
-	}
-)
+var writeStateAtomic = atomicfile.Write
 
 // SaveState serializes the tree and atomically replaces the unified profile
 // state path. The temporary file lives beside state.json so Rename is atomic.
@@ -104,33 +87,11 @@ func (t *Tree) SaveState() error {
 		return err
 	}
 
-	tmp, err := createStateTemp(filepath.Dir(path), ".state-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temporary state: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-
-	if err := tmp.Chmod(0o644); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("chmod temporary state: %w", err)
-	}
-	if err := writeStateTemp(tmp, data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write temporary state: %w", err)
-	}
-	if err := syncStateTemp(tmp); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync temporary state: %w", err)
-	}
-	if err := closeStateTemp(tmp); err != nil {
-		return fmt.Errorf("close temporary state: %w", err)
-	}
-	if err := renameState(tmpPath, path); err != nil {
-		return fmt.Errorf("replace %s: %w", path, err)
-	}
-	if err := syncStateDir(filepath.Dir(path)); err != nil {
-		return &CommittedStateError{Path: path, Err: err}
+	if err := writeStateAtomic(path, data, 0o644); err != nil {
+		if atomicfile.IsCommitted(err) {
+			return &CommittedStateError{Path: path, Err: err}
+		}
+		return fmt.Errorf("write state %s: %w", path, err)
 	}
 	return nil
 }

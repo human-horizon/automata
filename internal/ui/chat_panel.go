@@ -50,6 +50,26 @@ func isCommittedCleanupError(err error) bool {
 	return errors.As(err, &committedErr)
 }
 
+// CommittedActionError reports a warning after the requested action has
+// already committed and must not be rolled back.
+type CommittedActionError struct {
+	Err error
+}
+
+func (e *CommittedActionError) Error() string {
+	if e == nil || e.Err == nil {
+		return "action committed with warnings"
+	}
+	return e.Err.Error()
+}
+
+func (e *CommittedActionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // chatSession represents one tab in the chat panel.
 type chatSession struct {
 	name       string
@@ -74,6 +94,7 @@ type ChatPanel struct {
 	removalPending       map[string]bool
 	familiarError        string
 	familiarCleanupError string
+	actionWarning        string
 	started              bool
 
 	// Cached dimensions for tab bar rendering.
@@ -144,6 +165,11 @@ func (cp *ChatPanel) SetTheme(palette apptheme.Theme) {
 // .jsonl file for the session, and restart pi.
 func (cp *ChatPanel) SetOnClearSession(fn func(sessionID, cwd string) tea.Cmd) {
 	cp.onClearSession = fn
+}
+
+// SetActionWarning displays a lifecycle error in the chat tab bar.
+func (cp *ChatPanel) SetActionWarning(message string) {
+	cp.actionWarning = strings.ReplaceAll(message, "\n", "; ")
 }
 
 // SetOnCloseFamiliar sets the handler invoked when the user confirms closing
@@ -682,6 +708,9 @@ func (cp *ChatPanel) joinWithBar(termView string, termHeight, width int) string 
 
 func (cp *ChatPanel) tabBarWarning() string {
 	var warnings []string
+	if cp.actionWarning != "" {
+		warnings = append(warnings, "action: "+cp.actionWarning)
+	}
 	if cp.familiarError != "" {
 		warnings = append(warnings, "registry: "+cp.familiarError)
 	}
@@ -691,7 +720,11 @@ func (cp *ChatPanel) tabBarWarning() string {
 	if len(warnings) == 0 {
 		return ""
 	}
-	return "! familiar " + strings.Join(warnings, "; ") + " "
+	prefix := "! "
+	if cp.actionWarning == "" {
+		prefix += "familiar "
+	}
+	return prefix + strings.Join(warnings, "; ") + " "
 }
 
 func familiarTabStyle(palette apptheme.Theme, active bool) lipgloss.Style {
@@ -862,16 +895,6 @@ func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
 		cp.height = msg.Height
 		forwardCmd = cp.resizeActivePanel()
 
-	case familiarOutputMsg, familiarPaneIDMsg:
-		// Familiars now use TermPanel (Portalis Emulator), not FamiliarPanel.
-		// These messages are no longer sent — fall through to default routing.
-		forwardCmd = cp.routeBySessionID(msg)
-		if forwardCmd == nil {
-			if cp.activeIdx >= 0 && cp.activeIdx < len(cp.sessions) {
-				forwardCmd = cp.sessions[cp.activeIdx].panel.Update(msg)
-			}
-		}
-
 	case portalis.PtyExitMsg:
 		// When a familiar PTY exits, remove it from sessions and clear
 		// cp.known so the next checkFamiliars poll can re-spawn it from
@@ -912,36 +935,6 @@ func (cp *ChatPanel) routeBySessionID(msg tea.Msg) tea.Cmd {
 
 	for _, s := range cp.sessions {
 		if s.em != nil && s.em.SessionID == sessionID {
-			return s.panel.Update(msg)
-		}
-	}
-	return nil
-}
-
-// routeFamiliarMsg routes familiarOutputMsg and familiarPaneIDMsg to the
-// correct FamiliarPanel by matching familiarID. Returns nil if no match.
-func (cp *ChatPanel) routeFamiliarMsg(msg tea.Msg) tea.Cmd {
-	var familiarID string
-	switch m := msg.(type) {
-	case familiarOutputMsg:
-		familiarID = m.sessionID
-	case familiarPaneIDMsg:
-		// familiarPaneIDMsg carries pane ID, not familiarID — route to all
-		// FamiliarPanels, each checks if it's the right one.
-		for _, s := range cp.sessions {
-			if fp, ok := s.panel.(*FamiliarPanel); ok {
-				if cmd := fp.Update(msg); cmd != nil {
-					return cmd
-				}
-			}
-		}
-		return nil
-	default:
-		return nil
-	}
-
-	for _, s := range cp.sessions {
-		if s.familiarID == familiarID {
 			return s.panel.Update(msg)
 		}
 	}
@@ -993,6 +986,7 @@ func (cp *ChatPanel) handleMouse(msg tea.Msg) tea.Cmd {
 		if active != nil && active.em != nil {
 			cwd = active.em.CWD()
 		}
+		cp.actionWarning = ""
 		return cp.onClearSession(cp.sessionID, cwd)
 	}
 
@@ -1038,9 +1032,8 @@ func (cp *ChatPanel) handleMouse(msg tea.Msg) tea.Cmd {
 	return nil
 }
 
-// resizeActivePanel sends a fresh warp.ResizeMsg to all sessions so they
-// know their current size. FamiliarPanel uses this to keep its tmux pane
-// in sync even when the user isn't currently viewing it.
+// resizeActivePanel sends a fresh warp.ResizeMsg to all sessions so their
+// terminal emulators stay in sync even when the user isn't viewing them.
 func (cp *ChatPanel) resizeActivePanel() tea.Cmd {
 	if cp.width <= 0 || cp.height <= 1 {
 		return nil

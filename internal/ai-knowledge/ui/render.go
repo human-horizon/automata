@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -82,14 +82,23 @@ func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask strin
 	return ViewWithTheme(width, height, ctx, js, currentTask, apptheme.Default())
 }
 
-// ViewWithTheme renders the knowledge panel with the supplied palette.
+// CollapseState records which knowledge sections are hidden.
+type CollapseState struct {
+	Plans bool
+	Jobs  bool
+}
+
+// ViewWithTheme renders the knowledge panel with the supplied palette and a fixed height.
 func ViewWithTheme(width, height int, ctx *context.Data, js []jobs.Job, currentTask string, palette apptheme.Theme) string {
+	return fitHeight(ContentWithTheme(width, ctx, js, currentTask, palette, CollapseState{}), height)
+}
+
+// ContentWithTheme renders all content without clipping it to a viewport. The
+// embedding panel owns scrolling and can collapse selected sections.
+func ContentWithTheme(width int, ctx *context.Data, js []jobs.Job, currentTask string, palette apptheme.Theme, collapsed CollapseState) string {
 	styles := newRenderStyles(palette)
 	if width <= 0 {
 		width = 80
-	}
-	if height <= 0 {
-		height = 24
 	}
 
 	var b strings.Builder
@@ -101,12 +110,12 @@ func ViewWithTheme(width, height int, ctx *context.Data, js []jobs.Job, currentT
 		if s.Action != "" {
 			main = icon
 		}
-		for _, line := range wrapString("  "+main, width) {
+		for _, line := range wrapPrefixed("  ", main, width) {
 			b.WriteString(styles.item.Render(line))
 			b.WriteString("\n")
 		}
 		if s.Description != "" && (s.Action == "read" || s.Action == "write" || s.Action == "run") && !strings.HasSuffix(main, s.Description) {
-			for _, line := range wrapString("  "+s.Description, width) {
+			for _, line := range wrapPrefixed("  ", s.Description, width) {
 				b.WriteString(styles.path.Render(line))
 				b.WriteString("\n")
 			}
@@ -123,9 +132,9 @@ func ViewWithTheme(width, height int, ctx *context.Data, js []jobs.Job, currentT
 		b.WriteString("\n")
 	}
 
-	writeSection(&b, "Plans", styles.section)
+	writeCollapsibleSection(&b, "Plans", collapsed.Plans, styles.section)
 
-	if ctx != nil && len(ctx.Plans) > 0 {
+	if !collapsed.Plans && ctx != nil && len(ctx.Plans) > 0 {
 		names := make([]string, 0, len(ctx.Plans))
 		for n := range ctx.Plans {
 			names = append(names, n)
@@ -143,37 +152,44 @@ func ViewWithTheme(width, height int, ctx *context.Data, js []jobs.Job, currentT
 					mark = "[x]"
 					style = styles.done
 				}
-				line := fmt.Sprintf("    %s %s", mark, text)
-				for _, wl := range wrapString(line, width) {
+				prefix := fmt.Sprintf("    %s ", mark)
+				for _, wl := range wrapPrefixed(prefix, text, width) {
 					b.WriteString(style.Render(wl))
 					b.WriteString("\n")
 				}
 			}
 		}
-	} else {
+	} else if !collapsed.Plans {
 		b.WriteString(styles.empty.Render("  (no plans)"))
 		b.WriteString("\n")
 	}
 
-	writeSection(&b, "Jobs", styles.section)
-	if len(js) > 0 {
+	writeCollapsibleSection(&b, "Jobs", collapsed.Jobs, styles.section)
+	if !collapsed.Jobs && len(js) > 0 {
 		for _, j := range js {
 			mark := "•"
 			if j.Running {
 				mark = "●"
 			}
-			line := fmt.Sprintf("  %s %s", mark, firstLine(j.Command))
-			for _, wl := range wrapString(line, width) {
+			prefix := fmt.Sprintf("  %s ", mark)
+			for _, wl := range wrapPrefixed(prefix, firstLine(j.Command), width) {
 				b.WriteString(styles.item.Render(wl))
 				b.WriteString("\n")
 			}
 		}
-	} else {
+	} else if !collapsed.Jobs {
 		b.WriteString(styles.empty.Render("  (no running jobs)"))
 		b.WriteString("\n")
 	}
 
-	lines := strings.Split(b.String(), "\n")
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+func fitHeight(content string, height int) string {
+	if height <= 0 {
+		height = 24
+	}
+	lines := strings.Split(content, "\n")
 	if len(lines) > height {
 		lines = lines[:height]
 	}
@@ -186,7 +202,15 @@ func ViewWithTheme(width, height int, ctx *context.Data, js []jobs.Job, currentT
 func writeSection(b *strings.Builder, title string, style lipgloss.Style) {
 	b.WriteString(style.Render("── " + title + " "))
 	b.WriteString("\n")
-	_ = time.Now()
+}
+
+func writeCollapsibleSection(b *strings.Builder, title string, collapsed bool, style lipgloss.Style) {
+	indicator := "▾"
+	if collapsed {
+		indicator = "▸"
+	}
+	b.WriteString(style.Render("── " + indicator + " " + title + " "))
+	b.WriteString("\n")
 }
 
 func firstLine(s string) string {
@@ -211,8 +235,43 @@ func wrapString(s string, width int) []string {
 		if breakAt <= 0 {
 			breakAt = findBreakAt(s, width)
 		}
+		if breakAt <= 0 {
+			_, breakAt = utf8.DecodeRuneInString(s)
+		}
 		lines = append(lines, s[:breakAt])
 		s = s[breakAt:]
+	}
+	return lines
+}
+
+func wrapPrefixed(prefix, text string, width int) []string {
+	if width <= lipgloss.Width(prefix) {
+		return wrapString(prefix+text, width)
+	}
+	if text == "" {
+		return []string{prefix}
+	}
+
+	continuation := strings.Repeat(" ", lipgloss.Width(prefix))
+	lines := make([]string, 0, 1)
+	currentPrefix := prefix
+	remaining := text
+	for remaining != "" {
+		available := width - lipgloss.Width(currentPrefix)
+		if lipgloss.Width(remaining) <= available {
+			lines = append(lines, currentPrefix+remaining)
+			break
+		}
+		breakAt := lastSpaceBefore(remaining, available)
+		if breakAt <= 0 {
+			breakAt = findBreakAt(remaining, available)
+		}
+		if breakAt <= 0 {
+			_, breakAt = utf8.DecodeRuneInString(remaining)
+		}
+		lines = append(lines, currentPrefix+strings.TrimRight(remaining[:breakAt], " "))
+		remaining = strings.TrimLeft(remaining[breakAt:], " ")
+		currentPrefix = continuation
 	}
 	return lines
 }

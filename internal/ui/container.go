@@ -40,7 +40,7 @@ type Container struct {
 	profile        string
 	planWidth      int // fixed knowledge panel width in characters
 	chats          []ChatInfo
-	onTaskAssigned func(sessionID, taskTitle string) tea.Cmd
+	onTaskAssigned func(sessionID, taskTitle string) (tea.Cmd, error)
 
 	// Cached dimensions for border calculations.
 	width  int
@@ -215,8 +215,13 @@ func (c *Container) SetChats(chats []ChatInfo) {
 	}
 }
 
+// Chats returns a copy of the chat options currently supplied to the Kanban picker.
+func (c *Container) Chats() []ChatInfo {
+	return append([]ChatInfo(nil), c.chats...)
+}
+
 // SetOnTaskAssigned sets a callback for when a task is assigned to a chat.
-func (c *Container) SetOnTaskAssigned(fn func(sessionID, taskTitle string) tea.Cmd) {
+func (c *Container) SetOnTaskAssigned(fn func(sessionID, taskTitle string) (tea.Cmd, error)) {
 	c.onTaskAssigned = fn
 	if c.contextPanel != nil {
 		c.contextPanel.SetOnTaskAssigned(fn)
@@ -248,13 +253,15 @@ func (c *Container) RefreshKnowledge() {
 // knowledge and context panels. The UI applies it in the main Update loop so
 // file I/O never blocks the renderer.
 type KnowledgeRefreshMsg struct {
-	SessionID   string
-	Domain      string
-	Profile     string
-	Context     *akcontext.Data
-	Jobs        []akjobs.Job
-	Memory      *memory.Data
-	MemoryError string
+	SessionID    string
+	Domain       string
+	Profile      string
+	Context      *akcontext.Data
+	ContextError string
+	Jobs         []akjobs.Job
+	JobsError    string
+	Memory       *memory.Data
+	MemoryError  string
 }
 
 // RefreshKnowledgeCmd returns a command that reads the knowledge files for
@@ -278,12 +285,12 @@ func (c *Container) RefreshKnowledgeCmd() tea.Cmd {
 			Profile:   profile,
 		}
 		if sessionID != "" {
-			if d, err := akcontext.ReadForProfile(profile, sessionID); err == nil {
-				msg.Context = d
-			}
-			if j, err := akjobs.ListForProfile(profile, sessionID); err == nil {
-				msg.Jobs = j
-			}
+			contextData, contextErr := akcontext.ReadForProfile(profile, sessionID)
+			msg.Context = contextData
+			msg.ContextError = knowledgeReadError(contextErr)
+			jobs, jobsErr := akjobs.ListForProfile(profile, sessionID)
+			msg.Jobs = jobs
+			msg.JobsError = knowledgeReadError(jobsErr)
 		}
 		if domain != "" {
 			if d, err := memory.Read(profile, domain); err == nil {
@@ -299,12 +306,12 @@ func (c *Container) RefreshKnowledgeCmd() tea.Cmd {
 // ApplyKnowledgeRefresh applies the data carried by a KnowledgeRefreshMsg.
 func (c *Container) ApplyKnowledgeRefresh(msg KnowledgeRefreshMsg) {
 	if c.knowledgePanel != nil && msg.SessionID == c.knowledgePanel.sessionID {
-		if msg.Context != nil {
+		if msg.SessionID != "" {
 			c.knowledgePanel.data = msg.Context
-		}
-		if msg.Jobs != nil {
 			c.knowledgePanel.jobs = msg.Jobs
 		}
+		c.knowledgePanel.contextError = msg.ContextError
+		c.knowledgePanel.jobsError = msg.JobsError
 		c.knowledgePanel.lastRefresh = time.Now()
 		c.knowledgePanel.refreshCurrentTask()
 	}
@@ -381,8 +388,12 @@ func (c *Container) SetPlanWidth(w int) {
 // Does NOT call Update on innerTab — that happens in the normal Update path
 // so commands (like Listen for PTY output) are not lost.
 func (c *Container) View(width, height int) string {
+	widthChanged := width > 0 && width != c.width
 	c.width = width
 	c.height = height
+	if widthChanged {
+		c.updateSplitFraction()
+	}
 
 	return c.innerTab.View(width, height)
 }

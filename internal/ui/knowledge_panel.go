@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -60,13 +61,19 @@ type KnowledgePanel struct {
 	domain    string
 	palette   apptheme.Theme
 
-	width        int
-	height       int
-	scrollOffset int
+	width          int
+	height         int
+	scrollOffset   int
+	plansCollapsed bool
+	jobsCollapsed  bool
+	plansHeaderY   int
+	jobsHeaderY    int
 
-	lastRefresh time.Time
-	data        *akcontext.Data
-	jobs        []akjobs.Job
+	lastRefresh  time.Time
+	data         *akcontext.Data
+	jobs         []akjobs.Job
+	contextError string
+	jobsError    string
 
 	// Cached readers prevent re-reading unchanged files on every tick.
 	contextReader *akcontext.CachedReader
@@ -105,6 +112,8 @@ func NewKnowledgePanel() *KnowledgePanel {
 		palette:       apptheme.Default(),
 		contextReader: akcontext.NewCachedReader(),
 		jobsReader:    akjobs.NewCachedReader(),
+		plansHeaderY:  -1,
+		jobsHeaderY:   -1,
 	}
 }
 
@@ -118,6 +127,8 @@ func (k *KnowledgePanel) SetProfile(profile string) {
 	k.profile = profile
 	k.data = nil
 	k.jobs = nil
+	k.contextError = ""
+	k.jobsError = ""
 	k.contextReader.Invalidate(k.profile, k.sessionID)
 	k.readSettings()
 	if k.sessionID != "" {
@@ -151,6 +162,8 @@ func (k *KnowledgePanel) SetSession(sessionID string) {
 	k.sessionID = sessionID
 	k.data = nil
 	k.jobs = nil
+	k.contextError = ""
+	k.jobsError = ""
 	k.contextReader.Invalidate(k.profile, sessionID)
 	k.readSettings()
 	k.closeWatchers()
@@ -345,6 +358,13 @@ func (k *KnowledgePanel) writeSettings() error {
 	return nil
 }
 
+func knowledgeReadError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.ReplaceAll(err.Error(), "\n", "; ")
+}
+
 func (k *KnowledgePanel) setSettingsError(err error) {
 	if err == nil {
 		k.settingsError = ""
@@ -371,41 +391,11 @@ func settingsWriteWasCommitted(err error) bool {
 }
 
 func writeSettingsAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	temporary, err := os.CreateTemp(dir, ".settings-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temporary settings: %w", err)
+	err := atomicfile.Write(path, data, 0o644)
+	if !atomicfile.IsCommitted(err) {
+		return err
 	}
-	temporaryPath := temporary.Name()
-	defer func() { _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(0o644); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("chmod temporary settings: %w", err)
-	}
-	if _, err := temporary.Write(data); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("write temporary settings: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("sync temporary settings: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close temporary settings: %w", err)
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("replace settings: %w", err)
-	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return &committedSettingsWriteError{path: path, err: err}
-	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	if syncErr != nil || closeErr != nil {
-		return &committedSettingsWriteError{path: path, err: errors.Join(syncErr, closeErr)}
-	}
-	return nil
+	return &committedSettingsWriteError{path: path, err: err}
 }
 
 // settingsPath returns the path to settings.json for the current session.
@@ -420,12 +410,14 @@ func (k *KnowledgePanel) Refresh() {
 	if k.sessionID == "" {
 		return
 	}
-	if d, err := k.contextReader.ReadForProfile(k.profile, k.sessionID); err == nil {
-		k.data = d
+	data, contextErr := k.contextReader.ReadForProfile(k.profile, k.sessionID)
+	if data != nil {
+		k.data = data
 	}
-	if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
-		k.jobs = j
-	}
+	k.contextError = knowledgeReadError(contextErr)
+	jobs, jobsErr := k.jobsReader.ListForProfile(k.profile, k.sessionID)
+	k.jobs = jobs
+	k.jobsError = knowledgeReadError(jobsErr)
 	k.refreshCurrentTask()
 	k.lastRefresh = time.Now()
 }
@@ -512,12 +504,14 @@ func (k *KnowledgePanel) refreshKnowledgeData() {
 	// after either kind of event.
 	k.attachKnowledgeWatcherIfMissing()
 	k.attachJobsWatcherIfMissing()
-	if d, err := k.contextReader.ReadForProfile(k.profile, k.sessionID); err == nil {
-		k.data = d
+	data, contextErr := k.contextReader.ReadForProfile(k.profile, k.sessionID)
+	if data != nil {
+		k.data = data
 	}
-	if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
-		k.jobs = j
-	}
+	k.contextError = knowledgeReadError(contextErr)
+	jobs, jobsErr := k.jobsReader.ListForProfile(k.profile, k.sessionID)
+	k.jobs = jobs
+	k.jobsError = knowledgeReadError(jobsErr)
 	k.readSettings()
 	k.refreshCurrentTask()
 	k.lastRefresh = time.Now()
@@ -529,11 +523,17 @@ func (k *KnowledgePanel) refreshJobsData() {
 	// PruneStaleSession is the only place that flips running→exited in
 	// job.json. We deliberately do it before re-reading the list so the
 	// updated metadata is what the user sees.
-	if err := akjobs.PruneStaleSessionForProfile(k.profile, k.sessionID); err == nil {
-		if j, err := k.jobsReader.ListForProfile(k.profile, k.sessionID); err == nil {
-			k.jobs = j
-		}
+	pruneErr := akjobs.PruneStaleSessionForProfile(k.profile, k.sessionID)
+	jobs, readErr := k.jobsReader.ListForProfile(k.profile, k.sessionID)
+	k.jobs = jobs
+	var diagnostics []error
+	if pruneErr != nil {
+		diagnostics = append(diagnostics, fmt.Errorf("prune stale jobs: %w", pruneErr))
 	}
+	if readErr != nil {
+		diagnostics = append(diagnostics, readErr)
+	}
+	k.jobsError = knowledgeReadError(errors.Join(diagnostics...))
 	k.lastRefresh = time.Now()
 }
 
@@ -652,7 +652,6 @@ func (r terminalCellRange) contains(x int) bool {
 
 type knowledgeHeaderLayout struct {
 	rendered  string
-	title     terminalCellRange
 	auto      terminalCellRange
 	separator terminalCellRange
 	dual      terminalCellRange
@@ -685,34 +684,38 @@ func (k *KnowledgePanel) headerLayout(width int) knowledgeHeaderLayout {
 		dualLabel = "[✓ dual]"
 		dualStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Success))
 	}
-	title := lipgloss.NewStyle().Bold(true).
-		Foreground(lipgloss.Color(k.palette.TextStrong)).
-		Render("Knowledge ")
 	auto := autoStyle.Render(autoLabel)
 	separator := " "
 	dual := dualStyle.Render(dualLabel)
 
-	cursor := 0
-	titleWidth := ansi.StringWidth(title)
-	autoStart := cursor + titleWidth
+	autoStart := 0
 	autoWidth := ansi.StringWidth(auto)
 	separatorStart := autoStart + autoWidth
 	separatorWidth := ansi.StringWidth(separator)
 	dualStart := separatorStart + separatorWidth
 	dualWidth := ansi.StringWidth(dual)
 	layout := knowledgeHeaderLayout{
-		title:     visibleCellRange(cursor, titleWidth, width),
 		auto:      visibleCellRange(autoStart, autoWidth, width),
 		separator: visibleCellRange(separatorStart, separatorWidth, width),
 		dual:      visibleCellRange(dualStart, dualWidth, width),
 	}
 	if width > 0 {
-		layout.rendered = ansi.Truncate(title+auto+separator+dual, width, "")
+		layout.rendered = ansi.Truncate(auto+separator+dual, width, "")
 	}
 	return layout
 }
 
 func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) {
+	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		if msg.Y == k.plansHeaderY {
+			k.plansCollapsed = !k.plansCollapsed
+			return
+		}
+		if msg.Y == k.jobsHeaderY {
+			k.jobsCollapsed = !k.jobsCollapsed
+			return
+		}
+	}
 	if msg.Y == 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 		width := k.width
 		if width <= 0 {
@@ -772,6 +775,16 @@ func (k *KnowledgePanel) handleKey(msg tea.KeyMsg) {
 	}
 }
 
+func knowledgeSectionLine(content, title string) int {
+	for index, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "──") && strings.Contains(line, title) {
+			return index
+		}
+	}
+	return -1
+}
+
 // View renders the panel as a string for the parent App's View(). The signature
 // matches warp.Panel, so KnowledgePanel can be embedded directly into a split
 // without any wrapper.
@@ -790,22 +803,44 @@ func (k *KnowledgePanel) View(width, height int) string {
 	}
 
 	header := k.headerLayout(k.width).rendered
+	k.plansHeaderY = -1
+	k.jobsHeaderY = -1
 
 	if k.height < 2 {
 		return header
 	}
 	bodyHeight := k.height - 1
-	warning := ""
+	var diagnostics []string
 	if k.settingsError != "" {
+		diagnostics = append(diagnostics, "Settings error: "+k.settingsError)
+	}
+	if k.contextError != "" {
+		diagnostics = append(diagnostics, "Context read warning: "+k.contextError)
+	}
+	if k.jobsError != "" {
+		diagnostics = append(diagnostics, "Jobs read warning: "+k.jobsError)
+	}
+	warning := ""
+	if len(diagnostics) > 0 {
 		warning = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error)).Render(
-			ansi.Truncate("Settings error: "+k.settingsError, k.width, "…"),
+			ansi.Truncate(strings.Join(diagnostics, "; "), k.width, "…"),
 		)
 		bodyHeight--
 	}
 	lines := []string{}
+	sectionBody := ""
+	sectionLines := [2]int{-1, -1}
 	if bodyHeight > 0 {
-		body := akui.ViewWithTheme(k.width, bodyHeight, k.data, k.jobs, k.currentTask, k.palette)
-		lines = strings.Split(body, "\n")
+		sectionBody = akui.ContentWithTheme(k.width, k.data, k.jobs, k.currentTask, k.palette, akui.CollapseState{
+			Plans: k.plansCollapsed,
+			Jobs:  k.jobsCollapsed,
+		})
+		plainBody := ansi.Strip(sectionBody)
+		sectionLines = [2]int{
+			knowledgeSectionLine(plainBody, "Plans"),
+			knowledgeSectionLine(plainBody, "Jobs"),
+		}
+		lines = strings.Split(sectionBody, "\n")
 	}
 	if len(lines) > bodyHeight {
 		maxOffset := len(lines) - bodyHeight
@@ -821,6 +856,22 @@ func (k *KnowledgePanel) View(width, height int) string {
 		}
 	} else {
 		k.scrollOffset = 0
+	}
+	sectionBaseY := 1
+	if warning != "" {
+		sectionBaseY++
+	}
+	for index, sectionLine := range sectionLines {
+		visibleLine := sectionLine - k.scrollOffset
+		if sectionLine < 0 || visibleLine < 0 || visibleLine >= bodyHeight {
+			continue
+		}
+		headerY := sectionBaseY + visibleLine
+		if index == 0 {
+			k.plansHeaderY = headerY
+		} else {
+			k.jobsHeaderY = headerY
+		}
 	}
 	for len(lines) < bodyHeight {
 		lines = append(lines, strings.Repeat(" ", k.width))

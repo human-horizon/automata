@@ -8,17 +8,18 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 )
 
 // SessionRoots returns every ~/.ai/<agent>/pi/sessions/ directory that
-// currently exists on this machine. Each just-pi-style agent (just, getic,
-// synth, vexa, weft, ask, …) keeps its sessions under its own pi/ subdir,
-// so a new agent works without code changes. Falls back to
-// ~/.ai/just/pi/sessions/ when ~/.ai itself is missing or empty.
+// currently exists on this machine. Each just-pi-style agent keeps its
+// sessions under its own pi/ subdirectory, so new agents work without code
+// changes. When no agent directory exists, the default just path is returned.
 func SessionRoots() []string {
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
+	home, err := HomeDir()
+	if err != nil {
+		return nil
 	}
 	base := filepath.Join(home, ".ai")
 	entries, err := os.ReadDir(base)
@@ -59,40 +60,57 @@ func EncodeCwdDir(cwd string) string {
 // empty the search falls back to all known roots (discovered by SessionRoots),
 // which is the legacy behaviour used by tools and tests.
 func FindSessionJSONL(sessionID, cwd, agentDir string) string {
-	if ValidateSessionID(sessionID) != nil {
-		return ""
+	path, _ := FindSessionJSONLChecked(sessionID, cwd, agentDir)
+	return path
+}
+
+// FindSessionJSONLChecked returns a matching session file or a diagnostic when
+// a candidate cannot be inspected safely. The error-free wrapper is retained
+// for legacy read-only callers.
+func FindSessionJSONLChecked(sessionID, cwd, agentDir string) (string, error) {
+	if err := ValidateSessionID(sessionID); err != nil {
+		return "", err
 	}
 
 	roots := sessionRootsFor(agentDir)
 	subdir := EncodeCwdDir(cwd)
 	preferred := sessionFileCandidate{}
 	for _, root := range roots {
-		candidate, ok := newestSessionFile(filepath.Join(root, subdir), sessionID)
+		candidate, ok, err := newestSessionFileChecked(filepath.Join(root, subdir), sessionID)
+		if err != nil {
+			return "", err
+		}
 		if ok && candidate.newerThan(preferred) {
 			preferred = candidate
 		}
 	}
 	if preferred.path != "" {
-		return preferred.path
+		return preferred.path, nil
 	}
 
 	fallback := sessionFileCandidate{}
 	for _, root := range roots {
 		entries, err := os.ReadDir(root)
-		if err != nil {
+		if os.IsNotExist(err) {
 			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("read session root %s: %w", root, err)
 		}
 		for _, entry := range entries {
 			if !entry.IsDir() || entry.Name() == subdir {
 				continue
 			}
-			candidate, ok := newestSessionFile(filepath.Join(root, entry.Name()), sessionID)
+			candidate, ok, err := newestSessionFileChecked(filepath.Join(root, entry.Name()), sessionID)
+			if err != nil {
+				return "", err
+			}
 			if ok && candidate.newerThan(fallback) {
 				fallback = candidate
 			}
 		}
 	}
-	return fallback.path
+	return fallback.path, nil
 }
 
 // sessionRootsFor returns the search roots for FindSessionJSONL. When agentDir
@@ -114,10 +132,13 @@ func (candidate sessionFileCandidate) newerThan(other sessionFileCandidate) bool
 	return other.path == "" || candidate.modTime.After(other.modTime)
 }
 
-func newestSessionFile(dir, sessionID string) (sessionFileCandidate, bool) {
+func newestSessionFileChecked(dir, sessionID string) (sessionFileCandidate, bool, error) {
 	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return sessionFileCandidate{}, false, nil
+	}
 	if err != nil {
-		return sessionFileCandidate{}, false
+		return sessionFileCandidate{}, false, fmt.Errorf("read session directory %s: %w", dir, err)
 	}
 
 	newest := sessionFileCandidate{}
@@ -127,41 +148,52 @@ func newestSessionFile(dir, sessionID string) (sessionFileCandidate, bool) {
 		}
 
 		path := filepath.Join(dir, entry.Name())
-		if readSessionID(path) != sessionID {
+		foundID, err := readSessionIDChecked(path)
+		if err != nil {
+			return sessionFileCandidate{}, false, err
+		}
+		if foundID != sessionID {
 			continue
 		}
 		info, err := entry.Info()
 		if err != nil {
-			continue
+			return sessionFileCandidate{}, false, fmt.Errorf("inspect session file %s: %w", path, err)
 		}
 		candidate := sessionFileCandidate{path: path, modTime: info.ModTime()}
 		if candidate.newerThan(newest) {
 			newest = candidate
 		}
 	}
-	return newest, newest.path != ""
+	return newest, newest.path != "", nil
 }
 
-func readSessionID(path string) string {
+func readSessionIDChecked(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("read session header %s: %w", path, err)
 	}
 
 	scanner := bufio.NewScanner(file)
 	scanned := scanner.Scan()
+	scanErr := scanner.Err()
 	closeErr := file.Close()
-	if !scanned || closeErr != nil {
-		return ""
+	if scanErr != nil {
+		return "", fmt.Errorf("scan session header %s: %w", path, scanErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("close session header %s: %w", path, closeErr)
+	}
+	if !scanned {
+		return "", nil
 	}
 
 	var header struct {
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(scanner.Bytes(), &header); err != nil {
-		return ""
+		return "", fmt.Errorf("decode session header %s: %w", path, err)
 	}
-	return header.ID
+	return header.ID, nil
 }
 
 // DeleteSessionJSONL removes the .jsonl file for a given session and cwd,
@@ -169,20 +201,37 @@ func readSessionID(path string) string {
 // Clear must always know which agent it's clearing, otherwise it could
 // delete another profile's session by accident.
 func DeleteSessionJSONL(sessionID, cwd, agentDir string) (string, error) {
+	return deleteSessionJSONL(sessionID, cwd, agentDir, false)
+}
+
+// DeleteSessionJSONLIfPresent removes a matching session file and treats a
+// missing file as an already-clean state. Inspection and removal failures are
+// still returned to callers.
+func DeleteSessionJSONLIfPresent(sessionID, cwd, agentDir string) (string, error) {
+	return deleteSessionJSONL(sessionID, cwd, agentDir, true)
+}
+
+func deleteSessionJSONL(sessionID, cwd, agentDir string, allowMissing bool) (string, error) {
 	if err := ValidateSessionID(sessionID); err != nil {
 		return "", err
 	}
 	if agentDir == "" {
 		return "", fmt.Errorf("agentDir is required for safe deletion")
 	}
-	p := FindSessionJSONL(sessionID, cwd, agentDir)
-	if p == "" {
-		return "", fmt.Errorf("session file not found for %q in agent %q", sessionID, agentDir)
-	}
-	if err := os.Remove(p); err != nil {
+	path, err := FindSessionJSONLChecked(sessionID, cwd, agentDir)
+	if err != nil {
 		return "", err
 	}
-	return p, nil
+	if path == "" {
+		if allowMissing {
+			return "", nil
+		}
+		return "", fmt.Errorf("session file not found for %q in agent %q", sessionID, agentDir)
+	}
+	if err := os.Remove(path); err != nil {
+		return "", fmt.Errorf("remove session file %s: %w", path, err)
+	}
+	return path, nil
 }
 
 // FamiliarsJSONLPath returns the absolute path to familiars.json for the given
@@ -214,28 +263,7 @@ func ClearFamiliarsJSONL(profile, sessionID string) error {
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".automata-atomic-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(mode); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(data); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, path)
+	return atomicfile.Write(path, data, mode)
 }
 
 // FamiliarEntry mirrors the known fields in familiars.json. Cleanup and

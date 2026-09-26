@@ -2,6 +2,8 @@ package context
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -86,9 +88,12 @@ func readJSON(path string, v any) error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("read %s: %w", path, err)
 	}
-	return json.Unmarshal(data, v)
+	if err := json.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	return nil
 }
 
 func readForProfile(profile, sessionID string) (*Data, error) {
@@ -98,50 +103,96 @@ func readForProfile(profile, sessionID string) (*Data, error) {
 
 	ctxPath := sessionDirForProfile(profile, sessionID)
 
-	// Read plans — support both old ([]string) and new ([]PlanStep) formats
-	var rawPlans []map[string]interface{}
-	if err := readJSON(filepath.Join(ctxPath, "plans.json"), &rawPlans); err == nil {
-		for _, rp := range rawPlans {
-			name, _ := rp["name"].(string)
+	var failures []error
+
+	// Read plans — support both old string steps and new {text, done} steps.
+	plansPath := filepath.Join(ctxPath, "plans.json")
+	var rawPlans []json.RawMessage
+	planContents, plansErr := os.ReadFile(plansPath)
+	if os.IsNotExist(plansErr) {
+		plansErr = nil
+	}
+	if plansErr == nil && planContents != nil {
+		if !strings.HasPrefix(strings.TrimSpace(string(planContents)), "[") {
+			plansErr = errors.New("plans must be a JSON array")
+		} else if err := json.Unmarshal(planContents, &rawPlans); err != nil {
+			plansErr = fmt.Errorf("decode %s: %w", plansPath, err)
+		}
+	}
+	if plansErr != nil {
+		failures = append(failures, fmt.Errorf("read %s: %w", plansPath, plansErr))
+	} else {
+		for planIndex, rawPlanContents := range rawPlans {
+			var rawPlan map[string]interface{}
+			if err := json.Unmarshal(rawPlanContents, &rawPlan); err != nil || rawPlan == nil {
+				if err == nil {
+					err = errors.New("plan must be an object")
+				}
+				failures = append(failures, fmt.Errorf("decode %s plan %d: %w", plansPath, planIndex, err))
+				continue
+			}
+			name, nameIsString := rawPlan["name"].(string)
+			if _, exists := rawPlan["name"]; exists && !nameIsString {
+				failures = append(failures, fmt.Errorf("decode %s plan %d: name must be a string", plansPath, planIndex))
+			}
 			if name == "" {
 				name = "general"
 			}
 			var steps []PlanStep
-			if rawSteps, ok := rp["steps"]; ok {
-				if stepArr, ok := rawSteps.([]interface{}); ok {
-					for _, s := range stepArr {
-						if stepStr, ok := s.(string); ok {
-							// Old format: string
-							steps = append(steps, PlanStep{Text: stepStr, Done: false})
-						} else if stepMap, ok := s.(map[string]interface{}); ok {
-							// New format: {text, done}
-							text, _ := stepMap["text"].(string)
-							done, _ := stepMap["done"].(bool)
-							steps = append(steps, PlanStep{Text: text, Done: done})
+			if rawSteps, exists := rawPlan["steps"]; exists {
+				stepArray, isArray := rawSteps.([]interface{})
+				if !isArray {
+					failures = append(failures, fmt.Errorf("decode %s plan %d: steps must be an array", plansPath, planIndex))
+				} else {
+					for stepIndex, rawStep := range stepArray {
+						if stepText, ok := rawStep.(string); ok {
+							steps = append(steps, PlanStep{Text: stepText})
+							continue
 						}
+						stepMap, isObject := rawStep.(map[string]interface{})
+						if !isObject {
+							failures = append(failures, fmt.Errorf("decode %s plan %d step %d: expected a string or object", plansPath, planIndex, stepIndex))
+							continue
+						}
+						stepText, hasText := stepMap["text"].(string)
+						if !hasText {
+							failures = append(failures, fmt.Errorf("decode %s plan %d step %d: text must be a string", plansPath, planIndex, stepIndex))
+							continue
+						}
+						step := PlanStep{Text: stepText}
+						if rawDone, exists := stepMap["done"]; exists {
+							if done, ok := rawDone.(bool); ok {
+								step.Done = done
+							} else {
+								failures = append(failures, fmt.Errorf("decode %s plan %d step %d: done must be a boolean", plansPath, planIndex, stepIndex))
+							}
+						}
+						steps = append(steps, step)
 					}
 				}
 			}
-			data.Plans[name] = steps
+			data.Plans[name] = append(data.Plans[name], steps...)
 		}
 	}
 
-	// Read status — accept any non-empty status
+	// Read status — accept any non-empty status.
 	var status Status
-	if err := readJSON(filepath.Join(ctxPath, "status.json"), &status); err == nil {
-		if status.DisplayText() != "" || status.Action != "" || status.Command != "" {
-			data.Status = &status
-		}
+	statusPath := filepath.Join(ctxPath, "status.json")
+	if err := readJSON(statusPath, &status); err != nil {
+		failures = append(failures, err)
+	} else if status.DisplayText() != "" || status.Action != "" || status.Command != "" {
+		data.Status = &status
 	}
 
-	// Read settings
 	settingsPath := filepath.Join(ctxPath, "settings.json")
 	var settings Settings
-	if err := readJSON(settingsPath, &settings); err == nil {
+	if err := readJSON(settingsPath, &settings); err != nil {
+		failures = append(failures, err)
+	} else {
 		data.Settings = &settings
 	}
 
-	return data, nil
+	return data, errors.Join(failures...)
 }
 
 // Read resolves legacy sessions through existing profile directories, then

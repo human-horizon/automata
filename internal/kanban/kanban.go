@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"gopkg.in/yaml.v3"
 )
@@ -387,29 +388,10 @@ func writeTask(path string, task Task) error {
 		content.WriteByte('\n')
 	}
 
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".kanban-write-*")
-	if err != nil {
-		return err
+	if err := atomicfile.Write(path, []byte(content.String()), 0o644); err != nil {
+		return fmt.Errorf("write Kanban task %s: %w", path, err)
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0o644); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.WriteString(content.String()); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
+	return nil
 }
 
 func cloneYAMLNode(node *yaml.Node) *yaml.Node {

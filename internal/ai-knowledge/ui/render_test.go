@@ -206,3 +206,49 @@ func TestViewHeightClamp(t *testing.T) {
 		t.Fatalf("expected 3 lines, got %d", len(lines))
 	}
 }
+
+func TestContentWithThemeKeepsAllLinesAndCollapsesSections(t *testing.T) {
+	steps := make([]context.PlanStep, 12)
+	for index := range steps {
+		steps[index] = context.PlanStep{Text: "step"}
+	}
+	ctx := &context.Data{Plans: map[string][]context.PlanStep{"Build": steps}}
+	jobsList := []jobs.Job{{ID: "job", Command: "run command"}}
+
+	content := ContentWithTheme(80, ctx, jobsList, "", apptheme.Default(), CollapseState{})
+	if got := len(strings.Split(content, "\n")); got <= 5 {
+		t.Fatalf("content was clipped before scrolling: got %d lines", got)
+	}
+	collapsed := ContentWithTheme(80, ctx, jobsList, "", apptheme.Default(), CollapseState{Plans: true, Jobs: true})
+	if strings.Contains(collapsed, "step") || strings.Contains(collapsed, "run command") {
+		t.Fatalf("collapsed content still contains section entries: %s", collapsed)
+	}
+	for _, want := range []string{"Plans", "Jobs", "▸"} {
+		if !strings.Contains(collapsed, want) {
+			t.Errorf("collapsed section header missing %q: %s", want, collapsed)
+		}
+	}
+}
+
+func TestWrapPrefixedHandlesWideRuneInNarrowViewport(t *testing.T) {
+	lines := wrapPrefixed("x ", "界", 1)
+	if len(lines) == 0 || !strings.Contains(strings.Join(lines, ""), "界") {
+		t.Fatalf("wide rune was lost in narrow viewport: %#v", lines)
+	}
+}
+
+func TestWrapPrefixedHangsUnderItemTextWithinTerminalWidth(t *testing.T) {
+	const width = 18
+	lines := wrapPrefixed("    [ ] ", "αβγδ epsilon zeta", width)
+	if len(lines) < 2 {
+		t.Fatalf("expected wrapped lines, got %q", lines)
+	}
+	for index, line := range lines {
+		if got := lipgloss.Width(line); got > width {
+			t.Errorf("line %d width = %d, limit %d: %q", index, got, width, line)
+		}
+		if index > 0 && !strings.HasPrefix(line, "        ") {
+			t.Errorf("continuation does not align under step text: %q", line)
+		}
+	}
+}

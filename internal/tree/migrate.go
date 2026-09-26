@@ -2,11 +2,11 @@ package tree
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/slug"
 )
@@ -155,28 +155,9 @@ func migrationComplete(profileDir string) (bool, error) {
 }
 
 func writeMigrationMarker(profileDir string) error {
-	temporary, err := os.CreateTemp(profileDir, ".legacy-migration-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create migration marker: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o644); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("chmod migration marker: %w", err)
-	}
-	if _, err := temporary.WriteString("version=1\ncompletedAt=" + time.Now().UTC().Format(time.RFC3339Nano) + "\n"); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("write migration marker: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("sync migration marker: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close migration marker: %w", err)
-	}
-	if err := os.Rename(temporaryPath, filepath.Join(profileDir, migrationMarkerName)); err != nil {
+	path := filepath.Join(profileDir, migrationMarkerName)
+	contents := "version=1\ncompletedAt=" + time.Now().UTC().Format(time.RFC3339Nano) + "\n"
+	if err := atomicfile.Write(path, []byte(contents), 0o644); err != nil {
 		return fmt.Errorf("commit migration marker: %w", err)
 	}
 	return nil
@@ -291,23 +272,5 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-
-	temporary, err := os.CreateTemp(filepath.Dir(dst), ".legacy-copy-*.tmp")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if _, err := io.Copy(temporary, in); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, dst)
+	return atomicfile.WriteFrom(dst, in, 0o600)
 }

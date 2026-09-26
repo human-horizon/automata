@@ -909,9 +909,9 @@ func TestSaveStateKeepsPreviousStateWhenAtomicWriteFails(t *testing.T) {
 		t.Fatalf("read initial state: %v", err)
 	}
 
-	originalWrite := writeStateTemp
-	t.Cleanup(func() { writeStateTemp = originalWrite })
-	writeStateTemp = func(*os.File, []byte) error { return errors.New("injected write failure") }
+	originalWriter := writeStateAtomic
+	t.Cleanup(func() { writeStateAtomic = originalWriter })
+	writeStateAtomic = func(string, []byte, os.FileMode) error { return errors.New("injected write failure") }
 	tr.AddChat("after")
 
 	got, err := os.ReadFile(path)
@@ -940,9 +940,9 @@ func TestSaveStateRenameFailureKeepsPreviousState(t *testing.T) {
 		t.Fatalf("read initial state: %v", err)
 	}
 
-	originalRename := renameState
-	t.Cleanup(func() { renameState = originalRename })
-	renameState = func(_, _ string) error { return errors.New("injected rename failure") }
+	originalWriter := writeStateAtomic
+	t.Cleanup(func() { writeStateAtomic = originalWriter })
+	writeStateAtomic = func(string, []byte, os.FileMode) error { return errors.New("injected rename failure") }
 	tr.AddChat("after")
 
 	got, err := os.ReadFile(path)

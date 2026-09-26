@@ -82,7 +82,7 @@ func (c *ContextPanel) SetChats(chats []ChatInfo) {
 }
 
 // SetOnTaskAssigned sets a callback for when a task is assigned to a chat.
-func (c *ContextPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string) tea.Cmd) {
+func (c *ContextPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string) (tea.Cmd, error)) {
 	c.kanbanPanel.SetOnTaskAssigned(fn)
 }
 

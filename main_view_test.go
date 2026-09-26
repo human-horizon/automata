@@ -391,7 +391,11 @@ func TestAssignedTaskStartKeepsTreeActiveWhenPersistenceFails(t *testing.T) {
 		return nil
 	}
 
-	_ = app.startAssignedTaskSession(sessionID)
+	_, err := app.startAssignedTaskSession(sessionID)
+	var committedErr *ui.CommittedActionError
+	if !errors.As(err, &committedErr) {
+		t.Fatalf("startAssignedTaskSession error = %v, want committed persistence warning", err)
+	}
 	if !started {
 		t.Fatal("task assignment did not start its PTY")
 	}
@@ -412,6 +416,183 @@ func TestAssignedTaskStartKeepsTreeActiveWhenPersistenceFails(t *testing.T) {
 	}
 }
 
+func TestAssignedTaskStartRejectsMissingOrNonChatTreeItems(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	tr := tree.New()
+	tr.Profile = "task-preflight"
+	terminal, err := tr.CreateTerminal("Terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{
+		tree:            tr,
+		activeSessions:  make(map[string]struct{}),
+		runningSessions: make(map[string]struct{}),
+		emulatorCache:   make(map[string]*portalis.Emulator),
+	}
+	started := false
+	app.startEmulatorSyncFn = func(*portalis.Emulator, []string) error {
+		started = true
+		return nil
+	}
+
+	for _, sessionID := range []string{"task-preflight__missing-chat", tr.SessionKeyOf(terminal)} {
+		if _, err := app.startAssignedTaskSession(sessionID); err == nil {
+			t.Errorf("startAssignedTaskSession(%q) succeeded, want preflight error", sessionID)
+		}
+	}
+	if started {
+		t.Fatal("invalid assigned Tree item started a PTY")
+	}
+	if len(app.emulatorCache) != 0 || len(app.activeSessions) != 0 {
+		t.Fatalf("invalid assignment mutated runtime state: cache=%v active=%v", app.emulatorCache, app.activeSessions)
+	}
+}
+
+func TestAssignedTaskStartRollsBackBeforePTYCommit(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("PI_CMD", "/bin/sh")
+	tr := tree.New()
+	tr.Profile = "task-start-failure"
+	tr.AddChat("assigned-chat")
+	sessionID := tr.SessionKeyOf(tr.Root()[0])
+	app := &App{
+		tree:            tr,
+		piAgentDir:      t.TempDir(),
+		activeSessions:  make(map[string]struct{}),
+		runningSessions: make(map[string]struct{}),
+		emulatorCache:   make(map[string]*portalis.Emulator),
+	}
+	app.startEmulatorSyncFn = func(*portalis.Emulator, []string) error {
+		return errors.New("injected PTY start failure")
+	}
+
+	if cmd, err := app.startAssignedTaskSession(sessionID); err == nil || cmd != nil {
+		t.Fatalf("startAssignedTaskSession() = (%v, %v), want pre-commit error and no command", cmd, err)
+	}
+	if len(app.emulatorCache) != 0 || len(app.runningSessions) != 0 || len(app.activeSessions) != 0 {
+		t.Fatalf("failed PTY start committed runtime state: cache=%v running=%v active=%v", app.emulatorCache, app.runningSessions, app.activeSessions)
+	}
+	if tr.IsActiveSession(tr.Root()[0]) {
+		t.Fatal("failed PTY start marked Tree session active")
+	}
+}
+
+func TestAssignedTaskStartDoesNotDuplicateCachedEmulator(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("PI_CMD", "/bin/sh")
+	tr := tree.New()
+	tr.Profile = "task-duplicate"
+	tr.AddChat("assigned-chat")
+	sessionID := tr.SessionKeyOf(tr.Root()[0])
+	app := &App{
+		tree:            tr,
+		piAgentDir:      t.TempDir(),
+		activeSessions:  make(map[string]struct{}),
+		runningSessions: make(map[string]struct{}),
+		emulatorCache:   make(map[string]*portalis.Emulator),
+	}
+	starts := 0
+	app.startEmulatorSyncFn = func(*portalis.Emulator, []string) error {
+		starts++
+		return nil
+	}
+
+	if _, err := app.startAssignedTaskSession(sessionID); err != nil {
+		t.Fatalf("first start failed: %v", err)
+	}
+	if cmd, err := app.startAssignedTaskSession(sessionID); err != nil || cmd != nil {
+		t.Fatalf("duplicate start = (%v, %v), want no-op", cmd, err)
+	}
+	if starts != 1 {
+		t.Fatalf("PTY start count = %d, want 1", starts)
+	}
+}
+
+func TestTreeMutationsRefreshCurrentKanbanPicker(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	tr := tree.New()
+	tr.Profile = "picker-profile"
+	folder, err := tr.CreateFolder("Projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstChat, err := tr.CreateChildChat(folder, "Alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.CreateChildTerminal(folder, "Terminal"); err != nil {
+		t.Fatal(err)
+	}
+	outside, err := tr.CreateChat("Outside")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	container := ui.NewContainer(nil)
+	app := &App{tree: tr, container: container}
+	app.updateChatList(folder)
+	app.bindChatPickerToTree()
+	assertChatNames := func(want ...string) {
+		t.Helper()
+		chats := container.Chats()
+		if len(chats) != len(want) {
+			t.Fatalf("picker chats = %+v, want names %v", chats, want)
+		}
+		for i, name := range want {
+			if chats[i].Name != name {
+				t.Fatalf("picker chat[%d] = %+v, want name %q", i, chats[i], name)
+			}
+		}
+	}
+	assertChatNames("Alpha")
+
+	movedChat, err := tr.CreateChildChat(folder, "Beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertChatNames("Alpha", "Beta")
+	oldSessionID := tr.SessionKeyOf(movedChat)
+	if err := tr.RenameItem(movedChat, "Gamma"); err != nil {
+		t.Fatal(err)
+	}
+	if movedChat.Name != "Gamma" || tr.SessionKeyOf(movedChat) == oldSessionID {
+		t.Fatal("renamed chat identity was not reflected in Tree")
+	}
+	assertChatNames("Alpha", "Gamma")
+
+	if err := tr.MoveItemChecked(movedChat, outside); err != nil {
+		t.Fatal(err)
+	}
+	assertChatNames("Alpha")
+	if err := tr.DeleteItem(firstChat); err != nil {
+		t.Fatal(err)
+	}
+	assertChatNames()
+	if err := tr.DeleteItem(folder); err != nil {
+		t.Fatal(err)
+	}
+	assertChatNames("Outside", "Gamma")
+	container.Close()
+}
+
+func TestClearSessionErrorMessageSurfacesOnCapturedChatPanel(t *testing.T) {
+	panel := ui.NewChatPanel(portalis.NewEmulator("clear-chat", "Chat", "/bin/sh", nil), "clear-chat", "")
+	app := &App{}
+	_, cmd := app.Update(clearSessionErrorMsg{
+		sessionID: "clear-chat",
+		panel:     panel,
+		err:       errors.New("cleanup failed\nrestart skipped"),
+	})
+	if cmd != nil {
+		t.Fatalf("clear error Update command = %v, want nil", cmd)
+	}
+	if view := panel.View(100, 3); !strings.Contains(view, "cleanup failed; restart skipped") {
+		t.Fatalf("clear error was not displayed on the captured panel: %q", view)
+	}
+}
+
 func TestClearRestartFailureDoesNotRestoreActiveSession(t *testing.T) {
 	t.Setenv("PI_CMD", "/bin/sh")
 	const sessionID = "restart-failure"
@@ -425,14 +606,82 @@ func TestClearRestartFailureDoesNotRestoreActiveSession(t *testing.T) {
 		return fmt.Errorf("injected start failure")
 	}
 
-	if msg := app.clearSessionCmd(sessionID, "", nil)(); msg != nil {
-		t.Fatalf("failed restart returned %T, want nil", msg)
+	msg := app.clearSessionCmd(sessionID, "", nil)()
+	clearErr, ok := msg.(clearSessionErrorMsg)
+	if !ok || clearErr.err == nil || !strings.Contains(clearErr.err.Error(), "injected start failure") {
+		t.Fatalf("failed restart result = %#v, want visible startup error", msg)
 	}
 	if _, ok := app.emulatorCache[sessionID]; ok {
 		t.Fatal("failed restart remained in emulator cache")
 	}
 	if _, ok := app.activeSessions[sessionID]; ok {
 		t.Fatal("failed restart remained active")
+	}
+}
+
+func TestClearAggregatesCommittedCleanupErrorsAndDoesNotRestart(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("PI_CMD", "/bin/sh")
+	profile := "clear-errors"
+	ownerID := "clear-errors__chat"
+	familiarID := ownerID + "__expert"
+	agentDir := t.TempDir()
+	sessionDir := filepath.Join(agentDir, "sessions", "other-cwd")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a-familiar.jsonl", "b-owner.jsonl"} {
+		if err := os.WriteFile(filepath.Join(sessionDir, name), []byte("not-json\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	registryPath := paths.FamiliarsJSONLPath(profile, ownerID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(registryPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := tree.New()
+	tr.Profile = profile
+	tr.AddChat("chat")
+	app := &App{
+		tree:            tr,
+		profile:         profile,
+		piAgentDir:      agentDir,
+		activeSessions:  map[string]struct{}{ownerID: {}, familiarID: {}},
+		runningSessions: map[string]struct{}{ownerID: {}, familiarID: {}},
+		emulatorCache: map[string]*portalis.Emulator{
+			ownerID: portalis.NewEmulator(ownerID, "Chat", "/bin/sh", nil),
+		},
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+	}
+	app.killSessionFn = func(_, _ string) error { return errors.New("injected job stop failure") }
+	restarted := false
+	app.startEmulatorSyncFn = func(*portalis.Emulator, []string) error {
+		restarted = true
+		return nil
+	}
+
+	msg := app.clearSessionCmd(ownerID, "", []string{familiarID})()
+	clearErr, ok := msg.(clearSessionErrorMsg)
+	if !ok {
+		t.Fatalf("Clear result = %T, want aggregated cleanup error", msg)
+	}
+	for _, want := range []string{"injected job stop failure", "clear familiar", "clear session history", "clear familiars.json"} {
+		if !strings.Contains(clearErr.err.Error(), want) {
+			t.Errorf("Clear error %q does not include %q", clearErr.err, want)
+		}
+	}
+	if restarted {
+		t.Fatal("Clear restarted Pi despite committed cleanup errors")
+	}
+	if _, exists := app.emulatorCache[ownerID]; exists {
+		t.Fatal("stopped emulator remained in cache after cleanup error")
+	}
+	if _, active := app.activeSessions[ownerID]; active {
+		t.Fatal("stopped session remained active after committed cleanup")
 	}
 }
 
@@ -1688,8 +1937,9 @@ func TestClearSessionCmdRefusesWithoutPiAgentDir(t *testing.T) {
 	}
 
 	msg := app.clearSessionCmd(sessionID, cwd, nil)()
-	if msg != nil {
-		t.Errorf("clearSessionCmd with empty piAgentDir must return nil, got %T", msg)
+	clearErr, ok := msg.(clearSessionErrorMsg)
+	if !ok || clearErr.err == nil || !strings.Contains(clearErr.err.Error(), "without piAgentDir") {
+		t.Errorf("clearSessionCmd with empty piAgentDir = %#v, want visible fail-closed error", msg)
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Fatalf("target JSONL must be untouched, stat err: %v", err)

@@ -18,6 +18,43 @@ func sessionDir(sessionID string) string {
 	return paths.SessionDir("test", sessionID)
 }
 
+func TestListForProfileReturnsValidJobsAndMetadataDiagnostics(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "test__partial-jobs"
+	jobsDir := filepath.Join(sessionDir(sessionID), "jobs")
+	validDir := filepath.Join(jobsDir, "valid-job")
+	invalidDir := filepath.Join(jobsDir, "invalid-job")
+	for _, dir := range []string{validDir, invalidDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	validRecord := `{"id":"valid-job","command":"echo retained","pid":` + strconv.Itoa(os.Getpid()) + `,"status":"running"}`
+	if err := os.WriteFile(filepath.Join(validDir, "job.json"), []byte(validRecord), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invalidPath := filepath.Join(invalidDir, "job.json")
+	if err := os.WriteFile(invalidPath, []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := ListForProfile("test", sessionID)
+	if err == nil || !strings.Contains(err.Error(), invalidPath) {
+		t.Fatalf("ListForProfile error = %v, want path-specific metadata diagnostic", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "valid-job" {
+		t.Fatalf("valid job was not retained: %#v", jobs)
+	}
+
+	cachedJobs, cachedErr := NewCachedReader().ListForProfile("test", sessionID)
+	if cachedErr == nil || !strings.Contains(cachedErr.Error(), invalidPath) {
+		t.Fatalf("CachedReader error = %v, want path-specific metadata diagnostic", cachedErr)
+	}
+	if len(cachedJobs) != 1 || cachedJobs[0].ID != "valid-job" {
+		t.Fatalf("CachedReader dropped valid partial job: %#v", cachedJobs)
+	}
+}
+
 func TestCachedReaderNoticesNestedJobMetadataChange(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("AI_DATA_HOME", dataHome)
@@ -482,9 +519,9 @@ func TestWriteJSONFailurePreservesPreviousMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeErr := errors.New("injected atomic rename failure")
-	previousRename := renameJobMetadata
-	renameJobMetadata = func(string, string) error { return writeErr }
-	t.Cleanup(func() { renameJobMetadata = previousRename })
+	previousWriter := writeJobMetadataAtomic
+	writeJobMetadataAtomic = func(string, []byte, os.FileMode) error { return writeErr }
+	t.Cleanup(func() { writeJobMetadataAtomic = previousWriter })
 
 	record := &JobRecord{ID: "job-1", Status: "exited", PID: 0}
 	if err := writeJSON(metaPath, record); !errors.Is(err, writeErr) {
@@ -570,9 +607,9 @@ func TestPruneStaleSessionPreservesJobDirectoryOnMetadataWriteFailure(t *testing
 		t.Fatal(err)
 	}
 	writeErr := errors.New("injected metadata replacement failure")
-	previousRename := renameJobMetadata
-	renameJobMetadata = func(string, string) error { return writeErr }
-	t.Cleanup(func() { renameJobMetadata = previousRename })
+	previousWriter := writeJobMetadataAtomic
+	writeJobMetadataAtomic = func(string, []byte, os.FileMode) error { return writeErr }
+	t.Cleanup(func() { writeJobMetadataAtomic = previousWriter })
 
 	if err := PruneStaleSessionForProfile(profile, sessionID); !errors.Is(err, writeErr) {
 		t.Fatalf("PruneStaleSessionForProfile error = %v, want injected failure", err)

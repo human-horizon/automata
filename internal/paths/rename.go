@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 )
 
 // RenameDirectory moves one Automata data directory without merging it with
@@ -116,28 +118,7 @@ func MigrateSessionJSONL(oldID, newID, cwd, agentDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("stat session JSONL %q: %w", oldPath, err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(oldPath), ".automata-session-*.jsonl")
-	if err != nil {
-		return "", fmt.Errorf("create temporary session JSONL: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("preserve session JSONL mode: %w", err)
-	}
-	if _, err := tmp.Write(newData); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("write temporary session JSONL: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("sync temporary session JSONL: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("close temporary session JSONL: %w", err)
-	}
-	if err := os.Rename(tmpPath, oldPath); err != nil {
+	if err := atomicfile.Write(oldPath, newData, info.Mode().Perm()); err != nil {
 		return "", fmt.Errorf("replace session JSONL %q: %w", oldPath, err)
 	}
 	return oldPath, nil

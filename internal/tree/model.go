@@ -178,6 +178,9 @@ type Tree struct {
 	// Callback when a folder is selected (clicked)
 	onSelectFolder func(*Item)
 
+	// Callback after a persisted mutation changes Tree items or their order.
+	onItemsChanged func()
+
 	// Callback when the user requests to stop an active session
 	onStopSession func(*Item)
 
@@ -357,6 +360,7 @@ func (t *Tree) createItem(parent, item *Item, name string) (*Item, error) {
 
 	if err := t.SaveState(); err != nil {
 		if stateCommitWasApplied(err) {
+			t.notifyItemsChanged()
 			return item, t.recordActionError(err)
 		}
 		t.root = oldRoot
@@ -374,6 +378,7 @@ func (t *Tree) createItem(parent, item *Item, name string) (*Item, error) {
 		return nil, t.recordActionError(err)
 	}
 	t.lastActionError = nil
+	t.notifyItemsChanged()
 	return item, nil
 }
 
@@ -438,9 +443,12 @@ func (t *Tree) persistMutation(rollback func()) error {
 	err := t.SaveState()
 	if err == nil {
 		t.lastActionError = nil
+		t.notifyItemsChanged()
 		return nil
 	}
-	if !stateCommitWasApplied(err) && rollback != nil {
+	if stateCommitWasApplied(err) {
+		t.notifyItemsChanged()
+	} else if rollback != nil {
 		rollback()
 	}
 	return t.recordActionError(err)
@@ -739,6 +747,7 @@ func (t *Tree) MoveSelectedOutChecked() (bool, error) {
 	if oldID != newID && t.onItemMoved != nil {
 		t.onItemMoved(sel, oldID, newID)
 	}
+	t.notifyItemsChanged()
 	return true, nil
 }
 
@@ -1205,6 +1214,7 @@ func (t *Tree) renameItem(item *Item, name string) error {
 			if t.onRenameCommitted != nil {
 				t.onRenameCommitted(item, oldName, name)
 			}
+			t.notifyItemsChanged()
 			return nil
 		}
 		item.Name = oldName
@@ -1221,6 +1231,7 @@ func (t *Tree) renameItem(item *Item, name string) error {
 	if t.onRenameCommitted != nil {
 		t.onRenameCommitted(item, oldName, name)
 	}
+	t.notifyItemsChanged()
 	return nil
 }
 
@@ -1299,6 +1310,7 @@ func (t *Tree) DeleteItem(item *Item) error {
 	} else {
 		t.lastActionError = nil
 	}
+	t.notifyItemsChanged()
 	if t.onDeleteCommitted != nil {
 		if err := t.onDeleteCommitted(item); err != nil {
 			if saveErr != nil {
@@ -1450,6 +1462,7 @@ func (t *Tree) MoveItemChecked(item, target *Item) error {
 			if oldID != newID && t.onItemMoved != nil {
 				t.onItemMoved(item, oldID, newID)
 			}
+			t.notifyItemsChanged()
 			return err
 		}
 		t.root = oldRoot
@@ -1478,6 +1491,7 @@ func (t *Tree) MoveItemChecked(item, target *Item) error {
 	if oldID != newID && t.onItemMoved != nil {
 		t.onItemMoved(item, oldID, newID)
 	}
+	t.notifyItemsChanged()
 	return nil
 }
 
@@ -1919,6 +1933,17 @@ func (t *Tree) SetOnSelectFolder(fn func(*Item)) {
 // SetOnStopSession sets the callback invoked when the user stops a session.
 func (t *Tree) SetOnStopSession(fn func(*Item)) {
 	t.onStopSession = fn
+}
+
+// SetOnItemsChanged registers a callback for committed Tree item/order changes.
+func (t *Tree) SetOnItemsChanged(fn func()) {
+	t.onItemsChanged = fn
+}
+
+func (t *Tree) notifyItemsChanged() {
+	if t.onItemsChanged != nil {
+		t.onItemsChanged()
+	}
 }
 
 // SetOnBeforeDelete sets a side-effect-free preflight called before persistence.

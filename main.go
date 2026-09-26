@@ -73,7 +73,8 @@ type App struct {
 
 	// profile is the active profile name; stored on App so background workers
 	// (e.g. status polling) know where to look for session data.
-	profile string
+	profile          string
+	chatPickerFolder *tree.Item
 
 	// piAgentDir is the path to the pi agent directory (e.g.
 	// ~/.ai/just/pi, ~/.ai/getic/pi). Default: ~/.ai/just/pi.
@@ -135,7 +136,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 
 	container := ui.NewContainer(tp)
 	container.SetProfile(profile)
-	container.SetOnTaskAssigned(func(sessionID, _ string) tea.Cmd {
+	container.SetOnTaskAssigned(func(sessionID, _ string) (tea.Cmd, error) {
 		return a.startAssignedTaskSession(sessionID)
 	})
 
@@ -167,7 +168,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 	t.SetOnSelectChat(func(item *tree.Item) {
 		sessionID := slug.SessionName(item.Path(), item.Name)
 		if profile != "" {
-			sessionID = slug.Slug(profile) + "__" + sessionID
+			sessionID = paths.ProfileSlug(profile) + "__" + sessionID
 		}
 		a.currentSessionID = sessionID
 
@@ -183,7 +184,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 
 		cp := ui.NewChatPanel(em, sessionID, profile)
 		cp.SetOnClearSession(func(sid, cwd string) tea.Cmd {
-			return a.clearSessionCmd(sid, cwd, cp.FamiliarSessionIDs())
+			return a.clearSessionCmdForPanel(sid, cwd, cp.FamiliarSessionIDs(), cp)
 		})
 		cp.SetOnCloseFamiliar(func(familiarID string, em *portalis.Emulator) error {
 			if err := a.closeFamiliar(familiarID, em); err != nil {
@@ -273,7 +274,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 	t.SetOnStopSession(func(item *tree.Item) {
 		sessionID := slug.SessionName(item.Path(), item.Name)
 		if profile != "" {
-			sessionID = slug.Slug(profile) + "__" + sessionID
+			sessionID = paths.ProfileSlug(profile) + "__" + sessionID
 		}
 		if err := a.stopSessionRuntime(sessionID, stopSessionOptions{
 			stopJobs:        true,
@@ -330,6 +331,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 	t.SetOnOpenHelp(a.openHelpOverlay)
 	t.SetOnOpenSettings(a.openSettingsOverlay)
 	t.SetOnThemeChange(a.applyTheme)
+	a.bindChatPickerToTree()
 	a.applyTheme(t.ThemeID())
 	return a
 }
@@ -356,10 +358,42 @@ func (a *App) Init() tea.Cmd {
 // updateChatList builds the chat list from the tree and passes it to the
 // container for the kanban chat picker. If folder is non-nil, only chats
 // within that folder (and its children) are included.
+func treeContainsItem(t *tree.Tree, target *tree.Item) bool {
+	if t == nil || target == nil {
+		return false
+	}
+	for _, item := range t.AllItems() {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) currentChatPickerFolder() *tree.Item {
+	if a.tree == nil || a.chatPickerFolder == nil || !a.chatPickerFolder.IsFolder || !treeContainsItem(a.tree, a.chatPickerFolder) {
+		return nil
+	}
+	return a.chatPickerFolder
+}
+
+func (a *App) bindChatPickerToTree() {
+	if a.tree == nil {
+		return
+	}
+	a.tree.SetOnItemsChanged(func() {
+		a.updateChatList(a.currentChatPickerFolder())
+	})
+}
+
 func (a *App) updateChatList(folder *tree.Item) {
 	if a.tree == nil || a.container == nil {
 		return
 	}
+	if folder != nil && (!folder.IsFolder || !treeContainsItem(a.tree, folder)) {
+		folder = nil
+	}
+	a.chatPickerFolder = folder
 	var chats []ui.ChatInfo
 	var collect func([]*tree.Item)
 	collect = func(items []*tree.Item) {
@@ -496,6 +530,15 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 		a.blink = !a.blink
 		a.blinkT = time.Now()
 		return a, a.blinkCmd()
+	case clearSessionErrorMsg:
+		if msg.err != nil {
+			log.Printf("clearSession %q: %v", msg.sessionID, msg.err)
+			if msg.panel != nil {
+				msg.panel.SetActionWarning(msg.err.Error())
+			}
+		}
+		return a, nil
+
 	case ui.KnowledgeRefreshMsg:
 		a.container.ApplyKnowledgeRefresh(msg)
 		return a, nil
@@ -785,16 +828,31 @@ func (a *App) createChatEmulator(sessionID string) *portalis.Emulator {
 }
 
 // startAssignedTaskSession starts and tracks the chat PTY for an assigned task.
-func (a *App) startAssignedTaskSession(sessionID string) tea.Cmd {
-	if _, ok := a.emulatorCache[sessionID]; ok {
-		return nil
+func (a *App) startAssignedTaskSession(sessionID string) (tea.Cmd, error) {
+	if err := paths.ValidateSessionID(sessionID); err != nil {
+		return nil, fmt.Errorf("invalid assigned chat session: %w", err)
 	}
+	if a.tree == nil {
+		return nil, fmt.Errorf("cannot start assigned task without a Tree")
+	}
+	item := a.tree.FindItemBySessionID(sessionID)
+	if item == nil || item.IsFolder || item.IsTerminal {
+		return nil, fmt.Errorf("assigned session %q is not a chat in the Tree", sessionID)
+	}
+	if em, ok := a.emulatorCache[sessionID]; ok && em != nil {
+		return nil, nil
+	}
+	if a.emulatorCache != nil {
+		delete(a.emulatorCache, sessionID)
+	}
+
 	em := a.newChatEmulator(sessionID)
 	if em == nil {
-		return nil
+		return nil, fmt.Errorf("cannot create Pi emulator for assigned chat %q", sessionID)
 	}
 	if err := a.startEmulatorSync(em, nil); err != nil {
-		return nil
+		em.Stop()
+		return nil, fmt.Errorf("start assigned chat %q: %w", sessionID, err)
 	}
 	if a.emulatorCache == nil {
 		a.emulatorCache = make(map[string]*portalis.Emulator)
@@ -810,8 +868,9 @@ func (a *App) startAssignedTaskSession(sessionID string) tea.Cmd {
 	a.activeSessions[sessionID] = struct{}{}
 	if err := a.persistRuntimeActiveSessions(); err != nil {
 		log.Printf("automata: persist assigned task session %q: %v", sessionID, err)
+		return em.Listen(), &ui.CommittedActionError{Err: fmt.Errorf("persist assigned task session: %w", err)}
 	}
-	return em.Listen()
+	return em.Listen(), nil
 }
 
 // createFamiliarEmulator builds an emulator for a familiar tab.
@@ -929,73 +988,92 @@ func (a *App) startEmulatorSync(em *portalis.Emulator, env []string) error {
 	return em.StartSync(env)
 }
 
+type clearSessionErrorMsg struct {
+	sessionID string
+	panel     *ui.ChatPanel
+	err       error
+}
+
 func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.Cmd {
+	return a.clearSessionCmdForPanel(sessionID, cwd, familiarSIDs, nil)
+}
+
+func (a *App) clearSessionCmdForPanel(sessionID, cwd string, familiarSIDs []string, panel *ui.ChatPanel) tea.Cmd {
 	return func() tea.Msg {
-		// Fail-safe: without a known pi agent, refuse to delete any JSONL.
-		// One profile must never delete another profile's sessions.
+		fail := func(err error) tea.Msg {
+			return clearSessionErrorMsg{sessionID: sessionID, panel: panel, err: err}
+		}
 		agentDir := a.piAgentDir
 		if agentDir == "" {
-			log.Printf("clearSession: refuse to clear %q without piAgentDir", sessionID)
-			return nil
+			return fail(fmt.Errorf("refuse to clear %q without piAgentDir", sessionID))
 		}
 
-		// Stop the owner, its familiars, jobs, caches, watchers, and runtime
-		// state through the canonical lifecycle kernel before deleting JSONL.
-		if err := a.stopSessionRuntime(sessionID, stopSessionOptions{
+		stopErr := a.stopSessionRuntime(sessionID, stopSessionOptions{
 			stopJobs:           true,
 			stopFamiliars:      true,
 			persistInactive:    true,
 			familiarSessionIDs: familiarSIDs,
-		}); err != nil {
-			log.Printf("clearSession: %v", err)
-			return nil
+		})
+		if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
+			return fail(fmt.Errorf("stop runtime before Clear: %w", stopErr))
 		}
+
+		var failures []error
+		if stopErr != nil {
+			failures = append(failures, fmt.Errorf("stop runtime: %w", stopErr))
+		}
+		seen := make(map[string]struct{}, len(familiarSIDs))
 		for _, sid := range familiarSIDs {
-			if deleted, err := paths.DeleteSessionJSONL(sid, cwd, agentDir); err != nil {
-				log.Printf("clearSession: familiar %q: %v", sid, err)
+			if _, exists := seen[sid]; exists {
+				continue
+			}
+			seen[sid] = struct{}{}
+			deleted, err := paths.DeleteSessionJSONLIfPresent(sid, cwd, agentDir)
+			if err != nil {
+				failures = append(failures, fmt.Errorf("clear familiar %q history: %w", sid, err))
 			} else if deleted != "" {
 				log.Printf("clearSession: familiar %q deleted %s", sid, deleted)
 			}
 		}
 		if err := paths.ClearFamiliarsJSONL(a.profile, sessionID); err != nil {
-			log.Printf("clearSession: clear familiars.json: %v", err)
+			failures = append(failures, fmt.Errorf("clear familiars.json: %w", err))
 		}
-
-		// Delete the .jsonl file for this session (scoped to agentDir)
-		deleted, err := paths.DeleteSessionJSONL(sessionID, cwd, agentDir)
-		if err != nil {
-			log.Printf("clearSession: %v", err)
-		} else {
+		if deleted, err := paths.DeleteSessionJSONLIfPresent(sessionID, cwd, agentDir); err != nil {
+			failures = append(failures, fmt.Errorf("clear session history: %w", err))
+		} else if deleted != "" {
 			log.Printf("clearSession: deleted %s", deleted)
 		}
+		if err := errors.Join(failures...); err != nil {
+			return fail(err)
+		}
 
-		// Recreate the emulator with the same session id so pi starts fresh
 		newEm := a.newChatEmulator(sessionID)
-		if newEm != nil {
-			if err := a.startEmulatorSync(newEm, nil); err != nil {
-				newEm.Stop()
-				log.Printf("clearSession: restart %q: %v", sessionID, err)
-				return nil
+		if newEm == nil {
+			return fail(fmt.Errorf("cannot restart chat %q: no Pi emulator is available", sessionID))
+		}
+		if err := a.startEmulatorSync(newEm, nil); err != nil {
+			newEm.Stop()
+			return fail(fmt.Errorf("restart chat %q: %w", sessionID, err))
+		}
+		if a.emulatorCache == nil {
+			a.emulatorCache = make(map[string]*portalis.Emulator)
+		}
+		a.emulatorCache[sessionID] = newEm
+
+		if panel == nil && a.container != nil {
+			if active := a.container.Active(); active != nil {
+				panel, _ = active.(*ui.ChatPanel)
 			}
-			a.emulatorCache[sessionID] = newEm
-			// 4. Point the active ChatPanel's chatSession at the new emulator.
-			// Without this, the UI keeps rendering the stopped (old) emulator
-			// and the user sees an empty screen instead of a fresh pi prompt.
-			if a.container != nil {
-				if panel := a.container.Active(); panel != nil {
-					if cp, ok := panel.(*ui.ChatPanel); ok {
-						for _, s := range cp.Sessions() {
-							if s.Em() != nil && s.Em().SessionID == sessionID {
-								s.SetEm(newEm)
-								break
-							}
-						}
-					}
+		}
+		if panel != nil {
+			for _, session := range panel.Sessions() {
+				if session.Em() != nil && session.Em().SessionID == sessionID {
+					session.SetEm(newEm)
+					break
 				}
 			}
-			return portalis.PtyReadyMsg{SessionID: sessionID}
 		}
-		return nil
+		return portalis.PtyReadyMsg{SessionID: sessionID}
 	}
 }
 
@@ -1392,27 +1470,81 @@ func (a *App) sessionBaseDir() string {
 	return paths.SessionsDir(a.profile)
 }
 
-// enableMouse returns a command that enables mouse tracking in the terminal.
-// Mode 1000 = click, 1002 = cell-motion (only while button held).
-// We do NOT enable 1003 (all-motion) — it floods the update loop with one
-// msg per cursor pixel, easily spinning CPU to 100% just from a hover.
+// mouseModeSequence returns the complete set of terminal mouse modes used by
+// the Bubble Tea program, including all-motion for hover tracking.
+func mouseModeSequence(enabled bool) string {
+	suffix := byte('l')
+	if enabled {
+		suffix = 'h'
+	}
+	return fmt.Sprintf("\x1b[?1000%c\x1b[?1002%c\x1b[?1003%c\x1b[?1006%c", suffix, suffix, suffix, suffix)
+}
+
+// enableMouse returns a command that enables all active mouse tracking modes.
 func enableMouse() tea.Cmd {
 	return func() tea.Msg {
-		os.Stdout.Write([]byte("\x1b[?1000h\x1b[?1002h\x1b[?1006h"))
+		_, _ = os.Stdout.Write([]byte(mouseModeSequence(true)))
 		return nil
 	}
 }
 
-// disableMouse returns a command that disables mouse tracking in the terminal.
+// disableMouse returns a command that disables all active mouse tracking modes.
 func disableMouse() tea.Cmd {
 	return func() tea.Msg {
-		os.Stdout.Write([]byte("\x1b[?1000l\x1b[?1002l\x1b[?1006l"))
+		_, _ = os.Stdout.Write([]byte(mouseModeSequence(false)))
 		return nil
 	}
 }
 
 func openDebugLog(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+}
+
+type startupConfig struct {
+	profile    string
+	piAgentDir string
+}
+
+func resolveStartupConfig(profile, piTag string, resolveHome func() (string, error)) (startupConfig, error) {
+	if profile != "" && paths.ProfileSlug(profile) == "" {
+		return startupConfig{}, fmt.Errorf("profile %q has no valid path slug", profile)
+	}
+	if piTag != "" && !validPiTag(piTag) {
+		return startupConfig{}, fmt.Errorf("invalid Pi tag %q: use letters, digits, hyphens, and underscores only", piTag)
+	}
+
+	config := startupConfig{profile: profile}
+	if os.Getenv("AI_DATA_HOME") != "" && piTag == "" {
+		return config, nil
+	}
+	if resolveHome == nil {
+		resolveHome = paths.HomeDir
+	}
+	home, err := resolveHome()
+	if err != nil {
+		return startupConfig{}, fmt.Errorf("resolve home directory: %w", err)
+	}
+	if home == "" {
+		return startupConfig{}, fmt.Errorf("resolve home directory: empty path")
+	}
+	if piTag != "" {
+		config.piAgentDir = filepath.Join(home, ".ai", piTag, "pi")
+	}
+	return config, nil
+}
+
+func validPiTag(tag string) bool {
+	if tag == "" {
+		return false
+	}
+	for _, char := range tag {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func main() {
@@ -1422,14 +1554,12 @@ func main() {
 	cpuProfile := flag.String("cpuprofile", "", "path to write CPU profile (e.g. /tmp/automata-cpu.prof)")
 	flag.Parse()
 
-	piAgentDir := ""
-	if *piTag != "" {
-		home, _ := os.UserHomeDir()
-		if home == "" {
-			home = "/Users/a"
-		}
-		piAgentDir = filepath.Join(home, ".ai", *piTag, "pi")
+	startup, err := resolveStartupConfig(*profile, *piTag, nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "automata: invalid startup configuration:", err)
+		return
 	}
+	piAgentDir := startup.piAgentDir
 
 	if *cpuProfile != "" {
 		f, err := os.Create(*cpuProfile)

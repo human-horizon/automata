@@ -3,11 +3,57 @@ package context
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
 )
+
+func TestReadForProfileReturnsValidPartialDataAndDiagnostics(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "partial-context__chat"
+	dir := paths.SessionDir("", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plans := `[{"name":"valid","steps":["legacy",{"text":"structured","done":true},42]},42,{"name":"other","steps":[{"text":"retained","done":false}]}]`
+	if err := os.WriteFile(filepath.Join(dir, "plans.json"), []byte(plans), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(dir, "status.json")
+	if err := os.WriteFile(statusPath, []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"autoContinue":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := ReadForProfile("", sessionID)
+	if err == nil {
+		t.Fatal("corrupt context entries returned no diagnostic")
+	}
+	if data == nil {
+		t.Fatal("partial context data is nil")
+	}
+	if got := data.Plans["valid"]; len(got) != 2 || got[0].Text != "legacy" || got[1].Text != "structured" || !got[1].Done {
+		t.Fatalf("valid plan steps were not retained: %#v", got)
+	}
+	if got := data.Plans["other"]; len(got) != 1 || got[0].Text != "retained" {
+		t.Fatalf("valid plan after corrupt entries was not retained: %#v", got)
+	}
+	if data.Settings == nil || !data.Settings.AutoContinue {
+		t.Fatalf("valid settings were not retained: %#v", data.Settings)
+	}
+	if data.Status != nil {
+		t.Fatalf("corrupt status unexpectedly decoded: %#v", data.Status)
+	}
+	for _, expected := range []string{"plans.json plan 0 step 2", "plans.json plan 1", statusPath} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("aggregate diagnostic %q does not mention %q", err, expected)
+		}
+	}
+}
 
 func TestCachedReaderNoticesSizeChangeWhenMaxMtimeIsUnchanged(t *testing.T) {
 	dataHome := t.TempDir()

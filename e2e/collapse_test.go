@@ -79,8 +79,8 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	}
 	page.WaitStable(200 * time.Millisecond)
 
-	// Wait for the chat layout (vertical border between chat and knowledge).
-	if err := page.WaitFor("│", 5*time.Second); err != nil {
+	// Wait for the chat layout (vertical border before the auto/dual controls).
+	if err := page.WaitFor("│[× auto]", 5*time.Second); err != nil {
 		t.Fatalf("chat layout missing vertical border: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	// terminal-cell column tracks the actual inner chat panel's left edge.
 	before, _ := page.Text()
 	beforeLeftEdge := leftEdgeOfChatContent(before, "AUTOMATA_CHAT_RESIZE_MARKER")
-	beforeBorderCol := rightmostKnowledgeBorder(before)
+	beforeBorderCol := rightmostPanelBorder(before)
 	if beforeLeftEdge < 0 || beforeBorderCol < 0 {
 		t.Fatalf("could not measure rendered chat layout before collapse: left=%d border=%d\n%s", beforeLeftEdge, beforeBorderCol, before)
 	}
@@ -99,7 +99,7 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	page.MouseClick(29, 0)
 	page.WaitStable(100 * time.Millisecond)
 
-	if err := page.WaitFor("Knowledge", 2*time.Second); err != nil {
+	if err := page.WaitFor("[× auto]", 2*time.Second); err != nil {
 		text, _ := page.Text()
 		t.Fatalf("app appears crashed after collapse: %v\n%s", err, text)
 	}
@@ -114,7 +114,7 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	for time.Now().Before(deadline) {
 		after, _ = page.Text()
 		afterLeftEdge = leftEdgeOfChatContent(after, "AUTOMATA_CHAT_RESIZE_MARKER")
-		afterBorderCol = rightmostKnowledgeBorder(after)
+		afterBorderCol = rightmostPanelBorder(after)
 		afterWidth = afterBorderCol - afterLeftEdge
 		releasedWidth := beforeLeftEdge - afterLeftEdge
 		grewBy := afterWidth - beforeWidth
@@ -146,7 +146,7 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	// Verify the application is still alive after collapse. This
 	// catches nil-pointer or render-chain regressions that could
 	// crash the app on toggle.
-	if err := page.WaitFor("Knowledge", 2*time.Second); err != nil {
+	if err := page.WaitFor("[× auto]", 2*time.Second); err != nil {
 		text, _ := page.Text()
 		t.Fatalf("app appears crashed after collapse: %v\n%s", err, text)
 	}
@@ -169,10 +169,10 @@ func leftEdgeOfChatContent(screen, marker string) int {
 	return best
 }
 
-// rightmostKnowledgeBorder returns the terminal-cell column of the rightmost
-// rendered "│Knowledge" separator, or -1 if it is absent.
-func rightmostKnowledgeBorder(screen string) int {
-	const separator = "│Knowledge"
+// rightmostPanelBorder returns the terminal-cell column of the rightmost
+// rendered "│[× auto]" separator, or -1 if it is absent.
+func rightmostPanelBorder(screen string) int {
+	const separator = "│[× auto]"
 	best := -1
 	for _, line := range strings.Split(screen, "\n") {
 		searchFrom := 0

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -96,31 +97,8 @@ func Write(profile, domain string, notes []NoteSummary) error {
 	}
 	encoded = append(encoded, '\n')
 
-	temporary, err := os.CreateTemp(domainDir, ".notes-*.json")
-	if err != nil {
-		return fmt.Errorf("create temporary notes file: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-
-	if err := temporary.Chmod(0o644); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("set temporary notes permissions: %w", err)
-	}
-	if _, err := temporary.Write(encoded); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("write temporary notes file: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("sync temporary notes file: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close temporary notes file: %w", err)
-	}
-
-	if err := os.Rename(temporaryPath, filepath.Join(domainDir, "notes.json")); err != nil {
-		return fmt.Errorf("replace notes file: %w", err)
+	if err := atomicfile.Write(filepath.Join(domainDir, "notes.json"), encoded, 0o644); err != nil {
+		return fmt.Errorf("write notes file: %w", err)
 	}
 	return nil
 }

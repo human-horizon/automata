@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	akcontext "github.com/HumanHorizon/automata/internal/ai-knowledge/context"
+	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
@@ -98,44 +100,12 @@ func TestKnowledgePanelRecoversClosedWatchers(t *testing.T) {
 		t.Fatal("test setup did not create both watchers")
 	}
 
-	knowledgeCmd := k.watchKnowledgeCmd()
-	if knowledgeCmd == nil {
-		t.Fatal("knowledge watcher command is nil")
-	}
-	knowledgeMessages := make(chan tea.Msg, 1)
-	go func() { knowledgeMessages <- knowledgeCmd() }()
-	go func() { oldKnowledge.Errors <- errors.New("synthetic knowledge watcher error") }()
-	select {
-	case msg := <-knowledgeMessages:
-		errorMsg, ok := msg.(knowledgeWatcherErrorMsg)
-		if !ok || errorMsg.err == nil {
-			t.Fatalf("knowledge watcher error message = %#v", msg)
-		}
-		k.Update(msg)
-	case <-time.After(2 * time.Second):
-		t.Fatal("closed knowledge watcher did not report recovery")
-	}
+	k.Update(knowledgeWatcherErrorMsg{err: errors.New("synthetic knowledge watcher error")})
 	if k.knowledgeWatcher == nil || k.knowledgeWatcher == oldKnowledge {
 		t.Fatal("knowledge watcher was not recreated")
 	}
 
-	jobsCmd := k.watchJobsCmd()
-	if jobsCmd == nil {
-		t.Fatal("jobs watcher command is nil")
-	}
-	jobsMessages := make(chan tea.Msg, 1)
-	go func() { jobsMessages <- jobsCmd() }()
-	go func() { oldJobs.Errors <- errors.New("synthetic jobs watcher error") }()
-	select {
-	case msg := <-jobsMessages:
-		errorMsg, ok := msg.(jobsWatcherErrorMsg)
-		if !ok || errorMsg.err == nil {
-			t.Fatalf("jobs watcher error message = %#v", msg)
-		}
-		k.Update(msg)
-	case <-time.After(2 * time.Second):
-		t.Fatal("closed jobs watcher did not report recovery")
-	}
+	k.Update(jobsWatcherErrorMsg{err: errors.New("synthetic jobs watcher error")})
 	if k.jobsWatcher == nil || k.jobsWatcher == oldJobs {
 		t.Fatal("jobs watcher was not recreated")
 	}
@@ -194,7 +164,7 @@ func TestKnowledgeSettingsPreserveUnknownNestedKeys(t *testing.T) {
 	k := NewKnowledgePanel()
 	k.profile, k.sessionID = profile, sessionID
 	k.readSettings()
-	k.handleMouse(tea.MouseMsg{X: 12, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	k.handleMouse(tea.MouseMsg{X: 1, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	if !k.autoContinue || k.dual || k.settingsError != "" {
 		t.Fatalf("settings after toggle: auto=%v dual=%v error=%q", k.autoContinue, k.dual, k.settingsError)
 	}
@@ -237,7 +207,7 @@ func TestKnowledgeSettingsFailuresPreserveFileAndToggleState(t *testing.T) {
 	if k.settingsError == "" {
 		t.Fatal("malformed settings did not produce a visible diagnostic")
 	}
-	k.handleMouse(tea.MouseMsg{X: 12, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	k.handleMouse(tea.MouseMsg{X: 1, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	if k.autoContinue || k.dual {
 		t.Fatalf("failed update changed displayed toggles: auto=%v dual=%v", k.autoContinue, k.dual)
 	}
@@ -269,7 +239,7 @@ func TestKnowledgeSettingsAtomicWriterFailureRollsBackToggle(t *testing.T) {
 	k.profile, k.sessionID = profile, sessionID
 	k.readSettings()
 	k.settingsWriter = func(string, []byte) error { return errors.New("injected atomic write failure") }
-	k.handleMouse(tea.MouseMsg{X: 12, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	k.handleMouse(tea.MouseMsg{X: 1, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	if k.autoContinue || k.dual || !strings.Contains(k.settingsError, "injected atomic write failure") {
 		t.Fatalf("atomic failure state: auto=%v dual=%v error=%q", k.autoContinue, k.dual, k.settingsError)
 	}
@@ -289,7 +259,7 @@ func TestKnowledgeSettingsNewFileAndMutuallyExclusiveToggle(t *testing.T) {
 	k := NewKnowledgePanel()
 	k.profile, k.sessionID = profile, sessionID
 	k.readSettings()
-	k.handleMouse(tea.MouseMsg{X: 22, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	k.handleMouse(tea.MouseMsg{X: 11, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	if k.dual == false || k.autoContinue || k.settingsError != "" {
 		t.Fatalf("new settings toggle = auto=%v dual=%v error=%q", k.autoContinue, k.dual, k.settingsError)
 	}
@@ -311,12 +281,11 @@ func TestKnowledgeHeaderHitboxesMatchRenderedCells(t *testing.T) {
 		name  string
 		width int
 	}{
-		{name: "title only", width: 8},
-		{name: "partial auto", width: 12},
-		{name: "auto edge", width: 18},
-		{name: "separator", width: 19},
-		{name: "partial dual", width: 25},
-		{name: "full header", width: 27},
+		{name: "partial auto", width: 4},
+		{name: "auto only", width: 8},
+		{name: "separator", width: 9},
+		{name: "partial dual", width: 13},
+		{name: "full header", width: 17},
 		{name: "wide header", width: 80},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -332,8 +301,11 @@ func TestKnowledgeHeaderHitboxesMatchRenderedCells(t *testing.T) {
 			if got := ansi.StringWidth(header); got > test.width {
 				t.Fatalf("header width = %d, viewport = %d", got, test.width)
 			}
+			if strings.Contains(header, "Knowledge") {
+				t.Fatalf("removed panel title is still visible: %q", header)
+			}
 			for name, hitbox := range map[string]terminalCellRange{
-				"title": layout.title, "auto": layout.auto,
+				"auto":      layout.auto,
 				"separator": layout.separator, "dual": layout.dual,
 			} {
 				if hitbox.start < 0 || hitbox.end < hitbox.start || hitbox.end > test.width {
@@ -370,6 +342,60 @@ func TestKnowledgeHeaderHitboxesMatchRenderedCells(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestKnowledgePanelCollapsibleSectionsAndScrolling(t *testing.T) {
+	k := NewKnowledgePanel()
+	k.data = &akcontext.Data{Plans: map[string][]akcontext.PlanStep{
+		"Build": {{Text: "first step"}, {Text: "second step"}},
+	}}
+	k.jobs = []akjobs.Job{{ID: "job-1", Command: "build artifacts", Running: true}}
+
+	plain := ansi.Strip(k.View(80, 30))
+	if strings.Contains(plain, "Knowledge") {
+		t.Fatal("panel title should not be displayed")
+	}
+	if k.plansHeaderY < 0 || k.jobsHeaderY < 0 {
+		t.Fatalf("section headers are not hit-testable: plans=%d jobs=%d", k.plansHeaderY, k.jobsHeaderY)
+	}
+	if !strings.Contains(plain, "── ▾ Plans") || !strings.Contains(plain, "── ▾ Jobs") {
+		t.Fatalf("expanded section indicators missing: %s", plain)
+	}
+
+	k.handleMouse(tea.MouseMsg{Y: k.plansHeaderY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	plain = ansi.Strip(k.View(80, 30))
+	if !k.plansCollapsed || strings.Contains(plain, "first step") || !strings.Contains(plain, "── ▸ Plans") {
+		t.Fatalf("Plans did not collapse: %s", plain)
+	}
+	k.handleMouse(tea.MouseMsg{Y: k.jobsHeaderY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	plain = ansi.Strip(k.View(80, 30))
+	if !k.jobsCollapsed || strings.Contains(plain, "build artifacts") || !strings.Contains(plain, "── ▸ Jobs") {
+		t.Fatalf("Jobs did not collapse: %s", plain)
+	}
+
+	steps := make([]akcontext.PlanStep, 20)
+	for index := range steps {
+		steps[index] = akcontext.PlanStep{Text: "long step " + strings.Repeat("detail ", 3)}
+	}
+	k.data.Plans["Build"] = steps
+	k.plansCollapsed = false
+	k.jobsCollapsed = false
+	k.scrollOffset = 0
+	k.View(80, 8)
+	k.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	k.View(80, 8)
+	if k.scrollOffset == 0 {
+		t.Fatal("mouse wheel did not scroll the full section content")
+	}
+	k.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("pgdown")})
+	k.View(80, 8)
+	if k.scrollOffset == 0 {
+		t.Fatal("Page Down did not preserve scrolling")
+	}
+	k.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if k.scrollOffset < 0 {
+		t.Fatalf("scroll offset became negative: %d", k.scrollOffset)
 	}
 }
 

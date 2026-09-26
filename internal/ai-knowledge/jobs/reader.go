@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -207,18 +208,7 @@ func runPs(runner psRunner, pid int) (string, error) {
 	return runner(pid)
 }
 
-var (
-	renameJobMetadata        = os.Rename
-	syncJobMetadataDirectory = func(path string) error {
-		directory, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		syncErr := directory.Sync()
-		closeErr := directory.Close()
-		return errors.Join(syncErr, closeErr)
-	}
-)
+var writeJobMetadataAtomic = atomicfile.Write
 
 // writeJSON atomically replaces a JobRecord and reports every durability error.
 func writeJSON(path string, rec *JobRecord) error {
@@ -226,33 +216,8 @@ func writeJSON(path string, rec *JobRecord) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	temporary, err := os.CreateTemp(dir, ".job-metadata-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temporary job metadata: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer func() { _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(0o644); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("chmod temporary job metadata: %w", err)
-	}
-	if _, err := temporary.Write(data); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("write temporary job metadata: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("sync temporary job metadata: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close temporary job metadata: %w", err)
-	}
-	if err := renameJobMetadata(temporaryPath, path); err != nil {
-		return fmt.Errorf("replace job metadata: %w", err)
-	}
-	if err := syncJobMetadataDirectory(dir); err != nil {
-		return fmt.Errorf("job metadata committed but directory sync failed: %w", err)
+	if err := writeJobMetadataAtomic(path, data, 0o644); err != nil {
+		return fmt.Errorf("write job metadata %s: %w", path, err)
 	}
 	return nil
 }
@@ -276,13 +241,19 @@ func listForProfile(profile, sessionID string) ([]Job, error) {
 	}
 
 	var jobs []Job
+	var failures []error
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		metaPath := filepath.Join(jobsDir, entry.Name(), "job.json")
 		var rec JobRecord
-		if err := readJSON(metaPath, &rec); err != nil || rec.ID == "" {
+		if err := readJSON(metaPath, &rec); err != nil {
+			failures = append(failures, fmt.Errorf("read job metadata %s: %w", metaPath, err))
+			continue
+		}
+		if rec.ID == "" {
+			failures = append(failures, fmt.Errorf("read job metadata %s: missing job ID", metaPath))
 			continue
 		}
 
@@ -298,6 +269,7 @@ func listForProfile(profile, sessionID string) ([]Job, error) {
 
 		info, err := os.Stat(metaPath)
 		if err != nil {
+			failures = append(failures, fmt.Errorf("stat job metadata %s: %w", metaPath, err))
 			continue
 		}
 		jobs = append(jobs, Job{
@@ -309,7 +281,7 @@ func listForProfile(profile, sessionID string) ([]Job, error) {
 		})
 	}
 
-	return jobs, nil
+	return jobs, errors.Join(failures...)
 }
 
 // List resolves a legacy session by existing profile directories, then uses

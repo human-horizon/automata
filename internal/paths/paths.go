@@ -17,7 +17,10 @@
 package paths
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 
@@ -30,11 +33,26 @@ func dataHome() string {
 	if v := os.Getenv("AI_DATA_HOME"); v != "" {
 		return v
 	}
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "/Users/a"
+	home, err := HomeDir()
+	if err != nil {
+		panic(fmt.Errorf("resolve home directory: %w", err))
 	}
 	return filepath.Join(home, ".ai", "automata")
+}
+
+// HomeDir resolves the current user's home directory without assuming a
+// machine-specific path. The account database is a fallback when the process
+// environment does not provide HOME.
+func HomeDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		return home, nil
+	}
+	current, currentErr := user.Current()
+	if currentErr == nil && current.HomeDir != "" {
+		return current.HomeDir, nil
+	}
+	return "", errors.Join(err, currentErr)
 }
 
 // BaseDir returns ~/.ai/automata (or $AI_DATA_HOME).

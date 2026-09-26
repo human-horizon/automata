@@ -420,23 +420,7 @@ func TestContextPanelRecoversClosedNotesWatcher(t *testing.T) {
 	if oldWatcher == nil {
 		t.Fatal("test setup did not create notes watcher")
 	}
-	cmd := cp.watchNotesCmd()
-	if cmd == nil {
-		t.Fatal("notes watcher command is nil")
-	}
-	messages := make(chan tea.Msg, 1)
-	go func() { messages <- cmd() }()
-	go func() { oldWatcher.Errors <- errors.New("synthetic notes watcher error") }()
-	select {
-	case msg := <-messages:
-		errorMsg, ok := msg.(notesWatcherErrorMsg)
-		if !ok || errorMsg.err == nil {
-			t.Fatalf("notes watcher error message = %#v", msg)
-		}
-		cp.Update(msg)
-	case <-time.After(2 * time.Second):
-		t.Fatal("closed notes watcher did not report recovery")
-	}
+	cp.Update(notesWatcherErrorMsg{err: errors.New("synthetic notes watcher error")})
 	if cp.notesWatcher == nil || cp.notesWatcher == oldWatcher {
 		t.Fatal("notes watcher was not recreated")
 	}

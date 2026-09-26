@@ -9,9 +9,22 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/charmbracelet/lipgloss"
 )
+
+func injectCommittedStateWarning(t *testing.T) {
+	t.Helper()
+	previousWriter := writeStateAtomic
+	writeStateAtomic = func(path string, data []byte, mode os.FileMode) error {
+		if err := atomicfile.Write(path, data, mode); err != nil {
+			return err
+		}
+		return &atomicfile.CommittedError{Path: path, Err: errors.New("directory sync failed")}
+	}
+	t.Cleanup(func() { writeStateAtomic = previousWriter })
+}
 
 func TestLoadStateAcceptsSupportedVersions(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
@@ -221,9 +234,7 @@ func TestSaveStateReportsDirectorySyncFailureAsCommitted(t *testing.T) {
 	tr.Profile = "committed-warning"
 	tr.AddChat("persisted")
 
-	oldSync := syncStateDir
-	t.Cleanup(func() { syncStateDir = oldSync })
-	syncStateDir = func(string) error { return errors.New("sync failed") }
+	injectCommittedStateWarning(t)
 	err := tr.SaveState()
 	var committed *CommittedStateError
 	if !errors.As(err, &committed) {
@@ -361,9 +372,7 @@ func TestCreateRollbackAndCommittedWarning(t *testing.T) {
 	t.Run("directory sync warning keeps committed item", func(t *testing.T) {
 		t.Setenv("AI_DATA_HOME", t.TempDir())
 		tr := New()
-		oldSync := syncStateDir
-		t.Cleanup(func() { syncStateDir = oldSync })
-		syncStateDir = func(string) error { return errors.New("directory sync failed") }
+		injectCommittedStateWarning(t)
 		item, err := tr.CreateChat("committed")
 		var committed *CommittedStateError
 		if !errors.As(err, &committed) || item == nil {
@@ -531,9 +540,7 @@ func TestCommittedRenameAndMoveWarningsDoNotRollback(t *testing.T) {
 			return func() error { rollbackCalls++; return nil }, nil
 		})
 		tr.SetOnRenameCommitted(func(*Item, string, string) { committedCalls++ })
-		oldSync := syncStateDir
-		t.Cleanup(func() { syncStateDir = oldSync })
-		syncStateDir = func(string) error { return errors.New("directory sync failed") }
+		injectCommittedStateWarning(t)
 		if err := tr.RenameItem(item, "after"); err != nil {
 			t.Fatalf("RenameItem: committed warning should not be returned as failure: %v", err)
 		}
@@ -565,9 +572,7 @@ func TestCommittedRenameAndMoveWarningsDoNotRollback(t *testing.T) {
 			return func() error { rollbackCalls++; return nil }, nil
 		})
 		tr.SetOnItemMoved(func(*Item, string, string) { committedCalls++ })
-		oldSync := syncStateDir
-		t.Cleanup(func() { syncStateDir = oldSync })
-		syncStateDir = func(string) error { return errors.New("directory sync failed") }
+		injectCommittedStateWarning(t)
 		err = tr.MoveItemChecked(moving, target)
 		var committed *CommittedStateError
 		if !errors.As(err, &committed) {
@@ -637,9 +642,7 @@ func TestDeletePostCommitWarningKeepsDeletionAndRunsCleanup(t *testing.T) {
 	cleanupCalled := false
 	tr.SetOnBeforeDelete(func(*Item) error { return nil })
 	tr.SetOnDeleteCommitted(func(*Item) error { cleanupCalled = true; return nil })
-	oldSync := syncStateDir
-	t.Cleanup(func() { syncStateDir = oldSync })
-	syncStateDir = func(string) error { return errors.New("directory sync failed") }
+	injectCommittedStateWarning(t)
 	err = tr.DeleteItem(item)
 	var committed *CommittedStateError
 	if !errors.As(err, &committed) {
@@ -673,9 +676,7 @@ func TestSetActiveSessionsKeepsCommittedSnapshotAfterDirectorySyncWarning(t *tes
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	tr := New()
 	tr.SetActiveSessionsInMemory(map[string]struct{}{"old": {}})
-	oldSync := syncStateDir
-	t.Cleanup(func() { syncStateDir = oldSync })
-	syncStateDir = func(string) error { return errors.New("directory sync failed") }
+	injectCommittedStateWarning(t)
 	err := tr.SetActiveSessions(map[string]struct{}{"new": {}})
 	var committed *CommittedStateError
 	if !errors.As(err, &committed) {

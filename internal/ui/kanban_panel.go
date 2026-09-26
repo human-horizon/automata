@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
@@ -62,6 +64,13 @@ var statusTransitions = map[string][]transition{
 	"done": {{"→ Pending", "pending"}},
 }
 
+var (
+	assignKanbanTaskStatus      = kanban.AssignTaskAndStatus
+	updateKanbanTaskStatus      = kanban.UpdateStatus
+	writeAssignedChatTaskStatus = writeTaskToChatStatus
+	writeRemovedChatTaskStatus  = writeTaskRemovedFromChat
+)
+
 // KanbanPanel renders a full kanban board using warp layout.
 type KanbanPanel struct {
 	profile     string
@@ -98,10 +107,11 @@ type KanbanPanel struct {
 	// blocks on watcher event/error channels and is re-armed after each result.
 	watchPending bool
 
-	// onTaskAssigned is called when a task is assigned to a chat and may
-	// return a Bubble Tea command (for example, the emulator Listen command).
-	onTaskAssigned func(sessionID, taskTitle string) tea.Cmd
+	// onTaskAssigned is called when a task is assigned to a chat. It may return
+	// a Bubble Tea command and an error when the assignment must be rolled back.
+	onTaskAssigned func(sessionID, taskTitle string) (tea.Cmd, error)
 	assignmentErr  string
+	actionWarning  string
 
 	width  int
 	height int
@@ -253,7 +263,7 @@ func (k *KanbanPanel) SetChats(chats []ChatInfo) {
 }
 
 // SetOnTaskAssigned sets a callback that fires when a task is assigned to a chat.
-func (k *KanbanPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string) tea.Cmd) {
+func (k *KanbanPanel) SetOnTaskAssigned(fn func(sessionID, taskTitle string) (tea.Cmd, error)) {
 	k.onTaskAssigned = fn
 }
 
@@ -446,7 +456,11 @@ func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	if msg.Y == 1 {
 		// Button row
 		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
-			k.createTask()
+			if err := k.createTask(); err != nil {
+				k.assignmentErr = err.Error()
+			} else {
+				k.assignmentErr = ""
+			}
 		}
 		k.btnPanel.hover = msg.Button == tea.MouseButtonNone
 		return nil
@@ -569,9 +583,18 @@ func (k *KanbanPanel) View(width, height int) string {
 	topPad := strings.Repeat(" ", width)
 	btnLine := k.btnPanel.View(width, 1)
 	boardTopPad := strings.Repeat(" ", width)
+	warnings := make([]string, 0, 2)
+	if k.actionWarning != "" {
+		warnings = append(warnings, "⚠ "+k.actionWarning)
+	}
 	if k.readWarning != "" {
-		warning := "⚠ Не все Kanban-задачи загружены: " + k.readWarning
-		warning = ansi.Truncate(warning, width, "…")
+		warnings = append(warnings, "⚠ Не все Kanban-задачи загружены: "+k.readWarning)
+	}
+	if k.assignmentErr != "" {
+		warnings = append(warnings, "Ошибка Kanban-действия: "+k.assignmentErr)
+	}
+	if len(warnings) > 0 {
+		warning := ansi.Truncate(strings.Join(warnings, "; "), width, "…")
 		boardTopPad = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error)).Render(warning)
 	}
 
@@ -666,23 +689,54 @@ func (k *KanbanPanel) renderPicker(width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (k *KanbanPanel) createTask() {
+func (k *KanbanPanel) createTask() error {
+	return k.createTaskAt(time.Now())
+}
+
+func (k *KanbanPanel) createTaskAt(createdAt time.Time) error {
 	if k.domain == "" {
-		return
+		return errors.New("Kanban domain is not selected")
 	}
-	dir := filepath.Join(paths.DomainDir(k.profile, k.domain), "kanban")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return
+	dir := kanban.KanbanDir(k.domain, k.profile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create Kanban directory: %w", err)
 	}
-	ts := time.Now().Format("2006-01-02T15-04-05")
-	name := fmt.Sprintf("task-%s.md", ts)
-	content := `---
-title: Новая задача
-status: todo
----
-`
-	os.WriteFile(filepath.Join(dir, name), []byte(content), 0644)
-	k.reload()
+	baseName := "task-" + createdAt.Format("2006-01-02T15-04-05")
+	content := "---\ntitle: Новая задача\nstatus: todo\n---\n"
+	for suffix := uint64(0); ; suffix++ {
+		name := baseName + ".md"
+		if suffix > 0 {
+			name = fmt.Sprintf("%s-%d.md", baseName, suffix+1)
+		}
+		path := filepath.Join(dir, name)
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return fmt.Errorf("create Kanban task %s: %w", path, err)
+		}
+
+		_, writeErr := file.WriteString(content)
+		if writeErr == nil {
+			writeErr = file.Sync()
+		}
+		closeErr := file.Close()
+		if writeErr == nil {
+			writeErr = closeErr
+		} else if closeErr != nil {
+			writeErr = errors.Join(writeErr, closeErr)
+		}
+		if writeErr != nil {
+			removeErr := os.Remove(path)
+			if removeErr != nil && !os.IsNotExist(removeErr) {
+				writeErr = errors.Join(writeErr, fmt.Errorf("remove incomplete task: %w", removeErr))
+			}
+			return fmt.Errorf("write Kanban task %s: %w", path, writeErr)
+		}
+		k.reload()
+		return nil
+	}
 }
 
 // --- Button panel ---
@@ -724,7 +778,11 @@ func (b *kanbanBtnPanel) Update(msg tea.Msg) tea.Cmd {
 	case tea.MouseMsg:
 		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
 			if b.parent != nil {
-				b.parent.createTask()
+				if err := b.parent.createTask(); err != nil {
+					b.parent.assignmentErr = err.Error()
+				} else {
+					b.parent.assignmentErr = ""
+				}
 			}
 		}
 		b.hover = msg.Button == tea.MouseButtonNone
@@ -1026,9 +1084,15 @@ func (c *kanbanColPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			if row >= 0 && row < len(c.tasks) {
 				switch btn {
 				case "delete":
-					if err := os.Remove(c.tasks[row].Path); err != nil {
+					var err error
+					if c.parent == nil {
+						err = os.Remove(c.tasks[row].Path)
+					} else {
+						err = c.parent.deleteTask(c.tasks[row])
+					}
+					if err != nil {
 						if c.parent != nil {
-							c.parent.assignmentErr = fmt.Sprintf("delete task: %v", err)
+							c.parent.assignmentErr = err.Error()
 						}
 						return nil
 					}
@@ -1051,48 +1115,60 @@ func (c *kanbanColPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 						c.parent.pickerHover = -1
 					}
 				case "todo", "progress", "done":
-					task := c.tasks[row]
-					_, err := kanban.ReadTask(task.Path)
+					task, taskSnapshot, err := readTaskFileSnapshot(c.tasks[row].Path)
 					if err != nil {
 						if c.parent != nil {
 							c.parent.assignmentErr = fmt.Sprintf("read task: %v", err)
 						}
 						return nil
 					}
-					statusPath := ""
-					var statusSnapshot statusSnapshot
-					if c.parent != nil && task.Status == "progress" && btn == "todo" && task.AssignedTo != "" {
+
+					var statusPath string
+					var statusBefore statusSnapshot
+					statusChanged := false
+					committedWarnings := make([]string, 0, 2)
+					if c.parent != nil && btn == "todo" && task.AssignedTo != "" {
 						statusPath = filepath.Join(paths.SessionDir(c.parent.profile, task.AssignedTo), "status.json")
-						statusSnapshot, err = readStatusSnapshot(statusPath)
+						statusBefore, err = readStatusSnapshot(statusPath)
 						if err == nil {
-							err = writeTaskRemovedFromChat(c.parent.profile, task.AssignedTo, task.Title)
+							err = writeRemovedChatTaskStatus(c.parent.profile, task.AssignedTo, task.Title)
 						}
-						if err != nil {
-							if c.parent != nil {
-								c.parent.assignmentErr = fmt.Sprintf("notify task removal: %v", err)
-							}
+						if err != nil && !atomicfile.IsCommitted(err) {
+							c.parent.assignmentErr = fmt.Sprintf("notify task removal: %v", err)
 							return nil
 						}
+						if err != nil {
+							committedWarnings = append(committedWarnings, err.Error())
+						}
+						statusChanged = true
 					}
 
 					if btn == "todo" {
-						_, _, err = kanban.AssignTaskAndStatus(task.Path, "", btn)
+						_, _, err = assignKanbanTaskStatus(task.Path, "", btn)
 					} else {
-						_, err = kanban.UpdateStatus(task.Path, btn)
+						_, err = updateKanbanTaskStatus(task.Path, btn)
 					}
-					if err != nil {
-						if statusPath != "" {
-							if rollbackErr := restoreStatusSnapshot(statusPath, statusSnapshot); rollbackErr != nil {
-								err = fmt.Errorf("%w; restore chat status: %v", err, rollbackErr)
+					if err != nil && !atomicfile.IsCommitted(err) {
+						rollbackErrors := []error{fmt.Errorf("update task: %w", err)}
+						if restoreErr := taskSnapshot.restore(); restoreErr != nil {
+							rollbackErrors = append(rollbackErrors, fmt.Errorf("restore Kanban task: %w", restoreErr))
+						}
+						if statusChanged {
+							if restoreErr := restoreStatusSnapshot(statusPath, statusBefore); restoreErr != nil {
+								rollbackErrors = append(rollbackErrors, fmt.Errorf("restore chat status: %w", restoreErr))
 							}
 						}
 						if c.parent != nil {
-							c.parent.assignmentErr = fmt.Sprintf("update task: %v", err)
+							c.parent.assignmentErr = errors.Join(rollbackErrors...).Error()
 						}
 						return nil
 					}
+					if err != nil {
+						committedWarnings = append(committedWarnings, err.Error())
+					}
 					if c.parent != nil {
 						c.parent.assignmentErr = ""
+						c.parent.actionWarning = strings.Join(committedWarnings, "; ")
 						c.parent.reload()
 					}
 				default:
@@ -1235,6 +1311,82 @@ type statusSnapshot struct {
 	exists bool
 }
 
+type taskFileSnapshot struct {
+	path string
+	data []byte
+	mode os.FileMode
+}
+
+func readTaskFileSnapshot(path string) (kanban.Task, taskFileSnapshot, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return kanban.Task{}, taskFileSnapshot{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return kanban.Task{}, taskFileSnapshot{}, err
+	}
+	task, err := kanban.ReadTask(path)
+	if err != nil {
+		return kanban.Task{}, taskFileSnapshot{}, err
+	}
+	return task, taskFileSnapshot{path: path, data: data, mode: info.Mode().Perm()}, nil
+}
+
+func (snapshot taskFileSnapshot) restore() error {
+	return writeAtomicFile(snapshot.path, snapshot.data, snapshot.mode)
+}
+
+func (k *KanbanPanel) deleteTask(task kanban.Task) error {
+	if err := k.deleteTaskWith(task, os.Remove); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (k *KanbanPanel) deleteTaskWith(task kanban.Task, removeFile func(string) error) error {
+	current, taskSnapshot, err := readTaskFileSnapshot(task.Path)
+	if err != nil {
+		return fmt.Errorf("read task before deletion: %w", err)
+	}
+
+	var statusPath string
+	var statusBefore statusSnapshot
+	statusChanged := false
+	statusWarning := ""
+	if current.AssignedTo != "" {
+		statusPath = filepath.Join(paths.SessionDir(k.profile, current.AssignedTo), "status.json")
+		statusBefore, err = readStatusSnapshot(statusPath)
+		if err != nil {
+			return fmt.Errorf("read assigned chat status before deletion: %w", err)
+		}
+		if err := writeRemovedChatTaskStatus(k.profile, current.AssignedTo, current.Title); err != nil {
+			if !atomicfile.IsCommitted(err) {
+				return fmt.Errorf("notify assigned chat before deletion: %w", err)
+			}
+			statusWarning = err.Error()
+		}
+		statusChanged = true
+	}
+
+	if err := removeFile(task.Path); err != nil {
+		rollbackErrors := []error{fmt.Errorf("delete Kanban task: %w", err)}
+		if restoreErr := taskSnapshot.restore(); restoreErr != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore Kanban task snapshot: %w", restoreErr))
+		}
+		if statusChanged {
+			if restoreErr := restoreStatusSnapshot(statusPath, statusBefore); restoreErr != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restore assigned chat status snapshot: %w", restoreErr))
+			}
+		}
+		return errors.Join(rollbackErrors...)
+	}
+	if statusWarning != "" {
+		k.actionWarning = statusWarning
+	}
+	return nil
+}
+
 func readStatusSnapshot(path string) (statusSnapshot, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1264,52 +1416,87 @@ func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".automata-write-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
+	return atomicfile.Write(path, data, mode)
 }
 
 func (k *KanbanPanel) assignTaskToChat(task kanban.Task, chat ChatInfo, status string) (tea.Cmd, error) {
-	statusPath := filepath.Join(paths.SessionDir(k.profile, chat.SessionID), "status.json")
-	snapshot, err := readStatusSnapshot(statusPath)
+	previous, taskSnapshot, err := readTaskFileSnapshot(task.Path)
 	if err != nil {
-		return nil, fmt.Errorf("read chat status: %w", err)
+		return nil, fmt.Errorf("read Kanban task before assignment: %w", err)
 	}
-	previous, _, err := kanban.AssignTaskAndStatus(task.Path, chat.SessionID, status)
-	if err != nil {
-		return nil, fmt.Errorf("assign Kanban task %s: %w", task.Path, err)
+
+	type sessionStatusSnapshot struct {
+		sessionID string
+		path      string
+		snapshot  statusSnapshot
 	}
-	if err := writeTaskToChatStatus(k.profile, chat.SessionID, task.Title, task.Path); err != nil {
-		rollbackErr := kanban.WriteTask(previous.Path, previous)
-		statusRollbackErr := restoreStatusSnapshot(statusPath, snapshot)
-		if rollbackErr != nil || statusRollbackErr != nil {
-			return nil, fmt.Errorf("write chat status: %w; rollback Kanban=%v status=%v", err, rollbackErr, statusRollbackErr)
+	statusSnapshots := make([]sessionStatusSnapshot, 0, 2)
+	sessionIDs := make([]string, 0, 2)
+	if previous.AssignedTo != "" && previous.AssignedTo != chat.SessionID {
+		sessionIDs = append(sessionIDs, previous.AssignedTo)
+	}
+	sessionIDs = append(sessionIDs, chat.SessionID)
+	for _, sessionID := range sessionIDs {
+		statusPath := filepath.Join(paths.SessionDir(k.profile, sessionID), "status.json")
+		snapshot, err := readStatusSnapshot(statusPath)
+		if err != nil {
+			return nil, fmt.Errorf("read chat status for %s: %w", sessionID, err)
 		}
-		return nil, fmt.Errorf("write chat status: %w", err)
+		statusSnapshots = append(statusSnapshots, sessionStatusSnapshot{
+			sessionID: sessionID,
+			path:      statusPath,
+			snapshot:  snapshot,
+		})
+	}
+
+	rollback := func(cause error) error {
+		rollbackErrors := []error{cause}
+		if err := taskSnapshot.restore(); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore Kanban task snapshot: %w", err))
+		}
+		for index := len(statusSnapshots) - 1; index >= 0; index-- {
+			entry := statusSnapshots[index]
+			if err := restoreStatusSnapshot(entry.path, entry.snapshot); err != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restore chat status for %s: %w", entry.sessionID, err))
+			}
+		}
+		return errors.Join(rollbackErrors...)
+	}
+
+	committedWarnings := make([]string, 0, 2)
+	updatedPrevious, _, err := assignKanbanTaskStatus(task.Path, chat.SessionID, status)
+	if err != nil {
+		if !atomicfile.IsCommitted(err) {
+			return nil, fmt.Errorf("assign Kanban task %s: %w", task.Path, err)
+		}
+		committedWarnings = append(committedWarnings, err.Error())
+	} else {
+		previous = updatedPrevious
+	}
+	if previous.AssignedTo != "" && previous.AssignedTo != chat.SessionID {
+		if err := writeRemovedChatTaskStatus(k.profile, previous.AssignedTo, previous.Title); err != nil {
+			return nil, rollback(fmt.Errorf("notify previous chat about reassignment: %w", err))
+		}
+	}
+	if err := writeAssignedChatTaskStatus(k.profile, chat.SessionID, previous.Title, task.Path); err != nil {
+		return nil, rollback(fmt.Errorf("write assigned chat status: %w", err))
 	}
 	if k.onTaskAssigned == nil {
+		k.actionWarning = strings.Join(committedWarnings, "; ")
 		return nil, nil
 	}
-	return k.onTaskAssigned(chat.SessionID, task.Title), nil
+	cmd, startErr := k.onTaskAssigned(chat.SessionID, previous.Title)
+	if startErr == nil {
+		k.actionWarning = strings.Join(committedWarnings, "; ")
+		return cmd, nil
+	}
+	var committed *CommittedActionError
+	if errors.As(startErr, &committed) {
+		committedWarnings = append(committedWarnings, startErr.Error())
+		k.actionWarning = strings.Join(committedWarnings, "; ")
+		return cmd, nil
+	}
+	return nil, fmt.Errorf("start assigned chat: %w", rollback(startErr))
 }
 
 // writeTaskToChatStatus writes a task assignment to the chat's status.json

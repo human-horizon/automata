@@ -16,6 +16,16 @@ import (
 	warp "github.com/starframe-dev/warp"
 )
 
+func TestChatPanelRendersLifecycleActionWarning(t *testing.T) {
+	panel := NewChatPanel(portalis.NewEmulator("session", "Main", "/bin/sh", nil), "session", "")
+	panel.SetActionWarning("cleanup failed\nrestart skipped")
+
+	view := panel.View(100, 3)
+	if !strings.Contains(view, "! action: cleanup failed; restart skipped") {
+		t.Fatalf("chat panel did not render lifecycle warning: %q", view)
+	}
+}
+
 func TestRenderTabBarTruncatesANSIWithoutBreakingSequences(t *testing.T) {
 	panel := &ChatPanel{
 		activeIdx: 0,
