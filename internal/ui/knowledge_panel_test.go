@@ -88,9 +88,13 @@ func TestKnowledgeJobsWatcherObservesExistingNestedJobMetadata(t *testing.T) {
 	sessionID := "nested-jobs-watch__chat"
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", "job-1")
-	if err := os.MkdirAll(jobDir, 0o755); err != nil { t.Fatal(err) }
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	jobPath := filepath.Join(jobDir, "job.json")
-	if err := os.WriteFile(jobPath, []byte(`{"id":"job-1"}`), 0o644); err != nil { t.Fatal(err) }
+	if err := os.WriteFile(jobPath, []byte(`{"id":"job-1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	k := NewKnowledgePanel()
 	defer k.Close()
@@ -101,13 +105,19 @@ func TestKnowledgeJobsWatcherObservesExistingNestedJobMetadata(t *testing.T) {
 		t.Fatalf("nested job directory %q is not watched: %#v", jobDir, k.jobsWatchedPaths)
 	}
 	cmd := k.watchJobsCmd()
-	if cmd == nil { t.Fatal("nested jobs watch command is nil") }
+	if cmd == nil {
+		t.Fatal("nested jobs watch command is nil")
+	}
 	messages := make(chan tea.Msg, 1)
 	go func() { messages <- cmd() }()
-	if err := os.WriteFile(jobPath, []byte(`{"id":"job-1","status":"exited"}`), 0o644); err != nil { t.Fatal(err) }
+	if err := os.WriteFile(jobPath, []byte(`{"id":"job-1","status":"exited"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case msg := <-messages:
-		if _, ok := msg.(jobsChangedMsg); !ok { t.Fatalf("nested job update message = %T", msg) }
+		if _, ok := msg.(jobsChangedMsg); !ok {
+			t.Fatalf("nested job update message = %T", msg)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("nested job.json update was not observed")
 	}
