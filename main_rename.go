@@ -236,7 +236,9 @@ func (a *App) applyRenameMappings(plan *renamePlan) {
 		a.currentSessionID = newID
 	}
 	if a.container != nil {
-		a.container.RenameSessionIDs(oldToNew)
+		if cmd := a.container.RenameSessionIDs(oldToNew); cmd != nil {
+			a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, cmd)
+		}
 		sessionDomains := make(map[string]string, len(plan.sessions))
 		for _, session := range plan.sessions {
 			if session.newID != session.oldID {

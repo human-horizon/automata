@@ -2050,7 +2050,7 @@ func TestSharedStatusWatcherRearmsAfterEvent(t *testing.T) {
 	}
 }
 
-func TestMetadataSaveCoalescesRapidChangesAndDropsStaleTimers(t *testing.T) {
+func TestMetadataSaveCoalescesRapidChangesIntoOneTimer(t *testing.T) {
 	app := newTestApp(t, "metadata-coalesce")
 	item := app.tree.AllItems()[0]
 	writes := 0
@@ -2062,28 +2062,29 @@ func TestMetadataSaveCoalescesRapidChangesAndDropsStaleTimers(t *testing.T) {
 		return nil
 	})
 
-	var staleMessages []treeMetadataSaveMsg
-	var latest tea.Cmd
-	for index := range 100 {
+	item.CWD = "/work/0"
+	first := app.scheduleMetadataSave()
+	if first == nil {
+		t.Fatal("first metadata change did not schedule a timer")
+	}
+	for index := 1; index < 100; index++ {
 		item.CWD = fmt.Sprintf("/work/%d", index)
-		latest = app.scheduleMetadataSave()
-		staleMessages = append(staleMessages, treeMetadataSaveMsg{generation: app.metadataSaveGeneration - 1})
+		if cmd := app.scheduleMetadataSave(); cmd != nil {
+			t.Fatalf("metadata change %d scheduled a duplicate timer", index)
+		}
 	}
-	for _, stale := range staleMessages {
-		_, _ = app.Update(stale)
-	}
-	if writes != 0 || !app.metadataSaveDirty {
-		t.Fatalf("stale timers wrote state or cleared dirty state: writes=%d dirty=%t", writes, app.metadataSaveDirty)
+	if writes != 0 || !app.metadataSaveDirty || !app.metadataSavePending {
+		t.Fatalf("metadata changed before timer: writes=%d dirty=%t pending=%t", writes, app.metadataSaveDirty, app.metadataSavePending)
 	}
 
-	msg := latest()
-	saveMessage, ok := msg.(treeMetadataSaveMsg)
+	raw := first()
+	saveMessage, ok := raw.(treeMetadataSaveMsg)
 	if !ok {
-		t.Fatalf("metadata timer message = %T, want treeMetadataSaveMsg", msg)
+		t.Fatalf("metadata timer message = %T, want treeMetadataSaveMsg", raw)
 	}
 	_, _ = app.Update(saveMessage)
-	if writes != 1 || app.metadataSaveDirty {
-		t.Fatalf("coalesced save = writes:%d dirty:%t, want one write and clean state", writes, app.metadataSaveDirty)
+	if writes != 1 || app.metadataSaveDirty || app.metadataSavePending {
+		t.Fatalf("coalesced save = writes:%d dirty:%t pending:%t, want one write and clean state", writes, app.metadataSaveDirty, app.metadataSavePending)
 	}
 	_, _ = app.Update(saveMessage)
 	if writes != 1 {
@@ -2112,8 +2113,40 @@ func TestEmulatorMetadataCallbacksScheduleDeferredSaves(t *testing.T) {
 	if item.CWD != "/deferred/cwd" || !reflect.DeepEqual(item.CommandHistory, []string{"echo deferred"}) {
 		t.Fatalf("metadata callbacks did not update Tree item: cwd=%q history=%v", item.CWD, item.CommandHistory)
 	}
-	if writes != 0 || !app.metadataSaveDirty || len(app.pendingBubbleTeaCmds) != 2 {
-		t.Fatalf("callbacks wrote synchronously or failed to queue saves: writes=%d dirty=%t commands=%d", writes, app.metadataSaveDirty, len(app.pendingBubbleTeaCmds))
+	if writes != 0 || !app.metadataSaveDirty || !app.metadataSavePending || len(app.pendingBubbleTeaCmds) != 1 {
+		t.Fatalf("callbacks wrote synchronously or failed to coalesce saves: writes=%d dirty=%t pending=%t commands=%d", writes, app.metadataSaveDirty, app.metadataSavePending, len(app.pendingBubbleTeaCmds))
+	}
+}
+
+func TestPlanWidthChangeUsesDeferredMetadataSave(t *testing.T) {
+	app := newTestApp(t, "plan-width-deferred")
+	writes := 0
+	app.tree.SetSaveStateFunc(func() error {
+		writes++
+		return nil
+	})
+
+	app.handlePlanWidthChange(57)
+	if got := app.tree.PlanWidth(); got != 57 {
+		t.Fatalf("plan width = %d, want 57", got)
+	}
+	if writes != 0 {
+		t.Fatalf("plan width persisted synchronously: writes=%d", writes)
+	}
+	if !app.metadataSaveDirty || !app.metadataSavePending || len(app.pendingBubbleTeaCmds) != 1 {
+		t.Fatalf("plan width did not queue one deferred save: dirty=%t pending=%t commands=%d", app.metadataSaveDirty, app.metadataSavePending, len(app.pendingBubbleTeaCmds))
+	}
+
+	cmd := app.pendingBubbleTeaCmds[0]
+	app.pendingBubbleTeaCmds = nil
+	raw := cmd()
+	msg, ok := raw.(treeMetadataSaveMsg)
+	if !ok {
+		t.Fatalf("plan width timer returned %T, want treeMetadataSaveMsg", raw)
+	}
+	_, _ = app.Update(msg)
+	if writes != 1 || app.metadataSaveDirty || app.metadataSavePending {
+		t.Fatalf("deferred plan width save = writes:%d dirty:%t pending:%t", writes, app.metadataSaveDirty, app.metadataSavePending)
 	}
 }
 

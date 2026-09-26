@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/HumanHorizon/automata/internal/paths"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	"github.com/Starframe/portalis"
 	tea "github.com/charmbracelet/bubbletea"
@@ -1090,5 +1091,48 @@ func TestConfirmNoLeavesTabIntact(t *testing.T) {
 	}
 	if cp.closeFamiliarModal != nil {
 		t.Error("closeFamiliarModal should be cleared")
+	}
+}
+
+func TestRenameSessionIDsRebindsActiveFamiliarWatcher(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const (
+		profile = "rename-watcher"
+		oldID   = "rename-watcher__old"
+		newID   = "rename-watcher__new"
+	)
+
+	oldDir := filepath.Dir(paths.FamiliarsJSONLPath(profile, oldID))
+	newDir := filepath.Dir(paths.FamiliarsJSONLPath(profile, newID))
+	if err := os.MkdirAll(oldDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	panel := NewChatPanel(portalis.NewEmulator(oldID, "Main", "/bin/cat", nil), oldID, profile)
+	defer panel.Close()
+	_ = panel.Activate()
+	oldWatcher := panel.familiarWatcher
+	oldGeneration := panel.familiarGeneration
+	if oldWatcher == nil || filepath.Clean(panel.familiarWatcherPath) != filepath.Clean(oldDir) {
+		t.Fatalf("initial familiar watcher = %v path=%q, want %q", oldWatcher, panel.familiarWatcherPath, oldDir)
+	}
+
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := panel.RenameSessionIDs(map[string]string{oldID: newID})
+	if panel.SessionID() != newID {
+		t.Fatalf("renamed owner session = %q, want %q", panel.SessionID(), newID)
+	}
+	if panel.familiarWatcher == nil || panel.familiarWatcher == oldWatcher {
+		t.Fatal("active rename did not replace the familiar watcher")
+	}
+	if filepath.Clean(panel.familiarWatcherPath) != filepath.Clean(newDir) {
+		t.Fatalf("renamed familiar watcher path = %q, want %q", panel.familiarWatcherPath, newDir)
+	}
+	if panel.familiarGeneration <= oldGeneration {
+		t.Fatalf("rename generation = %d, want > %d", panel.familiarGeneration, oldGeneration)
+	}
+	if cmd == nil {
+		t.Fatal("active rename did not return a watcher re-arm command")
 	}
 }

@@ -155,15 +155,19 @@ func (c *Container) SetChatDomain(domain string) {
 
 // RenameSessionIDs updates the currently displayed chat and knowledge
 // panels after a tree rename. The caller has already stopped the emulators.
-func (c *Container) RenameSessionIDs(mapping map[string]string) {
+func (c *Container) RenameSessionIDs(mapping map[string]string) tea.Cmd {
+	var cmds []tea.Cmd
 	if cp, ok := c.chatTerminal.(*ChatPanel); ok {
-		cp.RenameSessionIDs(mapping)
+		if cmd := cp.RenameSessionIDs(mapping); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 	if c.knowledgePanel != nil {
 		if newID, ok := mapping[c.knowledgePanel.sessionID]; ok {
 			c.knowledgePanel.SetSession(newID)
 		}
 	}
+	return tea.Batch(cmds...)
 }
 
 // RenameDomains updates the currently displayed folder context after a tree

@@ -114,6 +114,7 @@ type App struct {
 	pendingBubbleTeaCmds []tea.Cmd
 
 	metadataSaveDirty      bool
+	metadataSavePending    bool
 	metadataSaveGeneration uint64
 
 	// Root overlays are rendered by App.View so Help and Settings cover the
@@ -302,13 +303,6 @@ func newApp(profile, piAgentDir string) (a *App) {
 		return a.commitDeletedTreeRuntime(plan)
 	})
 
-	container.SetOnPlanWidthChange(func(w int) {
-		t.SetPlanWidth(w)
-		if err := t.SaveState(); err != nil {
-			log.Printf("automata: persist plan width: %v", err)
-		}
-	})
-
 	a = &App{
 		warp:                  w,
 		tree:                  t,
@@ -329,6 +323,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 		pendingMovePlans:      make(map[*tree.Item]*renamePlan),
 		pendingRenamePlans:    make(map[*tree.Item]*renamePlan),
 	}
+	container.SetOnPlanWidthChange(a.handlePlanWidthChange)
 	t.SetOnOpenHelp(a.openHelpOverlay)
 	t.SetOnOpenSettings(a.openSettingsOverlay)
 	t.SetOnThemeChange(a.applyTheme)
@@ -541,7 +536,11 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 		return a, nil
 
 	case treeMetadataSaveMsg:
-		if msg.generation != a.metadataSaveGeneration || !a.metadataSaveDirty {
+		if msg.generation != a.metadataSaveGeneration || !a.metadataSavePending {
+			return a, nil
+		}
+		a.metadataSavePending = false
+		if !a.metadataSaveDirty {
 			return a, nil
 		}
 		_ = a.flushPendingTreeMetadata()
@@ -811,11 +810,11 @@ func (a *App) createChatEmulator(sessionID string) *portalis.Emulator {
 		}
 		em.OnCWDChange = func(path string) {
 			item.CWD = path
-			a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.scheduleMetadataSave())
+			a.queueMetadataSave()
 		}
 		em.OnCommandHistoryChanged = func(history []string) {
 			item.CommandHistory = append([]string(nil), history...)
-			a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.scheduleMetadataSave())
+			a.queueMetadataSave()
 		}
 	}
 
@@ -1379,11 +1378,23 @@ func (a *App) watchSessionCmd(key string) tea.Cmd {
 	return a.watchTreeStatusCmd()
 }
 
+func (a *App) handlePlanWidthChange(width int) {
+	if a == nil || a.tree == nil {
+		return
+	}
+	a.tree.SetPlanWidth(width)
+	a.queueMetadataSave()
+}
+
 func (a *App) scheduleMetadataSave() tea.Cmd {
 	if a == nil || a.tree == nil {
 		return nil
 	}
 	a.metadataSaveDirty = true
+	if a.metadataSavePending {
+		return nil
+	}
+	a.metadataSavePending = true
 	a.metadataSaveGeneration++
 	generation := a.metadataSaveGeneration
 	return tea.Tick(metadataSaveDelay, func(time.Time) tea.Msg {
@@ -1391,11 +1402,18 @@ func (a *App) scheduleMetadataSave() tea.Cmd {
 	})
 }
 
+func (a *App) queueMetadataSave() {
+	if cmd := a.scheduleMetadataSave(); cmd != nil {
+		a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, cmd)
+	}
+}
+
 func (a *App) flushPendingTreeMetadata() error {
 	if a == nil {
 		return nil
 	}
 	a.metadataSaveGeneration++
+	a.metadataSavePending = false
 	if !a.metadataSaveDirty {
 		return nil
 	}

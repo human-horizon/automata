@@ -220,9 +220,11 @@ func (cp *ChatPanel) SessionID() string {
 // RenameSessionIDs updates the main and familiar session IDs after an
 // external tree rename. Emulators are already stopped by the caller, so
 // changing their routing IDs cannot leave an old PTY event in flight.
-func (cp *ChatPanel) RenameSessionIDs(mapping map[string]string) {
+func (cp *ChatPanel) RenameSessionIDs(mapping map[string]string) tea.Cmd {
+	ownerChanged := false
 	if newID, ok := mapping[cp.sessionID]; ok {
 		cp.sessionID = newID
+		ownerChanged = true
 	}
 	for _, session := range cp.sessions {
 		if session.em != nil {
@@ -234,6 +236,22 @@ func (cp *ChatPanel) RenameSessionIDs(mapping map[string]string) {
 			session.familiarID = newID
 		}
 	}
+	for id, sessionID := range cp.familiarSessions {
+		if newID, ok := mapping[sessionID]; ok {
+			cp.familiarSessions[id] = newID
+		}
+	}
+	if !ownerChanged || !cp.active {
+		return nil
+	}
+
+	cp.closeFamiliarWatcher()
+	cp.setupFamiliarWatcher()
+	cmds := cp.checkFamiliars()
+	if watchCmd := cp.armFamiliarWatcher(); watchCmd != nil {
+		cmds = append(cmds, watchCmd)
+	}
+	return tea.Batch(cmds...)
 }
 
 // Sessions returns the underlying chat session list (Main + familiars).
@@ -613,7 +631,7 @@ func (cp *ChatPanel) removeSessionAt(index int) {
 // removeDeadFamiliar removes a familiar tab whose PTY has exited.
 // Matches by SessionID (the familiar's own session id, e.g.
 // humanhorizon__human-horizon.automata.ai-2__test6) and clears cp.known
-// so the next checkFamiliars poll re-creates the tab from familiars.json.
+// so the next watcher reconciliation re-creates the tab from familiars.json.
 func (cp *ChatPanel) removeDeadFamiliar(sessionID string) bool {
 	for i, s := range cp.sessions {
 		// Only familiar tabs may be removed here. Main-session PtyExitMsg
