@@ -1418,12 +1418,15 @@ func newTestApp(t *testing.T, profile string) *App {
 	tr.Profile = profile
 	tr.AddChat("agent")
 	return &App{
-		tree:            tr,
-		profile:         profile,
-		scrollbackLines: scrollback.DefaultLines,
-		piAgentDir:      filepath.Join(home, ".ai", profile, "pi"),
-		statusReader:    status.NewCachedReader(profile),
-		sessionWatchers: make(map[string]*fsnotify.Watcher),
+		tree:                tr,
+		profile:             profile,
+		scrollbackLines:     scrollback.DefaultLines,
+		piAgentDir:          filepath.Join(home, ".ai", profile, "pi"),
+		activeSessions:      make(map[string]struct{}),
+		statusReader:        status.NewCachedReader(profile),
+		sessionWatchers:     make(map[string]*fsnotify.Watcher),
+		statusSessionDirs:   make(map[string]string),
+		sessionWatchPending: make(map[string]bool),
 	}
 }
 
@@ -1518,6 +1521,10 @@ func TestSetupStatusWatcherAttachesPerSession(t *testing.T) {
 		t.Fatal("test setup: no chat items were created")
 	}
 
+	for _, key := range keys {
+		app.activeSessions[key] = struct{}{}
+	}
+	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	_ = app.syncSessionWatchers()
 	t.Cleanup(func() {

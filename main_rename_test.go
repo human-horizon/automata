@@ -310,6 +310,7 @@ func TestMoveRollbackRestoresRuntimeAndFilesystem(t *testing.T) {
 	app := &App{
 		tree:                  tr,
 		profile:               profile,
+		piAgentDir:            filepath.Join(t.TempDir(), "pi"),
 		activeSessions:        map[string]struct{}{oldID: {}},
 		emulatorCache:         map[string]*portalis.Emulator{oldID: em},
 		familiarEmulatorCache: make(map[string]*portalis.Emulator),
@@ -474,6 +475,7 @@ func TestMoveSaveStateFailureRestoresTreeBeforeRuntimeRollback(t *testing.T) {
 	app := &App{
 		tree:                  tr,
 		profile:               profile,
+		piAgentDir:            filepath.Join(t.TempDir(), "pi"),
 		activeSessions:        map[string]struct{}{oldID: {}},
 		runningSessions:       map[string]struct{}{oldID: {}},
 		emulatorCache:         map[string]*portalis.Emulator{oldID: portalis.NewEmulator(oldID, "chat", "/bin/sh", nil)},
@@ -620,7 +622,8 @@ func TestMoveChatReusesRenameMigrationWithoutMovingDomain(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("AI_DATA_HOME", dataHome)
 	profile := "Move Profile"
-	app := newApp(profile, "")
+	agentDir := filepath.Join(home, ".ai", "just", "pi")
+	app := newApp(profile, agentDir)
 	defer app.Close()
 
 	app.tree.AddFolder("source")
