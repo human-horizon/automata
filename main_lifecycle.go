@@ -143,7 +143,6 @@ func (a *App) commitDeletedTreeRuntime(plan *preparedDeleteRuntime) error {
 	}
 	for _, sessionID := range plan.sessionIDs {
 		a.stopCachedEmulator(sessionID)
-		a.clearSessionWatchPending(sessionID)
 		delete(a.runningSessions, sessionID)
 		delete(a.activeSessions, sessionID)
 	}
@@ -187,7 +186,6 @@ func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) 
 
 	for _, sessionID := range ids {
 		a.stopCachedEmulator(sessionID)
-		a.clearSessionWatchPending(sessionID)
 		delete(a.runningSessions, sessionID)
 		if opts.persistInactive {
 			delete(a.activeSessions, sessionID)
@@ -314,10 +312,6 @@ func (a *App) stopCachedEmulator(sessionID string) {
 			em.Stop()
 		}
 	}
-}
-
-func (a *App) clearSessionWatchPending(sessionID string) {
-	delete(a.sessionWatchPending, sessionID)
 }
 
 func (a *App) stopAllRuntimeSessions(persistInactive bool) {

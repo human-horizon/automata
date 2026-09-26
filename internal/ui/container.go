@@ -3,9 +3,6 @@ package ui
 import (
 	"time"
 
-	akcontext "github.com/HumanHorizon/automata/internal/ai-knowledge/context"
-	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
-	"github.com/HumanHorizon/automata/internal/ai-knowledge/memory"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	"github.com/HumanHorizon/automata/internal/tree"
 	tea "github.com/charmbracelet/bubbletea"
@@ -292,93 +289,6 @@ func (c *Container) Close() {
 	}
 	if c.contextPanel != nil {
 		c.contextPanel.Close()
-	}
-}
-
-// RefreshKnowledge tells the knowledge and context panels to re-read data
-// from disk. Call from a tick.
-func (c *Container) RefreshKnowledge() {
-	if c.knowledgePanel != nil {
-		c.knowledgePanel.Refresh()
-	}
-	if c.contextPanel != nil {
-		c.contextPanel.Refresh()
-	}
-}
-
-// KnowledgeRefreshMsg carries data read asynchronously from disk for the
-// knowledge and context panels. The UI applies it in the main Update loop so
-// file I/O never blocks the renderer.
-type KnowledgeRefreshMsg struct {
-	SessionID    string
-	Domain       string
-	Profile      string
-	Context      *akcontext.Data
-	ContextError string
-	Jobs         []akjobs.Job
-	JobsError    string
-	Memory       *memory.Data
-	MemoryError  string
-}
-
-// RefreshKnowledgeCmd returns a command that reads the knowledge files for
-// the currently displayed session/domain in a background goroutine. The result
-// is delivered as a KnowledgeRefreshMsg.
-func (c *Container) RefreshKnowledgeCmd() tea.Cmd {
-	sessionID := ""
-	domain := ""
-	profile := c.profile
-	if c.knowledgePanel != nil {
-		sessionID = c.knowledgePanel.sessionID
-	}
-	if c.contextPanel != nil {
-		domain = c.contextPanel.domain
-		profile = c.contextPanel.profile
-	}
-	return func() tea.Msg {
-		msg := KnowledgeRefreshMsg{
-			SessionID: sessionID,
-			Domain:    domain,
-			Profile:   profile,
-		}
-		if sessionID != "" {
-			contextData, contextErr := akcontext.ReadForProfile(profile, sessionID)
-			msg.Context = contextData
-			msg.ContextError = knowledgeReadError(contextErr)
-			jobs, jobsErr := akjobs.ListForProfile(profile, sessionID)
-			msg.Jobs = jobs
-			msg.JobsError = knowledgeReadError(jobsErr)
-		}
-		if domain != "" {
-			if d, err := memory.Read(profile, domain); err == nil {
-				msg.Memory = d
-			} else {
-				msg.MemoryError = err.Error()
-			}
-		}
-		return msg
-	}
-}
-
-// ApplyKnowledgeRefresh applies the data carried by a KnowledgeRefreshMsg.
-func (c *Container) ApplyKnowledgeRefresh(msg KnowledgeRefreshMsg) {
-	if c.knowledgePanel != nil && msg.SessionID == c.knowledgePanel.sessionID {
-		if msg.SessionID != "" {
-			c.knowledgePanel.data = msg.Context
-			c.knowledgePanel.jobs = msg.Jobs
-		}
-		c.knowledgePanel.contextError = msg.ContextError
-		c.knowledgePanel.jobsError = msg.JobsError
-		c.knowledgePanel.lastRefresh = time.Now()
-		c.knowledgePanel.refreshCurrentTask()
-	}
-	if c.contextPanel != nil && msg.Domain == c.contextPanel.domain && msg.Profile == c.contextPanel.profile {
-		if msg.Memory != nil {
-			c.contextPanel.data = msg.Memory
-		} else if msg.MemoryError != "" {
-			c.contextPanel.data = nil
-			c.contextPanel.notesStatus = "✗ Notes read error: " + msg.MemoryError
-		}
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
@@ -68,10 +67,8 @@ func sessionDataPath(profile, sessionID string) string {
 	return paths.SessionDir(profile, sessionID)
 }
 
-// KnowledgePanel renders ai-knowledge data for a single session. The data
-// layer (status.json, plans.json, jobs, notes) is owned by ai-knowledge; we
-// just read on a tick and hand the resulting structures to the ai-knowledge
-// reusable renderer.
+// KnowledgePanel renders ai-knowledge data for a single session. Filesystem
+// watchers keep its data synchronized without periodic polling.
 type KnowledgePanel struct {
 	profile   string
 	sessionID string
@@ -86,13 +83,12 @@ type KnowledgePanel struct {
 	plansHeaderY   int
 	jobsHeaderY    int
 
-	lastRefresh  time.Time
 	data         *akcontext.Data
 	jobs         []akjobs.Job
 	contextError string
 	jobsError    string
 
-	// Cached readers prevent re-reading unchanged files on every tick.
+	// Cached readers prevent re-reading unchanged files across watcher events.
 	contextReader *akcontext.CachedReader
 	jobsReader    *akjobs.CachedReader
 
@@ -102,9 +98,8 @@ type KnowledgePanel struct {
 	settingsError  string
 	settingsWriter func(path string, data []byte) error
 
-	// Current task title (from kanban) shown before plans
-	currentTask     string
-	lastTaskRefresh time.Time
+	// Current task title (from kanban) shown before plans.
+	currentTask string
 
 	// knowledgeWatcher observes status.json, plans.json and settings.json
 	// for the current session. The knowledge panel reacts to its events
@@ -114,8 +109,9 @@ type KnowledgePanel struct {
 
 	// jobsWatcher observes the per-session jobs/ directory so newly
 	// spawned or finished jobs surface in the right panel immediately.
-	jobsWatcher     *fsnotify.Watcher
-	jobsWatcherPath string
+	jobsWatcher      *fsnotify.Watcher
+	jobsWatcherPath  string
+	jobsWatchedPaths map[string]struct{}
 
 	// kanbanWatcher keeps the current-task label synchronized with external
 	// task-file changes while this chat's Knowledge panel is visible.
@@ -181,15 +177,13 @@ func (k *KnowledgePanel) SetDomain(domain string) {
 	k.resetKanbanWatcher()
 	k.domain = domain
 	k.currentTask = ""
-	k.lastTaskRefresh = time.Time{}
 	k.refreshCurrentTask()
 	if k.active {
 		k.attachKanbanWatcherIfMissing()
 	}
 }
 
-// SetSession switches the panel to a different session. Forces a refresh on
-// the next tick.
+// SetSession switches the panel to a different session and re-arms its watchers.
 func (k *KnowledgePanel) SetSession(sessionID string) {
 	if sessionID == k.sessionID {
 		return
@@ -223,6 +217,7 @@ func (k *KnowledgePanel) closeWatchers() {
 		_ = k.jobsWatcher.Close()
 		k.jobsWatcher = nil
 	}
+	k.jobsWatchedPaths = nil
 	if k.kanbanWatcher != nil {
 		_ = k.kanbanWatcher.Close()
 		k.kanbanWatcher = nil
@@ -471,26 +466,6 @@ func (k *KnowledgePanel) settingsPath() string {
 	return filepath.Join(sessionDataPath(k.profile, k.sessionID), "settings.json")
 }
 
-// Refresh re-reads the data files for the current session. The UI is now
-// fully event-driven via fsnotify, but we keep the method so external
-// callers (e.g. legacy tick) can request a manual reload on demand.
-func (k *KnowledgePanel) Refresh() {
-	if k.sessionID == "" {
-		return
-	}
-	data, contextErr := k.contextReader.ReadForProfile(k.profile, k.sessionID)
-	if data != nil {
-		k.data = data
-	}
-	k.contextError = knowledgeReadError(contextErr)
-	k.jobsReader.Invalidate(k.profile, k.sessionID)
-	jobs, jobsErr := k.jobsReader.ListForProfile(k.profile, k.sessionID)
-	k.jobs = jobs
-	k.jobsError = knowledgeReadError(jobsErr)
-	k.refreshCurrentTask()
-	k.lastRefresh = time.Now()
-}
-
 // SetSize updates the panel's viewport.
 func (k *KnowledgePanel) SetSize(w, h int) {
 	k.width = w
@@ -622,6 +597,7 @@ func (k *KnowledgePanel) resetJobsWatcher() {
 		k.jobsWatcher = nil
 	}
 	k.jobsWatcherPath = ""
+	k.jobsWatchedPaths = nil
 }
 
 func (k *KnowledgePanel) resetKanbanWatcher() {
@@ -653,7 +629,6 @@ func (k *KnowledgePanel) refreshKnowledgeData() {
 	k.jobsError = knowledgeReadError(jobsErr)
 	k.readSettings()
 	k.refreshCurrentTask()
-	k.lastRefresh = time.Now()
 }
 
 func (k *KnowledgePanel) refreshJobsData() {
@@ -663,6 +638,7 @@ func (k *KnowledgePanel) refreshJobsData() {
 	// job.json. We deliberately do it before re-reading the list so the
 	// updated metadata is what the user sees.
 	pruneErr := akjobs.PruneStaleSessionForProfile(k.profile, k.sessionID)
+	k.attachJobsWatcherIfMissing()
 	k.jobsReader.Invalidate(k.profile, k.sessionID)
 	jobs, readErr := k.jobsReader.ListForProfile(k.profile, k.sessionID)
 	k.jobs = jobs
@@ -674,38 +650,67 @@ func (k *KnowledgePanel) refreshJobsData() {
 		diagnostics = append(diagnostics, readErr)
 	}
 	k.jobsError = knowledgeReadError(errors.Join(diagnostics...))
-	k.lastRefresh = time.Now()
 }
 
 func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
 	if !k.active || k.sessionID == "" {
 		return
 	}
-	jobsDir := filepath.Join(sessionDataPath(k.profile, k.sessionID), "jobs")
-	watchPath := jobsDir
+	sessionDir := sessionDataPath(k.profile, k.sessionID)
+	jobsDir := filepath.Join(sessionDir, "jobs")
+	watchRoot := jobsDir
 	if info, err := os.Stat(jobsDir); err != nil || !info.IsDir() {
-		if _, err := os.Stat(sessionDataPath(k.profile, k.sessionID)); err != nil {
+		if _, err := os.Stat(sessionDir); err != nil {
 			return
 		}
-		watchPath = sessionDataPath(k.profile, k.sessionID)
+		watchRoot = sessionDir
 	}
-	if k.jobsWatcher != nil && k.jobsWatcherPath == watchPath {
+
+	if k.jobsWatcher == nil || k.jobsWatcherPath != watchRoot {
+		k.resetJobsWatcher()
+		w, err := fsnotify.NewWatcher()
+		if err != nil {
+			return
+		}
+		k.jobsWatcher = w
+		k.jobsWatcherPath = watchRoot
+		k.jobsWatchedPaths = make(map[string]struct{})
+	}
+	k.syncJobsWatcherPaths(jobsDir, watchRoot)
+}
+
+func (k *KnowledgePanel) syncJobsWatcherPaths(jobsDir, watchRoot string) {
+	if k.jobsWatcher == nil {
 		return
 	}
-	if k.jobsWatcher != nil {
-		_ = k.jobsWatcher.Close()
-		k.jobsWatcher = nil
+	desired := map[string]struct{}{watchRoot: {}}
+	if watchRoot == jobsDir {
+		entries, err := os.ReadDir(jobsDir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				desired[filepath.Join(jobsDir, entry.Name())] = struct{}{}
+			}
+		}
 	}
-	w, err := fsnotify.NewWatcher()
-	if err != nil {
-		return
+	for path := range k.jobsWatchedPaths {
+		if _, keep := desired[path]; keep {
+			continue
+		}
+		_ = k.jobsWatcher.Remove(path)
+		delete(k.jobsWatchedPaths, path)
 	}
-	if err := w.Add(watchPath); err != nil {
-		_ = w.Close()
-		return
+	for path := range desired {
+		if _, exists := k.jobsWatchedPaths[path]; exists {
+			continue
+		}
+		if err := k.jobsWatcher.Add(path); err != nil {
+			continue
+		}
+		k.jobsWatchedPaths[path] = struct{}{}
 	}
-	k.jobsWatcher = w
-	k.jobsWatcherPath = watchPath
 }
 
 func (k *KnowledgePanel) attachKanbanWatcherIfMissing() {
@@ -812,7 +817,6 @@ func (k *KnowledgePanel) refreshCurrentTask() {
 		k.currentTask = ""
 		return
 	}
-	k.lastTaskRefresh = time.Now()
 	domain := k.domain
 	if domain == "" {
 		k.currentTask = ""

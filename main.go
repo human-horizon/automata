@@ -71,8 +71,7 @@ type App struct {
 	// not captured, allowing text selection in the terminal. Toggle with F8.
 	mouseEnabled bool
 
-	// profile is the active profile name; stored on App so background workers
-	// (e.g. status polling) know where to look for session data.
+	// profile is the active profile name used by background watchers and runtime paths.
 	profile          string
 	scrollbackLines  int
 	chatPickerFolder *tree.Item
@@ -86,20 +85,16 @@ type App struct {
 	// statusReader caches status.json reads and is invalidated by watcher events.
 	statusReader *status.CachedReader
 
-	// statusWatcher observes the sessions root and all visible chat directories.
+	// statusWatcher observes only currently active chat directories.
 	statusWatcher *fsnotify.Watcher
 
-	// sessionWatchers indexes the shared watcher by session ID; values point
-	// to statusWatcher and own no separate file descriptors.
+	// sessionWatchers indexes active session paths registered on the shared watcher.
 	sessionWatchers   map[string]*fsnotify.Watcher
 	statusSessionDirs map[string]string
 
 	// statusWatchPending guards the single blocking reader for statusWatcher.
 	statusWatchPending bool
 	statusGeneration   uint64
-
-	sessionWatchPending map[string]bool
-	statusSetChanged    bool
 
 	// movePlans stores external migrations between the pre-move and post-move
 	// tree callbacks. The plan is consumed after the state snapshot succeeds.
@@ -324,7 +319,6 @@ func newApp(profile, piAgentDir string) (a *App) {
 		statusReader:          status.NewCachedReader(profile),
 		sessionWatchers:       make(map[string]*fsnotify.Watcher),
 		statusSessionDirs:     make(map[string]string),
-		sessionWatchPending:   make(map[string]bool),
 		pendingMovePlans:      make(map[*tree.Item]*renamePlan),
 		pendingRenamePlans:    make(map[*tree.Item]*renamePlan),
 	}
@@ -381,9 +375,8 @@ func (a *App) bindChatPickerToTree() {
 	a.tree.SetOnItemsChanged(func() {
 		a.updateChatList(a.currentChatPickerFolder())
 		a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.syncSessionWatchers()...)
-		if a.statusSetChanged {
-			a.recomputeTreeStatusBadges()
-		}
+		// Structural changes can change session IDs even for inactive chats.
+		a.recomputeTreeStatusBadges()
 	})
 }
 
@@ -536,10 +529,6 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 		}
 		return a, nil
 
-	case ui.KnowledgeRefreshMsg:
-		a.container.ApplyKnowledgeRefresh(msg)
-		return a, nil
-
 	case treeMetadataSaveMsg:
 		if msg.generation != a.metadataSaveGeneration || !a.metadataSavePending {
 			return a, nil
@@ -571,9 +560,6 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 			return a, nil
 		}
 		a.statusWatchPending = false
-		for key := range a.sessionWatchPending {
-			a.sessionWatchPending[key] = false
-		}
 		changedPath := filepath.Clean(msg.path)
 		if sessionID, ok := a.statusSessionDirs[filepath.Dir(changedPath)]; ok {
 			name := filepath.Base(changedPath)
@@ -1262,15 +1248,11 @@ func (a *App) resetStatusWatcher() {
 	for dir := range a.statusSessionDirs {
 		delete(a.statusSessionDirs, dir)
 	}
-	for key := range a.sessionWatchPending {
-		delete(a.sessionWatchPending, key)
-	}
 }
 
 // syncSessionWatchers adds visible session directories to the shared watcher,
 // removes stale ones, and keeps exactly one blocking reader armed.
 func (a *App) syncSessionWatchers() []tea.Cmd {
-	a.statusSetChanged = false
 	if a.tree == nil {
 		return nil
 	}
@@ -1280,10 +1262,6 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 	if a.statusSessionDirs == nil {
 		a.statusSessionDirs = make(map[string]string)
 	}
-	if a.sessionWatchPending == nil {
-		a.sessionWatchPending = make(map[string]bool)
-	}
-
 	desired := make(map[string]string)
 	for key := range a.activeSessions {
 		item := a.tree.FindItemBySessionID(key)
@@ -1308,8 +1286,7 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 		}
 		delete(a.statusSessionDirs, oldDir)
 		delete(a.sessionWatchers, key)
-		delete(a.sessionWatchPending, key)
-		a.statusSetChanged = true
+		a.tree.SetStatusBadge(key, "")
 	}
 
 	for key, dir := range desired {
@@ -1327,8 +1304,9 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 		}
 		a.sessionWatchers[key] = a.statusWatcher
 		a.statusSessionDirs[dir] = key
-		a.sessionWatchPending[key] = false
-		a.statusSetChanged = true
+		// status.json may have been written before this watch was attached.
+		a.statusReader.Invalidate(key)
+		a.tree.SetStatusBadge(key, status.Emoji(a.statusReader.Read(key)))
 	}
 
 	if cmd := a.watchTreeStatusCmd(); cmd != nil {
@@ -1351,9 +1329,6 @@ func (a *App) watchTreeStatusCmd() tea.Cmd {
 		return nil
 	}
 	a.statusWatchPending = true
-	for key := range a.sessionWatchPending {
-		a.sessionWatchPending[key] = true
-	}
 	watcher := a.statusWatcher
 	generation := a.statusGeneration
 	return func() tea.Msg {
@@ -1370,15 +1345,6 @@ func (a *App) watchTreeStatusCmd() tea.Cmd {
 			return statusWatcherErrorMsg{generation: generation, watcher: watcher, err: err}
 		}
 	}
-}
-
-// watchSessionCmd is retained as a compatibility helper; all session IDs
-// share the single reader and watcher object.
-func (a *App) watchSessionCmd(key string) tea.Cmd {
-	if _, exists := a.sessionWatchers[key]; !exists {
-		return nil
-	}
-	return a.watchTreeStatusCmd()
 }
 
 func (a *App) handlePlanWidthChange(width int) {

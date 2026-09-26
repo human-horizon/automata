@@ -1032,14 +1032,21 @@ func (t *Tree) unbindFolderChecked(item *Item) error {
 
 // revealInFinder opens the bound directory in the system file manager.
 // Silently no-ops when the path is missing.
-func revealInFinder(path string) {
+func revealInFinder(path string) error {
 	if path == "" {
-		return
+		return fmt.Errorf("bound path is empty")
 	}
-	if info, err := os.Stat(path); err != nil || !info.IsDir() {
-		return
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("inspect bound path %q: %w", path, err)
 	}
-	_ = childproc.StartAndReap(exec.Command("open", path))
+	if !info.IsDir() {
+		return fmt.Errorf("bound path %q is not a directory", path)
+	}
+	if err := childproc.StartAndReap(exec.Command("open", path)); err != nil {
+		return fmt.Errorf("reveal %q in Finder: %w", path, err)
+	}
+	return nil
 }
 
 func (t *Tree) addChildFolder(parent *Item, name string) error {
@@ -1541,7 +1548,11 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 		// Bind/Reveal/Unbind only make sense for anchored folders.
 		if sel.BoundPath != "" {
 			items = append(items, []warp.PopoverItem{
-				{Name: "Reveal in Finder", Action: func() { revealInFinder(sel.BoundPath) }},
+				{Name: "Reveal in Finder", Action: func() {
+					if err := revealInFinder(sel.BoundPath); err != nil {
+						t.recordActionError(err)
+					}
+				}},
 				{Name: "Unbind", Action: func() { t.unbindFolder(sel) }},
 			}...)
 		} else {
@@ -2346,6 +2357,6 @@ func (t *Tree) resetHover() {
 // autoSave persists the tree state to disk.
 func (t *Tree) autoSave() {
 	if err := t.SaveState(); err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, "Failed to save tree state:", err)
+		t.recordActionError(err)
 	}
 }

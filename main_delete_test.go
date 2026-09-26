@@ -150,7 +150,6 @@ func TestCleanupDeletedTreeItemStopsRuntimeAndRemovesGhostState(t *testing.T) {
 		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "Chat", "", nil)},
 		familiarEmulatorCache: map[string]*portalis.Emulator{familiarID: portalis.NewEmulator(familiarID, "Expert", "", nil)},
 		sessionWatchers:       make(map[string]*fsnotify.Watcher),
-		sessionWatchPending:   map[string]bool{sessionID: true},
 	}
 
 	if err := app.cleanupDeletedTreeItem(folder); err != nil {

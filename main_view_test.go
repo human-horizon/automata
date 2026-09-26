@@ -1019,7 +1019,6 @@ func TestCleanupExternallyRemovedFamiliarPreservesRegistryAndJSONL(t *testing.T)
 		runningSessions:       map[string]struct{}{famSID: {}},
 		emulatorCache:         map[string]*portalis.Emulator{famSID: em},
 		familiarEmulatorCache: map[string]*portalis.Emulator{famSID: em},
-		sessionWatchPending:   map[string]bool{famSID: true},
 	}
 	app.tree.Profile = profile
 	if err := app.cleanupExternallyRemovedFamiliar(famSID, em); err != nil {
@@ -1038,9 +1037,6 @@ func TestCleanupExternallyRemovedFamiliarPreservesRegistryAndJSONL(t *testing.T)
 	}
 	if _, exists := app.familiarEmulatorCache[famSID]; exists {
 		t.Fatal("familiar remains in familiar emulator cache")
-	}
-	if _, exists := app.sessionWatchPending[famSID]; exists {
-		t.Fatal("familiar remains in watcher pending map")
 	}
 	if _, err := os.Stat(jsonlPath); err != nil {
 		t.Fatalf("external removal deleted familiar JSONL: %v", err)
@@ -1426,7 +1422,6 @@ func newTestApp(t *testing.T, profile string) *App {
 		statusReader:        status.NewCachedReader(profile),
 		sessionWatchers:     make(map[string]*fsnotify.Watcher),
 		statusSessionDirs:   make(map[string]string),
-		sessionWatchPending: make(map[string]bool),
 	}
 }
 
@@ -1807,16 +1802,6 @@ func TestTreeStatusChangedMsgTriggersRefresh(t *testing.T) {
 	}
 	if !app.statusWatchPending {
 		t.Errorf("expected statusWatchPending=true after re-arm")
-	}
-}
-
-// TestWatchSessionCmdNilWithoutWatcher asserts watchSessionCmd is inert
-// when the requested key has no mounted watcher, so Update never schedules
-// a goroutine that would deadlock on a closed channel.
-func TestWatchSessionCmdNilWithoutWatcher(t *testing.T) {
-	app := newTestApp(t, "")
-	if cmd := app.watchSessionCmd("missing"); cmd != nil {
-		t.Errorf("expected nil cmd for missing watcher, got %T", cmd)
 	}
 }
 

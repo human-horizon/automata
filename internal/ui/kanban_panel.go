@@ -97,9 +97,6 @@ type KanbanPanel struct {
 	// pickerHover is the index of the hovered chat in the picker
 	pickerHover int
 
-	// lastRefresh tracks the last time tasks were reloaded from disk
-	lastRefresh time.Time
-
 	// watcher observes the kanban directory (or its parent until the
 	// directory is created) for file changes without polling.
 	watcher     *fsnotify.Watcher
@@ -403,7 +400,6 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 			k.watchPending = false
 			k.setupWatcher()
 			k.reload()
-			k.lastRefresh = time.Now()
 		}
 		baseCmd = nil
 	case kanbanWatcherErrorMsg:
@@ -413,7 +409,6 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 			k.closeWatcher()
 			k.setupWatcher()
 			k.reload()
-			k.lastRefresh = time.Now()
 		}
 		baseCmd = nil
 	default:
@@ -1226,8 +1221,14 @@ func (c *kanbanColPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 						c.parent.reload()
 					}
 				default:
-					// Click on card — open file
-					_ = childproc.StartAndReap(exec.Command("zed", c.tasks[row].Path))
+					// Click on card — open file.
+					if err := childproc.StartAndReap(exec.Command("zed", c.tasks[row].Path)); err != nil {
+						if c.parent != nil {
+							c.parent.assignmentErr = fmt.Sprintf("open task file: %v", err)
+						}
+					} else if c.parent != nil {
+						c.parent.assignmentErr = ""
+					}
 				}
 			}
 		}
