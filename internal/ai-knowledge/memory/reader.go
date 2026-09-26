@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/HumanHorizon/automata/internal/atomicfile"
+	"github.com/HumanHorizon/automata/internal/cache"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -36,7 +37,7 @@ type Data struct {
 // CachedReader caches notes reads by file signature so we only re-read when the file changes.
 type CachedReader struct {
 	mu    sync.Mutex
-	cache map[string]cachedNotesEntry
+	cache *cache.LRU[string, cachedNotesEntry]
 }
 
 type cachedNotesEntry struct {
@@ -46,7 +47,7 @@ type cachedNotesEntry struct {
 
 // NewCachedReader creates a notes reader with file-signature caching.
 func NewCachedReader() *CachedReader {
-	return &CachedReader{cache: make(map[string]cachedNotesEntry)}
+	return &CachedReader{cache: cache.NewLRU[string, cachedNotesEntry](cache.ReaderCacheCapacity)}
 }
 
 // Invalidate removes a domain from the cache so a subsequent read sees
@@ -58,7 +59,7 @@ func (r *CachedReader) Invalidate(profile, domain string) {
 
 	path := filepath.Join(paths.DomainDir(effectiveProfile(profile), domain), "notes.json")
 	r.mu.Lock()
-	delete(r.cache, path)
+	r.cache.Delete(path)
 	r.mu.Unlock()
 }
 
@@ -143,14 +144,24 @@ func (r *CachedReader) Read(profile, domain string) (*Data, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	info, statErr := os.Stat(path)
+	var sourceBytes int64
+	if statErr == nil {
+		sourceBytes = info.Size()
+	} else if !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("stat notes file %s: %w", path, statErr)
+	}
 	data, signature, err := readNotesFile(path)
 	if err != nil {
 		return nil, err
 	}
-	if entry, ok := r.cache[path]; ok && entry.signature == signature {
+	if entry, ok := r.cache.Get(path); ok && entry.signature == signature && sourceBytes <= cache.MaxSourceMetadataBytes {
 		return entry.data, nil
 	}
-	r.cache[path] = cachedNotesEntry{data: data, signature: signature}
+	r.cache.Delete(path)
+	if sourceBytes <= cache.MaxSourceMetadataBytes {
+		r.cache.Add(path, cachedNotesEntry{data: data, signature: signature})
+	}
 	return data, nil
 }
 

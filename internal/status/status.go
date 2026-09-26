@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/cache"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -19,10 +21,11 @@ type Record struct {
 }
 
 // CachedReader caches status reads while file identity, size and mtime remain unchanged.
-// Safe for concurrent use from a single goroutine (bubbletea main loop).
+// Safe for concurrent use.
 type CachedReader struct {
+	mu      sync.Mutex
 	profile string
-	cache   map[string]cachedEntry
+	cache   *cache.LRU[string, cachedEntry]
 }
 
 type cachedEntry struct {
@@ -36,30 +39,45 @@ func statusPath(profile, sessionID string) string {
 	return filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 }
 
+const statusCacheCapacity = 1024
+
 // NewCachedReader creates a reader that caches by file identity, size and mtime.
 func NewCachedReader(profile string) *CachedReader {
 	return &CachedReader{
 		profile: profile,
-		cache:   make(map[string]cachedEntry),
+		cache:   cache.NewLRU[string, cachedEntry](statusCacheCapacity),
 	}
 }
 
 // Read returns the "action" field of status.json for a session, or "" if the
 // file is missing or unreadable. Uses file metadata to avoid re-reading unchanged files.
+// Invalidate forces the next Read for a session to inspect status.json again.
+func (r *CachedReader) Invalidate(sessionID string) {
+	if r == nil || sessionID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.cache.Delete(sessionID)
+	r.mu.Unlock()
+}
+
 func (r *CachedReader) Read(sessionID string) string {
 	if sessionID == "" {
 		return ""
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	path := statusPath(r.profile, sessionID)
 
 	// Check mtime cache
 	fi, err := os.Stat(path)
 	if err != nil {
 		// File doesn't exist or can't be read — cache empty result
-		r.cache[sessionID] = cachedEntry{value: "", mtime: time.Time{}}
+		r.cache.Add(sessionID, cachedEntry{value: "", mtime: time.Time{}})
 		return ""
 	}
-	if entry, ok := r.cache[sessionID]; ok && entry.info != nil &&
+	if entry, ok := r.cache.Get(sessionID); ok && entry.info != nil &&
 		entry.mtime.Equal(fi.ModTime()) && entry.size == fi.Size() && os.SameFile(entry.info, fi) {
 		return entry.value
 	}
@@ -67,15 +85,15 @@ func (r *CachedReader) Read(sessionID string) string {
 	// Read file
 	data, err := os.ReadFile(path)
 	if err != nil {
-		r.cache[sessionID] = cachedEntry{value: "", mtime: fi.ModTime(), size: fi.Size(), info: fi}
+		r.cache.Add(sessionID, cachedEntry{value: "", mtime: fi.ModTime(), size: fi.Size(), info: fi})
 		return ""
 	}
 	var rec Record
 	if err := json.Unmarshal(data, &rec); err != nil {
-		r.cache[sessionID] = cachedEntry{value: "", mtime: fi.ModTime(), size: fi.Size(), info: fi}
+		r.cache.Add(sessionID, cachedEntry{value: "", mtime: fi.ModTime(), size: fi.Size(), info: fi})
 		return ""
 	}
-	r.cache[sessionID] = cachedEntry{value: rec.Action, mtime: fi.ModTime(), size: fi.Size(), info: fi}
+	r.cache.Add(sessionID, cachedEntry{value: rec.Action, mtime: fi.ModTime(), size: fi.Size(), info: fi})
 	return rec.Action
 }
 

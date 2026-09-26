@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/childproc"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/slug"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
@@ -1038,7 +1039,7 @@ func revealInFinder(path string) {
 	if info, err := os.Stat(path); err != nil || !info.IsDir() {
 		return
 	}
-	_ = exec.Command("open", path).Start()
+	_ = childproc.StartAndReap(exec.Command("open", path))
 }
 
 func (t *Tree) addChildFolder(parent *Item, name string) error {
@@ -2196,6 +2197,21 @@ func (t *Tree) FindItemBySessionID(sessionID string) *Item {
 // indicators in the tree (e.g. "🧠", "📖", "💤"). Pass an empty map to clear.
 func (t *Tree) SetStatusBadges(m map[string]string) {
 	t.statusBadges = m
+}
+
+// SetStatusBadge updates or removes one session's inline status indicator.
+func (t *Tree) SetStatusBadge(sessionID, badge string) {
+	if sessionID == "" {
+		return
+	}
+	if badge == "" {
+		delete(t.statusBadges, sessionID)
+		return
+	}
+	if t.statusBadges == nil {
+		t.statusBadges = make(map[string]string)
+	}
+	t.statusBadges[sessionID] = badge
 }
 
 // StatusBadge returns the emoji badge for an item, or "" if none is set.

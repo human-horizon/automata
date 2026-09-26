@@ -1,8 +1,10 @@
 package status
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,6 +183,81 @@ func TestCachedReaderNoticesSameMtimeReplacement(t *testing.T) {
 	if got := reader.Read(sessionID); got != "new" {
 		t.Fatalf("status after same-mtime replacement = %q, want new", got)
 	}
+}
+
+func TestCachedReaderInvalidateForcesRefresh(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "invalidate-status"
+	dir := paths.SessionDir("", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(dir, "status.json")
+	mtime := time.Unix(1_700_000_000, 0)
+	if err := os.WriteFile(statusPath, []byte(`{"action":"old"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(statusPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := NewCachedReader("")
+	if got := reader.Read(sessionID); got != "old" {
+		t.Fatalf("initial status = %q, want old", got)
+	}
+	if err := os.WriteFile(statusPath, []byte(`{"action":"new"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(statusPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	if got := reader.Read(sessionID); got != "old" {
+		t.Fatalf("cached same-signature status = %q, want stale old before invalidation", got)
+	}
+
+	reader.Invalidate(sessionID)
+	if got := reader.Read(sessionID); got != "new" {
+		t.Fatalf("invalidated status = %q, want new", got)
+	}
+}
+
+func TestCachedReaderBoundsSessionEntries(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	reader := NewCachedReader("")
+	for index := range statusCacheCapacity + 100 {
+		reader.Read(fmt.Sprintf("status-session-%d", index))
+	}
+	if got := reader.cache.Len(); got > statusCacheCapacity {
+		t.Fatalf("status cache entries = %d, exceeds capacity %d", got, statusCacheCapacity)
+	}
+}
+
+func TestCachedReaderConcurrentReadAndInvalidate(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "concurrent-status"
+	dir := paths.SessionDir("", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"action":"read"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := NewCachedReader("")
+	var wait sync.WaitGroup
+	for worker := range 16 {
+		wait.Add(1)
+		go func(worker int) {
+			defer wait.Done()
+			for iteration := range 100 {
+				if (worker+iteration)%2 == 0 {
+					reader.Invalidate(sessionID)
+				}
+				reader.Read(sessionID)
+			}
+		}(worker)
+	}
+	wait.Wait()
 }
 
 func TestReadMissingFile(t *testing.T) {

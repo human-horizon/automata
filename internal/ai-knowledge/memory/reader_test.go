@@ -1,11 +1,13 @@
 package memory
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/HumanHorizon/automata/internal/cache"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -203,6 +205,32 @@ func TestReadUsesCanonicalUnicodeProfileAndIgnoresLegacyPath(t *testing.T) {
 	wantDir := filepath.Join(dataHome, "profiles", paths.ProfileSlug(profile), "domains", domain)
 	if got := paths.DomainDir(profile, domain); got != wantDir {
 		t.Fatalf("canonical domain path = %q, want %q", got, wantDir)
+	}
+}
+
+func TestCachedReaderBoundsEntriesAndSkipsOversizedNotes(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	reader := NewCachedReader()
+	for index := range 500 {
+		domain := fmt.Sprintf("bounded-domain-%d", index)
+		if _, err := reader.Read("bounded-profile", domain); err != nil {
+			t.Fatalf("read domain %d: %v", index, err)
+		}
+	}
+	if got := reader.cache.Len(); got > cache.ReaderCacheCapacity {
+		t.Fatalf("cache entries = %d, exceeds capacity %d", got, cache.ReaderCacheCapacity)
+	}
+
+	const profile = "oversized-profile"
+	const domain = "oversized-domain"
+	content := `[{"title":"large","sections":[{"content":"` + strings.Repeat("x", int(cache.MaxSourceMetadataBytes)+1) + `"}]}]`
+	writeNotesFixture(t, "", profile, domain, content)
+	if _, err := reader.Read(profile, domain); err != nil {
+		t.Fatalf("read oversized notes: %v", err)
+	}
+	path := filepath.Join(paths.DomainDir(profile, domain), "notes.json")
+	if _, cached := reader.cache.Get(path); cached {
+		t.Fatal("oversized notes source was cached")
 	}
 }
 

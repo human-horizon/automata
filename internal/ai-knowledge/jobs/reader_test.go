@@ -3,6 +3,7 @@ package jobs
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/cache"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -1309,6 +1311,63 @@ func TestCleanupStaleUsesExplicitProfileScope(t *testing.T) {
 	}
 	if _, err := os.Stat(jobB); !os.IsNotExist(err) {
 		t.Fatalf("all-profile cleanup left profile B job: %v", err)
+	}
+}
+
+func TestCachedReaderInvalidateRemovesOneSession(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	calls := 0
+	reader := newCachedReader(func(string) ([]Job, error) {
+		calls++
+		return []Job{{ID: "job"}}, nil
+	})
+	const profile = "invalidate-profile"
+	const sessionID = "invalidate-profile__chat"
+	for range 2 {
+		if _, err := reader.ListForProfile(profile, sessionID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("list calls before invalidation = %d, want 1", calls)
+	}
+	reader.Invalidate(profile, sessionID)
+	if _, err := reader.ListForProfile(profile, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("list calls after invalidation = %d, want 2", calls)
+	}
+}
+
+func TestCachedReaderBoundsEntriesAndSkipsOversizedMetadata(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	reader := NewCachedReader()
+	for index := range 500 {
+		sessionID := fmt.Sprintf("bounded-jobs__chat-%d", index)
+		if _, err := reader.ListForProfile("bounded-jobs", sessionID); err != nil {
+			t.Fatalf("list session %d: %v", index, err)
+		}
+	}
+	if got := reader.cache.Len(); got > cache.ReaderCacheCapacity {
+		t.Fatalf("cache entries = %d, exceeds capacity %d", got, cache.ReaderCacheCapacity)
+	}
+
+	const profile = "oversized-jobs"
+	const sessionID = "oversized-jobs__session"
+	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", "large-job")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"id":"large-job","status":"exited","payload":"` + strings.Repeat("x", int(cache.MaxSourceMetadataBytes)+1) + `"}`
+	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ListForProfile(profile, sessionID); err != nil {
+		t.Fatalf("list oversized source: %v", err)
+	}
+	if _, cached := reader.cache.Get(profile + "\x00" + sessionID); cached {
+		t.Fatal("oversized job metadata was cached")
 	}
 }
 

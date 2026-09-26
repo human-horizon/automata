@@ -45,12 +45,12 @@ type ContextPanel struct {
 	notesPasteModal           *warp.Modal
 	confirmedNotesPasteAction notesClipboardAction
 
-	// notesWatcher observes the active domain directory so changes to
-	// notes.json reach the panel without polling. Created in SetDomain,
-	// closed when the panel switches domain or shuts down. Re-armed
-	// through notesWatchPending like KnowledgePanel.jobsWatcher.
+	// notesWatcher is mounted only while Content is the active panel tab.
 	notesWatcher      *fsnotify.Watcher
+	notesWatcherPath  string
 	notesWatchPending bool
+	notesGeneration   uint64
+	active            bool
 }
 
 // NewContextPanel creates an empty context panel for the given profile.
@@ -73,7 +73,17 @@ func (c *ContextPanel) SetTheme(palette apptheme.Theme) {
 
 // SetProfile updates the profile used to resolve domain data paths.
 func (c *ContextPanel) SetProfile(profile string) {
+	if c.profile == profile {
+		return
+	}
+	c.closeNotesWatcher()
 	c.profile = profile
+	c.notesReader.Invalidate(c.profile, c.domain)
+	c.refresh()
+	c.kanbanPanel.SetProfile(profile)
+	if c.active && c.activeTab == 0 {
+		c.setupNotesWatcher()
+	}
 }
 
 // SetChats forwards the chat list to the kanban panel for the picker.
@@ -102,7 +112,9 @@ func (c *ContextPanel) SetDomain(domain string) {
 	c.noteHits = nil
 	c.notesStatus = ""
 	c.refresh()
-	c.setupNotesWatcher()
+	if c.active && c.activeTab == 0 {
+		c.setupNotesWatcher()
+	}
 	c.kanbanPanel.SetDomain(domain)
 }
 
@@ -133,10 +145,16 @@ func (c *ContextPanel) refresh() {
 // other error is logged and ignored — the panel just keeps its previous
 // data until the next manual refresh.
 func (c *ContextPanel) setupNotesWatcher() {
-	if c.domain == "" {
+	if !c.active || c.activeTab != 0 || c.domain == "" {
 		return
 	}
 	dir := c.domainDirForActive()
+	if c.notesWatcher != nil && c.notesWatcherPath == dir {
+		return
+	}
+	if c.notesWatcher != nil {
+		c.closeNotesWatcher()
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "context_panel: cannot create %s: %v\n", dir, err)
 		return
@@ -148,24 +166,46 @@ func (c *ContextPanel) setupNotesWatcher() {
 	}
 	if err := w.Add(dir); err != nil {
 		fmt.Fprintf(os.Stderr, "context_panel: cannot watch %s: %v\n", dir, err)
-		w.Close()
+		_ = w.Close()
 		return
 	}
 	c.notesWatcher = w
+	c.notesWatcherPath = dir
 }
 
 // closeNotesWatcher releases the domain notes watcher if one is attached.
 func (c *ContextPanel) closeNotesWatcher() {
+	c.notesGeneration++
+	c.notesWatchPending = false
 	if c.notesWatcher != nil {
 		_ = c.notesWatcher.Close()
 		c.notesWatcher = nil
 	}
-	c.notesWatchPending = false
+	c.notesWatcherPath = ""
 }
 
-// Close releases the notes and Kanban watchers owned by the panel.
-func (c *ContextPanel) Close() {
+// Activate refreshes the visible tab and starts only its filesystem watchers.
+func (c *ContextPanel) Activate() tea.Cmd {
+	if !c.active {
+		c.active = true
+		c.refresh()
+	}
+	return c.syncActiveWatchers()
+}
+
+// Deactivate releases watchers without clearing context or Kanban view state.
+func (c *ContextPanel) Deactivate() {
+	if !c.active && c.notesWatcher == nil && c.kanbanPanel.watcher == nil {
+		return
+	}
+	c.active = false
 	c.closeNotesWatcher()
+	c.kanbanPanel.Deactivate()
+}
+
+// Close releases all resources owned by the panel.
+func (c *ContextPanel) Close() {
+	c.Deactivate()
 	c.closeNotesPasteConfirmation()
 	if c.kanbanPanel != nil {
 		c.kanbanPanel.Close()
@@ -180,18 +220,19 @@ func (c *ContextPanel) watchNotesCmd() tea.Cmd {
 		return nil
 	}
 	w := c.notesWatcher
+	generation := c.notesGeneration
 	return func() tea.Msg {
 		select {
 		case _, ok := <-w.Events:
 			if !ok {
-				return notesWatcherErrorMsg{}
+				return notesWatcherErrorMsg{generation: generation, watcher: w}
 			}
-			return notesChangedMsg{}
+			return notesChangedMsg{generation: generation, watcher: w}
 		case err, ok := <-w.Errors:
 			if !ok {
-				return notesWatcherErrorMsg{}
+				return notesWatcherErrorMsg{generation: generation, watcher: w}
 			}
-			return notesWatcherErrorMsg{err: err}
+			return notesWatcherErrorMsg{generation: generation, watcher: w, err: err}
 		}
 	}
 }
@@ -205,10 +246,15 @@ func (c *ContextPanel) domainDirForActive() string {
 
 // notesChangedMsg is sent by watchNotesCmd when fsnotify reports a
 // change to the active domain directory (typically notes.json).
-type notesChangedMsg struct{}
+type notesChangedMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+}
 
 type notesWatcherErrorMsg struct {
-	err error
+	generation uint64
+	watcher    *fsnotify.Watcher
+	err        error
 }
 
 type notesClipboardAction string
@@ -289,15 +335,19 @@ func (c *ContextPanel) Update(msg tea.Msg) tea.Cmd {
 		case notesClipboardMsg:
 			c.handleNotesClipboard(msg)
 		case notesChangedMsg:
-			c.notesWatchPending = false
-			c.refresh()
-		case notesWatcherErrorMsg:
-			if msg.err != nil {
-				fmt.Fprintf(os.Stderr, "automata: notes watcher failed: %v\n", msg.err)
+			if c.isCurrentNotesWatcher(msg.generation, msg.watcher) {
+				c.notesWatchPending = false
+				c.refresh()
 			}
-			c.closeNotesWatcher()
-			c.setupNotesWatcher()
-			c.refresh()
+		case notesWatcherErrorMsg:
+			if c.isCurrentNotesWatcher(msg.generation, msg.watcher) {
+				if msg.err != nil {
+					fmt.Fprintf(os.Stderr, "automata: notes watcher failed: %v\n", msg.err)
+				}
+				c.closeNotesWatcher()
+				c.setupNotesWatcher()
+				c.refresh()
+			}
 		}
 	}
 
@@ -306,11 +356,28 @@ func (c *ContextPanel) Update(msg tea.Msg) tea.Cmd {
 		c.confirmedNotesPasteAction = ""
 		baseCmd = tea.Batch(baseCmd, c.readNotesClipboard(action))
 	}
-	if c.notesWatcher != nil && !c.notesWatchPending {
-		c.notesWatchPending = true
-		baseCmd = tea.Batch(baseCmd, c.watchNotesCmd())
+	return tea.Batch(baseCmd, c.syncActiveWatchers())
+}
+
+func (c *ContextPanel) syncActiveWatchers() tea.Cmd {
+	if !c.active {
+		return nil
 	}
-	return baseCmd
+	if c.activeTab == 0 {
+		c.kanbanPanel.Deactivate()
+		c.setupNotesWatcher()
+		if c.notesWatcher == nil || c.notesWatchPending {
+			return nil
+		}
+		c.notesWatchPending = true
+		return c.watchNotesCmd()
+	}
+	c.closeNotesWatcher()
+	return c.kanbanPanel.Activate()
+}
+
+func (c *ContextPanel) isCurrentNotesWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
+	return c.active && c.activeTab == 0 && watcher != nil && watcher == c.notesWatcher && generation == c.notesGeneration
 }
 
 func (c *ContextPanel) handleNotesPasteConfirmation(msg tea.Msg) tea.Cmd {

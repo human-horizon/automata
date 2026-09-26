@@ -2,8 +2,11 @@ package main
 
 import (
 	"errors"
+	"io"
 	"path/filepath"
 	"testing"
+
+	"github.com/HumanHorizon/automata/internal/scrollback"
 )
 
 func TestResolveStartupConfigRejectsInvalidValuesBeforeHomeResolution(t *testing.T) {
@@ -15,6 +18,9 @@ func TestResolveStartupConfigRejectsInvalidValuesBeforeHomeResolution(t *testing
 		piTag   string
 	}{
 		{name: "empty profile slug", profile: "!!!", piTag: "just"},
+		{name: "reserved default profile", profile: "default", piTag: "just"},
+		{name: "case-folded default profile", profile: "Default", piTag: "just"},
+		{name: "slug-normalized default profile", profile: "___ Default ___", piTag: "just"},
 		{name: "pi path traversal", profile: "valid", piTag: "../outside"},
 		{name: "pi separator", profile: "valid", piTag: "agent/name"},
 		{name: "pi whitespace", profile: "valid", piTag: "agent name"},
@@ -32,6 +38,30 @@ func TestResolveStartupConfigRejectsInvalidValuesBeforeHomeResolution(t *testing
 				t.Fatal("home resolution ran before input validation")
 			}
 		})
+	}
+}
+
+func TestParseCLIFlagsScrollbackDefaultsZeroAndNegative(t *testing.T) {
+	defaults, err := parseCLIFlags(nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.scrollbackLines != scrollback.DefaultLines {
+		t.Fatalf("default scrollback = %d, want %d", defaults.scrollbackLines, scrollback.DefaultLines)
+	}
+	if defaults.debugLog != "" {
+		t.Fatalf("default debug log path = %q, want disabled", defaults.debugLog)
+	}
+
+	unlimited, err := parseCLIFlags([]string{"--scrollback-lines=0"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parse unlimited scrollback: %v", err)
+	}
+	if unlimited.scrollbackLines != 0 {
+		t.Fatalf("zero scrollback = %d, want unlimited", unlimited.scrollbackLines)
+	}
+	if _, err := parseCLIFlags([]string{"--scrollback-lines=-1"}, io.Discard); err == nil {
+		t.Fatal("negative scrollback limit was accepted")
 	}
 }
 

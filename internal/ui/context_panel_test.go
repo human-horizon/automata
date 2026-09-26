@@ -411,16 +411,52 @@ func TestContextPanelRendersNotes(t *testing.T) {
 	}
 }
 
+func TestContextPanelDeactivateRejectsStaleEventsAndPreservesUIState(t *testing.T) {
+	profile := "context-lifecycle"
+	domain := "context-lifecycle__folder"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	panel := NewContextPanel(profile)
+	defer panel.Close()
+	panel.SetDomain(domain)
+	panel.expandedNotes["kept-note"] = true
+	panel.activeNoteKey = "kept-note"
+	panel.scrollOffset = 8
+	panel.Activate()
+	oldWatcher := panel.notesWatcher
+	oldGeneration := panel.notesGeneration
+	if oldWatcher == nil {
+		t.Fatal("Activate did not create the Content watcher")
+	}
+
+	panel.Deactivate()
+	if panel.active || panel.notesWatcher != nil || panel.kanbanPanel.watcher != nil {
+		t.Fatalf("Deactivate retained panel resources: active=%v notes=%v kanban=%v", panel.active, panel.notesWatcher, panel.kanbanPanel.watcher)
+	}
+	panel.Update(notesChangedMsg{generation: oldGeneration, watcher: oldWatcher})
+	if panel.scrollOffset != 8 || panel.activeNoteKey != "kept-note" || !panel.expandedNotes["kept-note"] {
+		t.Fatalf("deactivation or stale event discarded UI state: scroll=%d activeNote=%q expanded=%v", panel.scrollOffset, panel.activeNoteKey, panel.expandedNotes)
+	}
+
+	panel.Activate()
+	if !panel.active || panel.notesWatcher == nil || panel.notesWatcher == oldWatcher {
+		t.Fatal("reactivation did not create a fresh Content watcher")
+	}
+	if panel.scrollOffset != 8 || panel.activeNoteKey != "kept-note" || !panel.expandedNotes["kept-note"] {
+		t.Fatal("reactivation discarded Context view state")
+	}
+}
+
 func TestContextPanelRecoversClosedNotesWatcher(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	cp := NewContextPanel("watcher-profile")
 	cp.SetDomain("watcher-domain")
 	defer cp.Close()
+	cp.Activate()
 	oldWatcher := cp.notesWatcher
 	if oldWatcher == nil {
 		t.Fatal("test setup did not create notes watcher")
 	}
-	cp.Update(notesWatcherErrorMsg{err: errors.New("synthetic notes watcher error")})
+	cp.Update(notesWatcherErrorMsg{generation: cp.notesGeneration, watcher: oldWatcher, err: errors.New("synthetic notes watcher error")})
 	if cp.notesWatcher == nil || cp.notesWatcher == oldWatcher {
 		t.Fatal("notes watcher was not recreated")
 	}
@@ -515,8 +551,9 @@ func TestContextPanelCanonicalUnicodePath(t *testing.T) {
 	}
 
 	cp := NewContextPanel(profile)
-	t.Cleanup(func() { cp.closeNotesWatcher() })
+	t.Cleanup(func() { cp.Close() })
 	cp.SetDomain(domain)
+	cp.Activate()
 	if got := cp.domainDirForActive(); got != canonicalDir {
 		t.Fatalf("domain directory = %q, want %q", got, canonicalDir)
 	}
@@ -707,10 +744,11 @@ func TestContextPanelNotesWatcherReactive(t *testing.T) {
 
 	cp := NewContextPanel(profile)
 	cp.SetDomain(domain)
-	t.Cleanup(func() { cp.closeNotesWatcher() })
+	cp.Activate()
+	t.Cleanup(func() { cp.Close() })
 
 	notesPath := filepath.Join(tmpDir, "profiles", profile, "domains", domain, "notes.json")
-	// Sanity: the watcher was created in SetDomain and the domain dir exists.
+	// Sanity: the watcher was created on activation and the domain dir exists.
 	if cp.notesWatcher == nil {
 		t.Fatal("expected notesWatcher to be created in SetDomain")
 	}
@@ -729,7 +767,7 @@ func TestContextPanelNotesWatcherReactive(t *testing.T) {
 	// round-trip because fsnotify's Events channel is unbuffered and the
 	// test process can't both write to it and consume via Update in a
 	// race-free way without an extra goroutine.
-	cmd := cp.Update(notesChangedMsg{})
+	cmd := cp.Update(notesChangedMsg{generation: cp.notesGeneration, watcher: cp.notesWatcher})
 
 	if cp.data == nil || len(cp.data.Notes) != 1 || cp.data.Notes[0].Title != "From agent" {
 		t.Fatalf("expected notes to be re-read after notesChangedMsg, got %+v", cp.data)
@@ -752,6 +790,7 @@ func TestContextPanelNotesWatcherClosesOnDomainChange(t *testing.T) {
 
 	cp := NewContextPanel(profile)
 	cp.SetDomain("first")
+	cp.Activate()
 	first := cp.notesWatcher
 	if first == nil {
 		t.Fatal("expected first watcher")
@@ -798,6 +837,7 @@ watcherClosed:
 func TestContextPanelNotesWatcherNilWhenNoDomain(t *testing.T) {
 	cp := NewContextPanel("ctx-empty")
 	cp.SetDomain("anywhere")
+	cp.Activate()
 	if cp.notesWatcher == nil {
 		t.Fatal("setup: expected watcher")
 	}

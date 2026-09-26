@@ -507,7 +507,7 @@ func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot, persist bool)
 		}
 		a.runningSessions[id] = struct{}{}
 		if cmd := em.Update(portalis.PtyReadyMsg{SessionID: id}); cmd != nil {
-			a.pendingRuntimeCmds = append(a.pendingRuntimeCmds, cmd)
+			a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, cmd)
 		}
 	}
 	if snapshot.currentSessionCaptured {
@@ -520,7 +520,7 @@ func (a *App) restoreRenameRuntime(snapshot renameRuntimeSnapshot, persist bool)
 				return fmt.Errorf("persist restored active sessions: %w", err)
 			}
 		}
-		a.pendingRuntimeCmds = append(a.pendingRuntimeCmds, a.syncSessionWatchers()...)
+		a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.syncSessionWatchers()...)
 	}
 	return nil
 }

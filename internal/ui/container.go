@@ -15,6 +15,8 @@ import (
 // ContainerMode indicates what the right panel is currently displaying.
 type ContainerMode int
 
+const dragResizeInterval = 33 * time.Millisecond
+
 const (
 	// ChatMode shows a chat terminal on the left and the ai-knowledge panel
 	// (status/plans/jobs/notes) on the right.
@@ -26,6 +28,10 @@ const (
 // Container is the right-side panel that switches between chat + knowledge
 // and folder domain layouts. It uses warp primitives for layout and border
 // rendering.
+type chatResizeDueMsg struct {
+	generation uint64
+}
+
 type Container struct {
 	innerTab *warp.Tab
 	mode     ContainerMode
@@ -48,6 +54,11 @@ type Container struct {
 
 	// Callbacks.
 	onPlanWidthChange func(int) // called when user drags the knowledge border
+
+	planDragActive       bool
+	dragResizePending    bool
+	dragResizeGeneration uint64
+	lastDragResizeAt     time.Time
 }
 
 // NewContainer creates a new container with the given initial panel.
@@ -119,6 +130,8 @@ func (c *Container) planFraction(width int) float64 {
 
 // SetChat switches the container to chat mode with the knowledge side panel.
 func (c *Container) SetChat(terminal warp.Panel, sessionID string) {
+	c.cancelPlanDrag()
+	c.Deactivate()
 	c.mode = ChatMode
 	c.chatTerminal = terminal
 	if chat, ok := terminal.(*ChatPanel); ok {
@@ -181,6 +194,8 @@ func (c *Container) RenameSessionDomains(domains map[string]string) {
 
 // SetFolder switches the container to folder domain mode.
 func (c *Container) SetFolder(folder *tree.Item) {
+	c.cancelPlanDrag()
+	c.Deactivate()
 	c.mode = FolderMode
 	if c.contextPanel == nil {
 		c.contextPanel = NewContextPanel(c.profile)
@@ -228,8 +243,46 @@ func (c *Container) SetOnTaskAssigned(fn func(sessionID, taskTitle string) (tea.
 	}
 }
 
+// Activate refreshes and starts only the panel tree visible in the current mode.
+func (c *Container) Activate() tea.Cmd {
+	switch c.mode {
+	case ChatMode:
+		var cmds []tea.Cmd
+		if chat, ok := c.chatTerminal.(*ChatPanel); ok {
+			cmds = append(cmds, chat.Activate())
+		}
+		if c.knowledgePanel != nil {
+			cmds = append(cmds, c.knowledgePanel.Activate())
+		}
+		return tea.Batch(cmds...)
+	case FolderMode:
+		if c.contextPanel != nil {
+			return c.contextPanel.Activate()
+		}
+	}
+	return nil
+}
+
+// Deactivate releases hidden-panel watchers without clearing panel state.
+func (c *Container) Deactivate() {
+	c.cancelPlanDrag()
+	if chat, ok := c.chatTerminal.(*ChatPanel); ok {
+		chat.Deactivate()
+	}
+	if c.knowledgePanel != nil {
+		c.knowledgePanel.Deactivate()
+	}
+	if c.contextPanel != nil {
+		c.contextPanel.Deactivate()
+	}
+}
+
 // Close releases filesystem watchers owned by the container's panels.
 func (c *Container) Close() {
+	c.Deactivate()
+	if chat, ok := c.chatTerminal.(*ChatPanel); ok {
+		chat.Close()
+	}
 	if c.knowledgePanel != nil {
 		c.knowledgePanel.Close()
 	}
@@ -401,7 +454,16 @@ func (c *Container) View(width, height int) string {
 // Update forwards messages to the innerTab and handles mode-specific logic.
 func (c *Container) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
+	case chatResizeDueMsg:
+		if !c.planDragActive || !c.dragResizePending || msg.generation != c.dragResizeGeneration {
+			return nil
+		}
+		c.dragResizePending = false
+		c.lastDragResizeAt = time.Now()
+		return c.applyChatResize()
+
 	case tea.WindowSizeMsg:
+		c.cancelPlanDrag()
 		c.width = msg.Width
 		c.height = msg.Height
 		// Update split fraction to match current planWidth.
@@ -409,6 +471,7 @@ func (c *Container) Update(msg tea.Msg) tea.Cmd {
 		return c.innerTab.Update(msg)
 
 	case warp.ResizeMsg:
+		c.cancelPlanDrag()
 		c.width = msg.Width
 		c.height = msg.Height
 		// Update split fraction to match current planWidth.
@@ -436,17 +499,34 @@ func (c *Container) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		return c.innerTab.HandleMouse(msg)
 	}
 
-	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
-		borderX := c.findBorderX()
-		if borderX >= 0 && int(msg.X) == borderX && msg.Y == 0 {
+	if c.planDragActive {
+		switch msg.Action {
+		case tea.MouseActionMotion:
+			c.updatePlanDrag(msg.X)
+			return c.queueDragResize()
+		case tea.MouseActionRelease:
+			c.updatePlanDrag(msg.X)
+			c.planDragActive = false
+			c.cancelDragResizeTimer()
+			c.lastDragResizeAt = time.Now()
+			return c.applyChatResize()
+		default:
 			return nil
 		}
 	}
 
-	// Forward to innerTab's HandleMouse for border dragging.
-	cmd := c.innerTab.HandleMouse(msg)
-	c.syncPlanWidth()
-	return cmd
+	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+		borderX := c.findBorderX()
+		if borderX >= 0 && int(msg.X) == borderX {
+			if msg.Y == 0 {
+				return nil
+			}
+			c.planDragActive = true
+			return nil
+		}
+	}
+
+	return c.innerTab.HandleMouse(msg)
 }
 
 // findBorderX returns the X position of the vertical split border, or -1.
@@ -454,11 +534,7 @@ func (c *Container) findBorderX() int {
 	if c.innerTab == nil || c.chatTerminal == nil || c.width <= 0 {
 		return -1
 	}
-	frac, ok := c.innerTab.GetSplitFraction(c.chatTerminal)
-	if !ok {
-		return -1
-	}
-	return int(float64(c.width) * frac)
+	return c.terminalPanelWidth()
 }
 
 // syncPlanWidth reads the current split fraction and updates planWidth.
@@ -481,6 +557,79 @@ func (c *Container) syncPlanWidth() {
 			c.onPlanWidthChange(newPlanW)
 		}
 	}
+}
+
+func (c *Container) updatePlanDrag(x int) {
+	if c.innerTab == nil || c.chatTerminal == nil || c.width <= 0 {
+		return
+	}
+	c.innerTab.SetSplitFraction(c.chatTerminal, float64(x)/float64(c.width))
+	c.syncPlanWidth()
+}
+
+func (c *Container) queueDragResize() tea.Cmd {
+	if c.dragResizePending {
+		return nil
+	}
+	now := time.Now()
+	delay := time.Duration(0)
+	if !c.lastDragResizeAt.IsZero() {
+		delay = time.Until(c.lastDragResizeAt.Add(dragResizeInterval))
+	}
+	if delay <= 0 {
+		c.lastDragResizeAt = now
+		return c.applyChatResize()
+	}
+
+	c.dragResizePending = true
+	c.dragResizeGeneration++
+	generation := c.dragResizeGeneration
+	return tea.Tick(delay, func(time.Time) tea.Msg {
+		return chatResizeDueMsg{generation: generation}
+	})
+}
+
+func (c *Container) cancelDragResizeTimer() {
+	c.dragResizeGeneration++
+	c.dragResizePending = false
+}
+
+func (c *Container) cancelPlanDrag() {
+	c.planDragActive = false
+	c.cancelDragResizeTimer()
+}
+
+func (c *Container) applyChatResize() tea.Cmd {
+	if c.mode != ChatMode || c.height <= 0 {
+		return nil
+	}
+	chat, ok := c.chatTerminal.(*ChatPanel)
+	if !ok || chat == nil {
+		return nil
+	}
+	return chat.Update(warp.ResizeMsg{Width: c.terminalPanelWidth(), Height: c.height})
+}
+
+func (c *Container) terminalPanelWidth() int {
+	if c.innerTab == nil || c.chatTerminal == nil || c.width <= 0 {
+		return 0
+	}
+	fraction, ok := c.innerTab.GetSplitFraction(c.chatTerminal)
+	if !ok {
+		return 0
+	}
+	available := c.width - 1
+	first := int(float64(available) * fraction)
+	if first < warp.MinPanelSize {
+		first = warp.MinPanelSize
+	}
+	if available-first < warp.MinPanelSize {
+		first = available - warp.MinPanelSize
+	}
+	if first < 0 {
+		return 0
+	}
+	return first
 }
 
 // SetOnPlanWidthChange sets a callback invoked when the user drags the knowledge border.

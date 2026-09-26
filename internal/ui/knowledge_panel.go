@@ -25,22 +25,28 @@ import (
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 )
 
-// knowledgeChangedMsg is sent by watchKnowledgeCmd when fsnotify reports a
-// change to status.json, plans.json, settings.json or notes.json in the
-// current session directory. The Cmd re-arms itself after every event so
-// the UI is event-driven and consumes 0 CPU while idle.
-type knowledgeChangedMsg struct{}
-
-type knowledgeWatcherErrorMsg struct {
-	err error
+// knowledgeChangedMsg is sent by the active session watcher after a file change.
+type knowledgeChangedMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
 }
 
-// jobsChangedMsg is the analogous event for any change inside the session's
-// jobs/ directory (new job, completed job, status flip in job.json).
-type jobsChangedMsg struct{}
+type knowledgeWatcherErrorMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+	err        error
+}
+
+// jobsChangedMsg reports a change inside the session's jobs/ directory.
+type jobsChangedMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+}
 
 type jobsWatcherErrorMsg struct {
-	err error
+	generation uint64
+	watcher    *fsnotify.Watcher
+	err        error
 }
 
 // sessionDataPath returns the per-session directory that owns status.json,
@@ -100,8 +106,14 @@ type KnowledgePanel struct {
 	jobsWatcher     *fsnotify.Watcher
 	jobsWatcherPath string
 
-	// knowledgeWatchPending and jobsWatchPending guard against stacking
-	// multiple blocking watchJobsCmd/watchKnowledgeCmd Cmds.
+	// active gates filesystem resources while the panel is hidden.
+	active bool
+
+	// Independent generations bind each blocking reader to its watcher.
+	knowledgeGeneration uint64
+	jobsGeneration      uint64
+
+	// Pending flags guarantee at most one blocking reader per watcher.
 	knowledgeWatchPending bool
 	jobsWatchPending      bool
 }
@@ -131,8 +143,9 @@ func (k *KnowledgePanel) SetProfile(profile string) {
 	k.jobsError = ""
 	k.contextReader.Invalidate(k.profile, k.sessionID)
 	k.readSettings()
-	if k.sessionID != "" {
+	if k.active {
 		k.setupWatchers()
+		k.refreshKnowledgeData()
 	}
 }
 
@@ -167,8 +180,9 @@ func (k *KnowledgePanel) SetSession(sessionID string) {
 	k.contextReader.Invalidate(k.profile, sessionID)
 	k.readSettings()
 	k.closeWatchers()
-	if sessionID != "" {
+	if k.active {
 		k.setupWatchers()
+		k.refreshKnowledgeData()
 	}
 }
 
@@ -176,6 +190,8 @@ func (k *KnowledgePanel) SetSession(sessionID string) {
 // jobs/ directory watcher. Called from SetSession and on shutdown so we
 // never leak fsnotify descriptors.
 func (k *KnowledgePanel) closeWatchers() {
+	k.knowledgeGeneration++
+	k.jobsGeneration++
 	if k.knowledgeWatcher != nil {
 		_ = k.knowledgeWatcher.Close()
 		k.knowledgeWatcher = nil
@@ -190,9 +206,30 @@ func (k *KnowledgePanel) closeWatchers() {
 	k.jobsWatchPending = false
 }
 
+// Activate refreshes the panel and starts its filesystem watchers.
+func (k *KnowledgePanel) Activate() tea.Cmd {
+	if !k.active {
+		k.active = true
+		k.knowledgeGeneration++
+		k.jobsGeneration++
+		k.setupWatchers()
+		k.refreshKnowledgeData()
+	}
+	return k.armWatchers()
+}
+
+// Deactivate releases watchers without clearing the panel's UI state.
+func (k *KnowledgePanel) Deactivate() {
+	if !k.active && k.knowledgeWatcher == nil && k.jobsWatcher == nil {
+		return
+	}
+	k.active = false
+	k.closeWatchers()
+}
+
 // Close releases all filesystem watchers owned by the panel.
 func (k *KnowledgePanel) Close() {
-	k.closeWatchers()
+	k.Deactivate()
 }
 
 // setupWatchers attaches fsnotify watchers to the session directory (for
@@ -200,7 +237,7 @@ func (k *KnowledgePanel) Close() {
 // are watched through their nearest existing parent, so creation is handled
 // by an event instead of a polling tick.
 func (k *KnowledgePanel) setupWatchers() {
-	if k.sessionID == "" {
+	if !k.active || k.sessionID == "" {
 		return
 	}
 	k.attachKnowledgeWatcherIfMissing()
@@ -210,7 +247,7 @@ func (k *KnowledgePanel) setupWatchers() {
 // attachKnowledgeWatcherIfMissing watches the session directory directly, or
 // the profile sessions directory until a new session directory appears.
 func (k *KnowledgePanel) attachKnowledgeWatcherIfMissing() {
-	if k.sessionID == "" {
+	if !k.active || k.sessionID == "" {
 		return
 	}
 	sessionDir := sessionDataPath(k.profile, k.sessionID)
@@ -233,7 +270,7 @@ func (k *KnowledgePanel) attachKnowledgeWatcherIfMissing() {
 		return
 	}
 	if err := w.Add(watchPath); err != nil {
-		w.Close()
+		_ = w.Close()
 		return
 	}
 	k.knowledgeWatcher = w
@@ -415,6 +452,7 @@ func (k *KnowledgePanel) Refresh() {
 		k.data = data
 	}
 	k.contextError = knowledgeReadError(contextErr)
+	k.jobsReader.Invalidate(k.profile, k.sessionID)
 	jobs, jobsErr := k.jobsReader.ListForProfile(k.profile, k.sessionID)
 	k.jobs = jobs
 	k.jobsError = knowledgeReadError(jobsErr)
@@ -444,44 +482,74 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 	case tea.KeyMsg:
 		k.handleKey(msg)
 	case knowledgeChangedMsg:
-		k.knowledgeWatchPending = false
-		k.refreshKnowledgeData()
+		if k.isCurrentKnowledgeWatcher(msg.generation, msg.watcher) {
+			k.knowledgeWatchPending = false
+			k.refreshKnowledgeData()
+		}
 	case knowledgeWatcherErrorMsg:
-		k.knowledgeWatchPending = false
-		if msg.err != nil {
-			log.Printf("automata: knowledge watcher failed: %v", msg.err)
+		if k.isCurrentKnowledgeWatcher(msg.generation, msg.watcher) {
+			k.knowledgeWatchPending = false
+			if msg.err != nil {
+				log.Printf("automata: knowledge watcher failed: %v", msg.err)
+			}
+			k.resetKnowledgeWatcher()
+			k.attachKnowledgeWatcherIfMissing()
+			k.refreshKnowledgeData()
 		}
-		k.resetKnowledgeWatcher()
-		k.attachKnowledgeWatcherIfMissing()
-		k.refreshKnowledgeData()
 	case jobsChangedMsg:
-		k.jobsWatchPending = false
-		k.refreshJobsData()
-	case jobsWatcherErrorMsg:
-		k.jobsWatchPending = false
-		if msg.err != nil {
-			log.Printf("automata: jobs watcher failed: %v", msg.err)
+		if k.isCurrentJobsWatcher(msg.generation, msg.watcher) {
+			k.jobsWatchPending = false
+			k.refreshJobsData()
 		}
-		k.resetJobsWatcher()
-		k.attachJobsWatcherIfMissing()
-		k.refreshJobsData()
+	case jobsWatcherErrorMsg:
+		if k.isCurrentJobsWatcher(msg.generation, msg.watcher) {
+			k.jobsWatchPending = false
+			if msg.err != nil {
+				log.Printf("automata: jobs watcher failed: %v", msg.err)
+			}
+			k.resetJobsWatcher()
+			k.attachJobsWatcherIfMissing()
+			k.refreshJobsData()
+		}
 	}
 
+	return tea.Batch(baseCmd, k.armWatchers())
+}
+
+func (k *KnowledgePanel) armWatchers() tea.Cmd {
+	if !k.active {
+		return nil
+	}
+	var cmds []tea.Cmd
 	if k.knowledgeWatcher != nil && !k.knowledgeWatchPending {
 		k.knowledgeWatchPending = true
-		baseCmd = tea.Batch(baseCmd, k.watchKnowledgeCmd())
+		if cmd := k.watchKnowledgeCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 	if k.jobsWatcher != nil && !k.jobsWatchPending {
 		k.jobsWatchPending = true
-		baseCmd = tea.Batch(baseCmd, k.watchJobsCmd())
+		if cmd := k.watchJobsCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
-	return baseCmd
+	return tea.Batch(cmds...)
+}
+
+func (k *KnowledgePanel) isCurrentKnowledgeWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
+	return k.active && watcher != nil && watcher == k.knowledgeWatcher && generation == k.knowledgeGeneration
+}
+
+func (k *KnowledgePanel) isCurrentJobsWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
+	return k.active && watcher != nil && watcher == k.jobsWatcher && generation == k.jobsGeneration
 }
 
 // attachJobsWatcherIfMissing ensures the per-session jobs/ subdirectory has
 // an active fsnotify watcher. Until jobs/ exists, the session directory is
 // watched so its creation is handled by the next event.
 func (k *KnowledgePanel) resetKnowledgeWatcher() {
+	k.knowledgeGeneration++
+	k.knowledgeWatchPending = false
 	if k.knowledgeWatcher != nil {
 		_ = k.knowledgeWatcher.Close()
 		k.knowledgeWatcher = nil
@@ -490,6 +558,8 @@ func (k *KnowledgePanel) resetKnowledgeWatcher() {
 }
 
 func (k *KnowledgePanel) resetJobsWatcher() {
+	k.jobsGeneration++
+	k.jobsWatchPending = false
 	if k.jobsWatcher != nil {
 		_ = k.jobsWatcher.Close()
 		k.jobsWatcher = nil
@@ -509,6 +579,7 @@ func (k *KnowledgePanel) refreshKnowledgeData() {
 		k.data = data
 	}
 	k.contextError = knowledgeReadError(contextErr)
+	k.jobsReader.Invalidate(k.profile, k.sessionID)
 	jobs, jobsErr := k.jobsReader.ListForProfile(k.profile, k.sessionID)
 	k.jobs = jobs
 	k.jobsError = knowledgeReadError(jobsErr)
@@ -524,6 +595,7 @@ func (k *KnowledgePanel) refreshJobsData() {
 	// job.json. We deliberately do it before re-reading the list so the
 	// updated metadata is what the user sees.
 	pruneErr := akjobs.PruneStaleSessionForProfile(k.profile, k.sessionID)
+	k.jobsReader.Invalidate(k.profile, k.sessionID)
 	jobs, readErr := k.jobsReader.ListForProfile(k.profile, k.sessionID)
 	k.jobs = jobs
 	var diagnostics []error
@@ -538,7 +610,7 @@ func (k *KnowledgePanel) refreshJobsData() {
 }
 
 func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
-	if k.sessionID == "" {
+	if !k.active || k.sessionID == "" {
 		return
 	}
 	jobsDir := filepath.Join(sessionDataPath(k.profile, k.sessionID), "jobs")
@@ -561,7 +633,7 @@ func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
 		return
 	}
 	if err := w.Add(watchPath); err != nil {
-		w.Close()
+		_ = w.Close()
 		return
 	}
 	k.jobsWatcher = w
@@ -575,21 +647,19 @@ func (k *KnowledgePanel) watchKnowledgeCmd() tea.Cmd {
 		return nil
 	}
 	w := k.knowledgeWatcher
+	generation := k.knowledgeGeneration
 	return func() tea.Msg {
 		select {
-		case ev, ok := <-w.Events:
+		case _, ok := <-w.Events:
 			if !ok {
-				return knowledgeWatcherErrorMsg{}
+				return knowledgeWatcherErrorMsg{generation: generation, watcher: w}
 			}
-			if strings.HasSuffix(ev.Name, ".swp") {
-				return knowledgeChangedMsg{}
-			}
-			return knowledgeChangedMsg{}
+			return knowledgeChangedMsg{generation: generation, watcher: w}
 		case err, ok := <-w.Errors:
 			if !ok {
-				return knowledgeWatcherErrorMsg{}
+				return knowledgeWatcherErrorMsg{generation: generation, watcher: w}
 			}
-			return knowledgeWatcherErrorMsg{err: err}
+			return knowledgeWatcherErrorMsg{generation: generation, watcher: w, err: err}
 		}
 	}
 }
@@ -601,18 +671,19 @@ func (k *KnowledgePanel) watchJobsCmd() tea.Cmd {
 		return nil
 	}
 	w := k.jobsWatcher
+	generation := k.jobsGeneration
 	return func() tea.Msg {
 		select {
 		case _, ok := <-w.Events:
 			if !ok {
-				return jobsWatcherErrorMsg{}
+				return jobsWatcherErrorMsg{generation: generation, watcher: w}
 			}
-			return jobsChangedMsg{}
+			return jobsChangedMsg{generation: generation, watcher: w}
 		case err, ok := <-w.Errors:
 			if !ok {
-				return jobsWatcherErrorMsg{}
+				return jobsWatcherErrorMsg{generation: generation, watcher: w}
 			}
-			return jobsWatcherErrorMsg{err: err}
+			return jobsWatcherErrorMsg{generation: generation, watcher: w, err: err}
 		}
 	}
 }

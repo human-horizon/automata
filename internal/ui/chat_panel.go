@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/fsnotify/fsnotify"
 	warp "github.com/starframe-dev/warp"
 )
 
@@ -88,14 +89,19 @@ type ChatPanel struct {
 	palette   apptheme.Theme
 	profile   string
 
-	// Polling state.
+	// Familiar registry watcher state. Generation-bound messages from closed
+	// watchers are ignored after deactivation or session identity changes.
 	known                map[string]bool // familiar IDs we already have tabs for
 	familiarSessions     map[string]string
 	removalPending       map[string]bool
 	familiarError        string
 	familiarCleanupError string
 	actionWarning        string
-	started              bool
+	active               bool
+	familiarWatcher      *fsnotify.Watcher
+	familiarWatcherPath  string
+	familiarGeneration   uint64
+	familiarWatchPending bool
 
 	// Cached dimensions for tab bar rendering.
 	width  int
@@ -284,38 +290,140 @@ func (cp *ChatPanel) FamiliarSessionIDs() []string {
 	return ids
 }
 
-// startPolling begins polling for familiars. Called on first Update.
-func (cp *ChatPanel) startPolling() tea.Cmd {
-	cp.started = true
-	return cp.pollTick()
-}
-
-// pollTick checks for new/removed familiars and schedules the next poll.
-func (cp *ChatPanel) pollTick() tea.Cmd {
-	cmds := cp.checkFamiliars()
-	// Schedule next poll in 3 seconds.
-	tickCmd := tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
-		return pollFamiliarsMsg(t)
-	})
-	if len(cmds) == 0 {
-		return tickCmd
+// Activate starts familiar detection without discarding tab or selection state.
+func (cp *ChatPanel) Activate() tea.Cmd {
+	if cp.active {
+		return cp.armFamiliarWatcher()
 	}
-	return tea.Batch(append(cmds, tickCmd)...)
+	cp.active = true
+	cp.familiarGeneration++
+	cp.reconcilePendingFamiliarMessages()
+	cp.setupFamiliarWatcher()
+	cmds := cp.checkFamiliars()
+	if watchCmd := cp.armFamiliarWatcher(); watchCmd != nil {
+		cmds = append(cmds, watchCmd)
+	}
+	return tea.Batch(cmds...)
 }
 
-// pollFamiliarsMsg is sent by the ticker to trigger a familiar check.
-type pollFamiliarsMsg time.Time
+// reconcilePendingFamiliarMessages retries registry actions whose messages were
+// invalidated while the panel was hidden.
+func (cp *ChatPanel) reconcilePendingFamiliarMessages() {
+	liveNames := make(map[string]struct{}, len(cp.sessions))
+	for _, session := range cp.sessions {
+		if session != nil && session.familiarID != "" {
+			liveNames[session.name] = struct{}{}
+		}
+	}
+	for id := range cp.known {
+		if _, exists := liveNames[id]; !exists {
+			delete(cp.known, id)
+		}
+	}
+	clear(cp.removalPending)
+}
+
+// Deactivate closes filesystem resources while preserving visible and runtime state.
+func (cp *ChatPanel) Deactivate() {
+	if !cp.active && cp.familiarWatcher == nil {
+		return
+	}
+	cp.active = false
+	cp.closeFamiliarWatcher()
+}
+
+// Close releases the familiar watcher owned by the panel.
+func (cp *ChatPanel) Close() {
+	cp.Deactivate()
+}
+
+func (cp *ChatPanel) setupFamiliarWatcher() {
+	if !cp.active || cp.sessionID == "" {
+		return
+	}
+	watchPath := filepath.Dir(cp.familiarStatePath())
+	if info, err := os.Stat(watchPath); err != nil || !info.IsDir() {
+		watchPath = paths.SessionsDir(cp.profile)
+		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+			log.Printf("automata: cannot create familiar watcher parent %s: %v", watchPath, err)
+			return
+		}
+	}
+	if cp.familiarWatcher != nil && cp.familiarWatcherPath == watchPath {
+		return
+	}
+	cp.closeFamiliarWatcher()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("automata: cannot create familiar watcher: %v", err)
+		return
+	}
+	if err := watcher.Add(watchPath); err != nil {
+		_ = watcher.Close()
+		log.Printf("automata: cannot watch familiar registry parent %s: %v", watchPath, err)
+		return
+	}
+	cp.familiarWatcher = watcher
+	cp.familiarWatcherPath = watchPath
+}
+
+func (cp *ChatPanel) closeFamiliarWatcher() {
+	cp.familiarGeneration++
+	cp.familiarWatchPending = false
+	if cp.familiarWatcher != nil {
+		_ = cp.familiarWatcher.Close()
+		cp.familiarWatcher = nil
+	}
+	cp.familiarWatcherPath = ""
+}
+
+func (cp *ChatPanel) armFamiliarWatcher() tea.Cmd {
+	if !cp.active || cp.familiarWatcher == nil || cp.familiarWatchPending {
+		return nil
+	}
+	watcher := cp.familiarWatcher
+	generation := cp.familiarGeneration
+	cp.familiarWatchPending = true
+	return func() tea.Msg {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return familiarWatcherErrorMsg{generation: generation, watcher: watcher}
+			}
+			return familiarRegistryChangedMsg{generation: generation, watcher: watcher, path: event.Name}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return familiarWatcherErrorMsg{generation: generation, watcher: watcher}
+			}
+			return familiarWatcherErrorMsg{generation: generation, watcher: watcher, err: err}
+		}
+	}
+}
+
+type familiarRegistryChangedMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+	path       string
+}
+
+type familiarWatcherErrorMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+	err        error
+}
 
 // familiarDetectedMsg is sent when a new familiar is found.
 type familiarDetectedMsg struct {
 	id         string
 	familiarID string
+	generation uint64
 }
 
 // familiarRemovedMsg is sent when a familiar is removed.
 type familiarRemovedMsg struct {
 	id         string
 	familiarID string
+	generation uint64
 }
 
 // familiarStatePath returns the path to the familiars.json file for a session.
@@ -411,16 +519,18 @@ func (cp *ChatPanel) checkFamiliars() []tea.Cmd {
 			continue
 		}
 		cp.known[f.ID] = true
+		generation := cp.familiarGeneration
 		cmds = append(cmds, func() tea.Msg {
-			return familiarDetectedMsg{id: f.ID, familiarID: f.SessionID}
+			return familiarDetectedMsg{id: f.ID, familiarID: f.SessionID, generation: generation}
 		})
 	}
 	for id := range cp.known {
 		if !seen[id] && !cp.removalPending[id] {
 			cp.removalPending[id] = true
 			familiarID := cp.familiarSessions[id]
+			generation := cp.familiarGeneration
 			cmds = append(cmds, func() tea.Msg {
-				return familiarRemovedMsg{id: id, familiarID: familiarID}
+				return familiarRemovedMsg{id: id, familiarID: familiarID, generation: generation}
 			})
 		}
 	}
@@ -824,12 +934,6 @@ func (cp *ChatPanel) renderTabBar(width int) string {
 
 // Update handles messages for the ChatPanel.
 func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
-	// Start polling on first Update, but still handle the message.
-	var pollCmd tea.Cmd
-	if !cp.started {
-		pollCmd = cp.startPolling()
-	}
-
 	// Familiar-close confirmation modal swallows keys. While pending,
 	// Y/N/Esc close/cancel the prompt and nothing else is forwarded to the
 	// underlying session. Mouse events are routed to the modal so its
@@ -843,16 +947,16 @@ func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
 				cp.pendingCloseFamiliar = ""
 				cp.closeFamiliarModal = nil
 				cp.closeFamiliarByID(id) // synchronous cleanup
-				return pollCmd
+				return cp.armFamiliarWatcher()
 			case "n", "N", "esc":
 				cp.pendingCloseFamiliar = ""
 				cp.closeFamiliarModal = nil
-				return pollCmd
+				return cp.armFamiliarWatcher()
 			}
-			return pollCmd // swallow other keys while modal is up
+			return cp.armFamiliarWatcher() // swallow other keys while modal is up
 		case tea.MouseMsg:
 			if cp.closeFamiliarModal != nil && cp.closeFamiliarModal.HandleMouse(msg) {
-				return pollCmd
+				return cp.armFamiliarWatcher()
 			}
 			// An unconsumed click is outside the modal. Dismiss the
 			// confirmation without forwarding the event to the tab bar or
@@ -861,20 +965,45 @@ func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
 				cp.pendingCloseFamiliar = ""
 				cp.closeFamiliarModal = nil
 			}
-			return pollCmd
+			return cp.armFamiliarWatcher()
 		}
 	}
 
 	var forwardCmd tea.Cmd
 	switch msg := msg.(type) {
-	case pollFamiliarsMsg:
-		forwardCmd = cp.pollTick()
+	case familiarRegistryChangedMsg:
+		if cp.isCurrentFamiliarWatcher(msg.generation, msg.watcher) {
+			cp.familiarWatchPending = false
+			ownerDir := filepath.Dir(cp.familiarStatePath())
+			registryChanged := filepath.Clean(msg.path) == filepath.Clean(cp.familiarStatePath())
+			ownerCreated := filepath.Clean(cp.familiarWatcherPath) == filepath.Clean(paths.SessionsDir(cp.profile)) &&
+				filepath.Clean(msg.path) == filepath.Clean(ownerDir)
+			if registryChanged || ownerCreated {
+				cp.setupFamiliarWatcher()
+				forwardCmd = tea.Batch(cp.checkFamiliars()...)
+			}
+		}
+
+	case familiarWatcherErrorMsg:
+		if cp.isCurrentFamiliarWatcher(msg.generation, msg.watcher) {
+			cp.familiarWatchPending = false
+			if msg.err != nil {
+				log.Printf("automata: familiar watcher for %q failed: %v", cp.sessionID, msg.err)
+			}
+			cp.closeFamiliarWatcher()
+			cp.setupFamiliarWatcher()
+			forwardCmd = tea.Batch(cp.checkFamiliars()...)
+		}
 
 	case familiarDetectedMsg:
-		forwardCmd = cp.addFamiliar(msg.id, msg.familiarID)
+		if cp.active && msg.generation == cp.familiarGeneration {
+			forwardCmd = cp.addFamiliar(msg.id, msg.familiarID)
+		}
 
 	case familiarRemovedMsg:
-		cp.handleExternalFamiliarRemoval(msg)
+		if cp.active && msg.generation == cp.familiarGeneration {
+			cp.handleExternalFamiliarRemoval(msg)
+		}
 
 	case tea.MouseMsg:
 		forwardCmd = cp.handleMouse(msg)
@@ -896,16 +1025,18 @@ func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
 		forwardCmd = cp.resizeActivePanel()
 
 	case portalis.PtyExitMsg:
-		// When a familiar PTY exits, remove it from sessions and clear
-		// cp.known so the next checkFamiliars poll can re-spawn it from
-		// familiars.json. Main PTY exits stay in Main and are routed to
-		// that panel so its emulator can process the lifecycle event.
-		if !cp.removeDeadFamiliar(msg.SessionID) {
+		// A failed familiar process is retried immediately from its registry
+		// entry; no timer is needed to resurrect the tab.
+		if cp.removeDeadFamiliar(msg.SessionID) {
+			if cp.active {
+				forwardCmd = tea.Batch(cp.checkFamiliars()...)
+			}
+		} else {
 			forwardCmd = cp.routeBySessionID(msg)
 		}
 
 	default:
-		// Route messages with SessionID to the correct session.
+		// Route messages with a SessionID to the correct session.
 		forwardCmd = cp.routeBySessionID(msg)
 		if forwardCmd == nil {
 			// Fallback: forward to active session only.
@@ -915,7 +1046,11 @@ func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
 		}
 	}
 
-	return tea.Batch(pollCmd, forwardCmd)
+	return tea.Batch(forwardCmd, cp.armFamiliarWatcher())
+}
+
+func (cp *ChatPanel) isCurrentFamiliarWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
+	return cp.active && generation == cp.familiarGeneration && watcher != nil && watcher == cp.familiarWatcher
 }
 
 // routeBySessionID routes messages with a SessionID field to the correct session.

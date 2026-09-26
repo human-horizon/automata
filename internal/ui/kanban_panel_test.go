@@ -727,6 +727,7 @@ func TestKanbanPanelLateAttachesWatcherWhenDirectoryAppears(t *testing.T) {
 	k := NewKanbanPanel(profile)
 	defer k.Close()
 	k.SetDomain(domain)
+	k.Activate()
 
 	kanbanDir := kanban.KanbanDir(domain, profile)
 	if k.watcher == nil || k.watcherPath != filepath.Dir(kanbanDir) {
@@ -758,7 +759,7 @@ func TestKanbanPanelLateAttachesWatcherWhenDirectoryAppears(t *testing.T) {
 	if err := os.WriteFile(taskPath, []byte("---\ntitle: Late\nstatus: todo\n---\nbody\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	k.Update(kanbanChangedMsg{})
+	k.Update(kanbanChangedMsg{generation: k.generation, watcher: k.watcher})
 	if len(k.tasks) != 1 || k.tasks[0].Title != "Late" {
 		t.Fatalf("tasks after late watcher attach = %+v", k.tasks)
 	}
@@ -780,11 +781,12 @@ func TestKanbanPanelSetupWatcherAttaches(t *testing.T) {
 	}
 
 	k := NewKanbanPanel(profile)
-	defer k.closeWatcher()
+	defer k.Close()
 	k.SetDomain(domain)
+	k.Activate()
 
 	if k.watcher == nil {
-		t.Fatalf("expected watcher to be attached after SetDomain")
+		t.Fatalf("expected watcher to be attached after Activate")
 	}
 	if k.domain != domain {
 		t.Fatalf("domain not stored: got %q", k.domain)
@@ -807,8 +809,9 @@ func TestKanbanPanelDrainReloadsOnFileChange(t *testing.T) {
 	}
 
 	k := NewKanbanPanel(profile)
-	defer k.closeWatcher()
+	defer k.Close()
 	k.SetDomain(domain)
+	k.Activate()
 
 	if k.watcher == nil {
 		t.Fatalf("watcher not attached")
@@ -824,9 +827,8 @@ func TestKanbanPanelDrainReloadsOnFileChange(t *testing.T) {
 		t.Fatalf("write task: %v", err)
 	}
 
-	// Simulate the fsnotify event by sending kanbanChangedMsg through Update.
-	// This is what the real watchKanbanCmd does.
-	k.Update(kanbanChangedMsg{})
+	// Simulate the fsnotify event by sending a generation-bound message.
+	k.Update(kanbanChangedMsg{generation: k.generation, watcher: k.watcher})
 
 	if len(k.tasks) != 1 {
 		t.Fatalf("expected 1 task after kanbanChangedMsg, got %d", len(k.tasks))
@@ -858,8 +860,9 @@ func TestKanbanPanelCloseWatcherReleases(t *testing.T) {
 	}
 
 	k := NewKanbanPanel(profile)
-	defer k.closeWatcher()
+	defer k.Close()
 	k.SetDomain("domain-a")
+	k.Activate()
 	first := k.watcher
 	if first == nil {
 		t.Fatalf("watcher not attached for domain-a")
@@ -893,8 +896,9 @@ func TestKanbanWatchCmdReactsToFsnotifyEvent(t *testing.T) {
 	}
 
 	k := NewKanbanPanel(profile)
-	defer k.closeWatcher()
+	defer k.Close()
 	k.SetDomain(domain)
+	k.Activate()
 	if k.watcher == nil {
 		t.Fatalf("watcher not attached")
 	}
@@ -958,6 +962,7 @@ func TestKanbanWatcherErrorRecreatesWatcherAndReloads(t *testing.T) {
 			k := NewKanbanPanel(profile)
 			defer k.Close()
 			k.SetDomain(domain)
+			k.Activate()
 			oldWatcher := k.watcher
 			if oldWatcher == nil {
 				t.Fatal("watcher was not initialized")

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/HumanHorizon/automata/internal/atomicfile"
+	"github.com/HumanHorizon/automata/internal/childproc"
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
@@ -22,14 +23,16 @@ import (
 	warp "github.com/starframe-dev/warp"
 )
 
-// kanbanChangedMsg is sent by watchKanbanCmd when fsnotify reports a change
-// in the kanban directory. We use a single-message Cmd that re-arms itself
-// after every event so the drain loop costs 0 CPU while idle.
-type kanbanChangedMsg struct{}
+// kanbanChangedMsg is sent by the active watcher after a board change.
+type kanbanChangedMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+}
 
 type kanbanWatcherErrorMsg struct {
-	watcher *fsnotify.Watcher
-	err     error
+	generation uint64
+	watcher    *fsnotify.Watcher
+	err        error
 }
 
 // ChatInfo describes an AI chat session for the picker.
@@ -103,8 +106,13 @@ type KanbanPanel struct {
 	watcherPath string
 	watchErrors <-chan error
 
-	// watchPending is true while a watchKanbanCmd is already in flight — it
-	// blocks on watcher event/error channels and is re-armed after each result.
+	// active gates watcher ownership while the Kanban tab is hidden.
+	active bool
+
+	// generation binds each blocking command to the watcher that created it.
+	generation uint64
+
+	// watchPending guarantees at most one blocking reader per watcher.
 	watchPending bool
 
 	// onTaskAssigned is called when a task is assigned to a chat. It may return
@@ -155,26 +163,42 @@ func (k *KanbanPanel) SetTheme(palette apptheme.Theme) {
 	k.palette = palette
 }
 
+// SetProfile updates the profile used to resolve Kanban data.
+func (k *KanbanPanel) SetProfile(profile string) {
+	if k.profile == profile {
+		return
+	}
+	k.closeWatcher()
+	k.profile = profile
+	k.reload()
+	if k.active {
+		k.setupWatcher()
+	}
+}
+
 // SetDomain reloads tasks for the given domain.
 func (k *KanbanPanel) SetDomain(domain string) {
 	if k.domain == domain {
-		k.setupWatcher()
+		if k.active {
+			k.setupWatcher()
+		}
 		return
 	}
+	k.closeWatcher()
 	k.domain = domain
 	k.pendingTask = nil
 	k.activeCol = 0
-	k.closeWatcher()
 	k.reload()
-	k.setupWatcher()
-	k.watchPending = false // ensure a fresh watcher cmd is scheduled on the next Update
+	if k.active {
+		k.setupWatcher()
+	}
 }
 
 // setupWatcher attaches an fsnotify.Watcher to the domain's kanban
 // directory. If the directory does not exist yet, it watches the domain
 // directory and switches to kanban/ as soon as that directory is created.
 func (k *KanbanPanel) setupWatcher() {
-	if k.domain == "" {
+	if !k.active || k.domain == "" {
 		return
 	}
 	dir := kanban.KanbanDir(k.domain, k.profile)
@@ -194,7 +218,7 @@ func (k *KanbanPanel) setupWatcher() {
 		return
 	}
 	if err := w.Add(watchPath); err != nil {
-		w.Close()
+		_ = w.Close()
 		return
 	}
 	k.watcher = w
@@ -204,6 +228,8 @@ func (k *KanbanPanel) setupWatcher() {
 
 // closeWatcher stops and releases the file watcher if one is attached.
 func (k *KanbanPanel) closeWatcher() {
+	k.generation++
+	k.watchPending = false
 	if k.watcher != nil {
 		_ = k.watcher.Close()
 		k.watcher = nil
@@ -212,9 +238,36 @@ func (k *KanbanPanel) closeWatcher() {
 	k.watchErrors = nil
 }
 
+// Activate reloads the board while preserving its scroll position and starts its watcher.
+func (k *KanbanPanel) Activate() tea.Cmd {
+	if !k.active {
+		k.active = true
+		k.generation++
+		offsets := make([]int, len(k.colPanels))
+		for index, panel := range k.colPanels {
+			offsets[index] = panel.scrollOffset
+		}
+		k.reload()
+		for index, panel := range k.colPanels {
+			panel.scrollOffset = min(offsets[index], panel.maxScrollOffset())
+		}
+		k.setupWatcher()
+	}
+	return k.armWatcher()
+}
+
+// Deactivate releases the watcher without clearing Kanban UI state.
+func (k *KanbanPanel) Deactivate() {
+	if !k.active && k.watcher == nil {
+		return
+	}
+	k.active = false
+	k.closeWatcher()
+}
+
 // Close releases the Kanban filesystem watcher.
 func (k *KanbanPanel) Close() {
-	k.closeWatcher()
+	k.Deactivate()
 }
 
 // watchKanbanCmd blocks on fsnotify event/error channels and returns one
@@ -224,6 +277,7 @@ func (k *KanbanPanel) watchKanbanCmd() tea.Cmd {
 		return nil
 	}
 	w := k.watcher
+	generation := k.generation
 	watchErrors := k.watchErrors
 	if watchErrors == nil {
 		watchErrors = w.Errors
@@ -231,24 +285,18 @@ func (k *KanbanPanel) watchKanbanCmd() tea.Cmd {
 	return func() tea.Msg {
 		// Block until the watcher reports a filesystem event or an error.
 		select {
-		case ev, ok := <-w.Events:
+		case _, ok := <-w.Events:
 			if !ok {
-				return kanbanWatcherErrorMsg{watcher: w, err: fmt.Errorf("fsnotify events channel closed")}
+				return kanbanWatcherErrorMsg{generation: generation, watcher: w, err: fmt.Errorf("fsnotify events channel closed")}
 			}
-			if !strings.HasSuffix(ev.Name, ".md") {
-				return kanbanChangedMsg{}
-			}
-			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
-				return kanbanChangedMsg{}
-			}
-			return kanbanChangedMsg{}
+			return kanbanChangedMsg{generation: generation, watcher: w}
 		case err, ok := <-watchErrors:
 			if !ok {
 				err = fmt.Errorf("fsnotify errors channel closed")
 			} else if err == nil {
 				err = fmt.Errorf("fsnotify returned an empty watcher error")
 			}
-			return kanbanWatcherErrorMsg{watcher: w, err: err}
+			return kanbanWatcherErrorMsg{generation: generation, watcher: w, err: err}
 		}
 	}
 }
@@ -349,16 +397,17 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 		}
 		baseCmd = k.tab.Update(msg)
 	case kanbanChangedMsg:
-		// fsnotify reported a change — a missing kanban directory may have
-		// just been created, so switch the parent watcher to it before
-		// re-arming the command.
-		k.watchPending = false
-		k.setupWatcher()
-		k.reload()
-		k.lastRefresh = time.Now()
+		if k.isCurrentWatcher(msg.generation, msg.watcher) {
+			// A missing kanban directory may have just been created, so switch
+			// the parent watcher before re-arming the command.
+			k.watchPending = false
+			k.setupWatcher()
+			k.reload()
+			k.lastRefresh = time.Now()
+		}
 		baseCmd = nil
 	case kanbanWatcherErrorMsg:
-		if msg.watcher == k.watcher {
+		if k.isCurrentWatcher(msg.generation, msg.watcher) {
 			k.watchPending = false
 			log.Printf("automata: kanban watcher failed: %v", msg.err)
 			k.closeWatcher()
@@ -371,14 +420,19 @@ func (k *KanbanPanel) Update(msg tea.Msg) tea.Cmd {
 		baseCmd = k.tab.Update(msg)
 	}
 
-	// Re-arm the blocking fsnotify Cmd so we keep receiving changes.
-	// This is the only goroutine we use inside Bubble Tea — it sleeps on
-	// the watcher's Events channel and costs 0 CPU while idle.
-	if k.watcher != nil && !k.watchPending {
-		k.watchPending = true
-		baseCmd = tea.Batch(baseCmd, k.watchKanbanCmd())
+	return tea.Batch(baseCmd, k.armWatcher())
+}
+
+func (k *KanbanPanel) armWatcher() tea.Cmd {
+	if !k.active || k.watcher == nil || k.watchPending {
+		return nil
 	}
-	return baseCmd
+	k.watchPending = true
+	return k.watchKanbanCmd()
+}
+
+func (k *KanbanPanel) isCurrentWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
+	return k.active && watcher != nil && watcher == k.watcher && generation == k.generation
 }
 
 // drainWatcher is no longer used — the blocking watchKanbanCmd handles all
@@ -1173,7 +1227,7 @@ func (c *kanbanColPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 					}
 				default:
 					// Click on card — open file
-					exec.Command("zed", c.tasks[row].Path).Start()
+					_ = childproc.StartAndReap(exec.Command("zed", c.tasks[row].Path))
 				}
 			}
 		}

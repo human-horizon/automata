@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/HumanHorizon/automata/internal/atomicfile"
+	"github.com/HumanHorizon/automata/internal/cache"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -686,7 +687,7 @@ func readJSON(path string, v any) error {
 // CachedReader caches running jobs until the set of nested job.json files changes.
 type CachedReader struct {
 	mu            sync.Mutex
-	cache         map[string]cachedJobsEntry
+	cache         *cache.LRU[string, cachedJobsEntry]
 	listFn        func(string) ([]Job, error)
 	listProfileFn func(string, string) ([]Job, error)
 }
@@ -698,7 +699,7 @@ type cachedJobsEntry struct {
 
 func NewCachedReader() *CachedReader {
 	return &CachedReader{
-		cache:         make(map[string]cachedJobsEntry),
+		cache:         cache.NewLRU[string, cachedJobsEntry](cache.ReaderCacheCapacity),
 		listFn:        List,
 		listProfileFn: ListForProfile,
 	}
@@ -706,22 +707,23 @@ func NewCachedReader() *CachedReader {
 
 func newCachedReader(listFn func(string) ([]Job, error)) *CachedReader {
 	return &CachedReader{
-		cache:         make(map[string]cachedJobsEntry),
+		cache:         cache.NewLRU[string, cachedJobsEntry](cache.ReaderCacheCapacity),
 		listFn:        listFn,
 		listProfileFn: func(_ string, sessionID string) ([]Job, error) { return listFn(sessionID) },
 	}
 }
 
-func jobsSignature(jobsDir string) string {
+func jobsSignature(jobsDir string) (string, int64) {
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "missing"
+			return "missing", 0
 		}
-		return "unreadable"
+		return "unreadable", 0
 	}
 
 	var signature strings.Builder
+	var sourceBytes int64
 	signature.WriteString("jobs:")
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -734,12 +736,22 @@ func jobsSignature(jobsDir string) string {
 			signature.WriteString("missing;")
 			continue
 		}
+		sourceBytes = cache.CappedSourceBytes(sourceBytes, info.Size())
 		signature.WriteString(strconv.FormatInt(info.Size(), 10))
 		signature.WriteByte(':')
 		signature.WriteString(strconv.FormatInt(info.ModTime().UnixNano(), 10))
 		signature.WriteByte(';')
 	}
-	return signature.String()
+	return signature.String(), sourceBytes
+}
+
+func (r *CachedReader) Invalidate(profile, sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.cache.Delete(profile + "\x00" + sessionID)
+	r.mu.Unlock()
 }
 
 func (r *CachedReader) List(sessionID string) ([]Job, error) {
@@ -755,15 +767,16 @@ func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) 
 		return nil, nil
 	}
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
-	signature := jobsSignature(jobsDir)
+	signature, sourceBytes := jobsSignature(jobsDir)
 	cacheKey := profile + "\x00" + sessionID
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if entry, ok := r.cache[cacheKey]; ok && entry.signature == signature {
+	if entry, ok := r.cache.Get(cacheKey); ok && entry.signature == signature && sourceBytes <= cache.MaxSourceMetadataBytes {
 		return entry.jobs, nil
 	}
+	r.cache.Delete(cacheKey)
 
 	listFn := r.listProfileFn
 	if listFn == nil {
@@ -773,6 +786,8 @@ func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) 
 	if err != nil {
 		return jobs, err
 	}
-	r.cache[cacheKey] = cachedJobsEntry{jobs: jobs, signature: signature}
+	if sourceBytes <= cache.MaxSourceMetadataBytes {
+		r.cache.Add(cacheKey, cachedJobsEntry{jobs: jobs, signature: signature})
+	}
 	return jobs, nil
 }

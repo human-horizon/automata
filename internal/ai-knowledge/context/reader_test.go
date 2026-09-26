@@ -1,12 +1,14 @@
 package context
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/cache"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -351,5 +353,35 @@ func TestReadForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	}
 	if cachedData.Status == nil || cachedData.Status.Text != "explicit" {
 		t.Fatalf("cached explicit profile status = %#v", cachedData.Status)
+	}
+}
+
+func TestCachedReaderBoundsEntriesAndSkipsOversizedSource(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	reader := NewCachedReader()
+	for index := range 500 {
+		sessionID := fmt.Sprintf("bounded-context__session-%d", index)
+		if _, err := reader.ReadForProfile("bounded-context", sessionID); err != nil {
+			t.Fatalf("read session %d: %v", index, err)
+		}
+	}
+	if got := reader.cache.Len(); got > cache.ReaderCacheCapacity {
+		t.Fatalf("cache entries = %d, exceeds capacity %d", got, cache.ReaderCacheCapacity)
+	}
+
+	const sessionID = "oversized-context__session"
+	dir := paths.SessionDir("oversized-context", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	largePlans := []byte("[]" + strings.Repeat(" ", int(cache.MaxSourceMetadataBytes)+1))
+	if err := os.WriteFile(filepath.Join(dir, "plans.json"), largePlans, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadForProfile("oversized-context", sessionID); err != nil {
+		t.Fatalf("read oversized source: %v", err)
+	}
+	if _, cached := reader.cache.Get(contextCacheKey("oversized-context", sessionID)); cached {
+		t.Fatal("oversized context source was cached")
 	}
 }

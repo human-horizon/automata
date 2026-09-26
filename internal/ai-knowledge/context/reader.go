@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/HumanHorizon/automata/internal/cache"
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
@@ -214,7 +215,7 @@ func ReadForProfile(profile, sessionID string) (*Data, error) {
 // of the relevant files. Safe for concurrent use (single reader locks).
 type CachedReader struct {
 	mu    sync.Mutex
-	cache map[string]cachedCtxEntry
+	cache *cache.LRU[string, cachedCtxEntry]
 }
 
 type cachedCtxEntry struct {
@@ -226,15 +227,16 @@ var contextFiles = []string{"plans.json", "status.json", "settings.json"}
 
 // NewCachedReader creates a context reader with file-signature caching.
 func NewCachedReader() *CachedReader {
-	return &CachedReader{cache: make(map[string]cachedCtxEntry)}
+	return &CachedReader{cache: cache.NewLRU[string, cachedCtxEntry](cache.ReaderCacheCapacity)}
 }
 
 func contextCacheKey(profile, sessionID string) string {
 	return sessionDirForProfile(profile, sessionID)
 }
 
-func contextFileSignature(dir string) string {
+func contextFileSignature(dir string) (string, int64) {
 	var signature strings.Builder
+	var sourceBytes int64
 	for _, name := range contextFiles {
 		signature.WriteString(name)
 		signature.WriteByte('=')
@@ -249,12 +251,13 @@ func contextFileSignature(dir string) string {
 			signature.WriteByte(';')
 			continue
 		}
+		sourceBytes = cache.CappedSourceBytes(sourceBytes, info.Size())
 		signature.WriteString(strconv.FormatInt(info.Size(), 10))
 		signature.WriteByte(':')
 		signature.WriteString(strconv.FormatInt(info.ModTime().UnixNano(), 10))
 		signature.WriteByte(';')
 	}
-	return signature.String()
+	return signature.String(), sourceBytes
 }
 
 // Invalidate removes a session from the cache. It is useful when a watcher
@@ -264,7 +267,7 @@ func (r *CachedReader) Invalidate(profile, sessionID string) {
 		return
 	}
 	r.mu.Lock()
-	delete(r.cache, contextCacheKey(profile, sessionID))
+	r.cache.Delete(contextCacheKey(profile, sessionID))
 	r.mu.Unlock()
 }
 
@@ -285,19 +288,22 @@ func (r *CachedReader) ReadForProfile(profile, sessionID string) (*Data, error) 
 	}
 	dir := sessionDirForProfile(profile, sessionID)
 	cacheKey := contextCacheKey(profile, sessionID)
-	signature := contextFileSignature(dir)
+	signature, sourceBytes := contextFileSignature(dir)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if entry, ok := r.cache[cacheKey]; ok && entry.signature == signature {
+	if entry, ok := r.cache.Get(cacheKey); ok && entry.signature == signature && sourceBytes <= cache.MaxSourceMetadataBytes {
 		return entry.data, nil
 	}
+	r.cache.Delete(cacheKey)
 
 	data, err := readForProfile(profile, sessionID)
 	if err != nil {
 		return data, err
 	}
-	r.cache[cacheKey] = cachedCtxEntry{data: data, signature: signature}
+	if sourceBytes <= cache.MaxSourceMetadataBytes {
+		r.cache.Add(cacheKey, cachedCtxEntry{data: data, signature: signature})
+	}
 	return data, nil
 }

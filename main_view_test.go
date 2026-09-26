@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/HumanHorizon/automata/internal/paths"
+	"github.com/HumanHorizon/automata/internal/scrollback"
 	"github.com/HumanHorizon/automata/internal/status"
 	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/HumanHorizon/automata/internal/ui"
@@ -793,34 +796,24 @@ func TestRouteCachedEmulatorMessageLeavesUnknownMessagesForWarp(t *testing.T) {
 	}
 }
 
-func TestKnowledgeRefreshDoesNotForkBlinkChain(t *testing.T) {
-	t.Log("Given the existing blink chain already scheduled the next tick")
+func TestKnowledgeRefreshDoesNotSchedulePeriodicWork(t *testing.T) {
 	app := &App{container: &ui.Container{}}
-
-	t.Log("When the asynchronous knowledge refresh result arrives")
 	_, cmd := app.Update(ui.KnowledgeRefreshMsg{})
-
-	t.Log("Then it applies data without scheduling another independent blink chain")
 	if cmd != nil {
-		t.Fatal("KnowledgeRefreshMsg returned a command; this forks the blink timer chain and makes idle CPU grow over time")
+		t.Fatal("KnowledgeRefreshMsg unexpectedly scheduled periodic work")
 	}
 }
 
-func TestWindowResizeDoesNotForkBlinkChain(t *testing.T) {
-	t.Log("Given a minimal app whose Warp layout has no resize command")
+func TestWindowResizeDoesNotSchedulePeriodicWork(t *testing.T) {
 	w := warp.New()
 	w.SetRoot(nil)
 	app := &App{
 		warp: w,
 		tree: tree.New(),
 	}
-
-	t.Log("When Bubble Tea reports a zero-sized startup resize")
 	_, cmd := app.Update(tea.WindowSizeMsg{})
-
-	t.Log("Then resize does not schedule an independent blink chain")
 	if cmd != nil {
-		t.Fatal("WindowSizeMsg returned a command despite Warp returning nil; the extra command is a leaked blink timer")
+		t.Fatal("WindowSizeMsg unexpectedly scheduled periodic work")
 	}
 }
 
@@ -1427,6 +1420,7 @@ func newTestApp(t *testing.T, profile string) *App {
 	return &App{
 		tree:            tr,
 		profile:         profile,
+		scrollbackLines: scrollback.DefaultLines,
 		piAgentDir:      filepath.Join(home, ".ai", profile, "pi"),
 		statusReader:    status.NewCachedReader(profile),
 		sessionWatchers: make(map[string]*fsnotify.Watcher),
@@ -1592,6 +1586,106 @@ func TestWatchTreeStatusCmdNilWithoutWatcher(t *testing.T) {
 // Update and confirms a fresh recompute happened (badge appears) plus a
 // re-arm cmd is returned. The recompute works against an on-disk
 // status.json written before the message fires.
+func TestChatAndFamiliarEmulatorsReceiveConfiguredScrollback(t *testing.T) {
+	installFakePi(t)
+	app := newTestApp(t, "scrollback-profile")
+	app.scrollbackLines = 0
+
+	chatID := app.tree.SessionKeyOf(app.tree.AllItems()[0])
+	chat := app.createChatEmulator(chatID)
+	if chat == nil {
+		t.Fatal("chat emulator was not created")
+	}
+	if got := int(reflect.ValueOf(chat).Elem().FieldByName("scrollbackLimit").Int()); got != 0 {
+		t.Fatalf("chat emulator scrollback limit = %d, want 0", got)
+	}
+
+	familiar, _ := app.createFamiliarEmulator("scrollback-profile__familiar")
+	if familiar == nil {
+		t.Fatal("familiar emulator was not created")
+	}
+	if got := int(reflect.ValueOf(familiar).Elem().FieldByName("scrollbackLimit").Int()); got != 0 {
+		t.Fatalf("familiar emulator scrollback limit = %d, want 0", got)
+	}
+}
+
+func TestReadyMessageAppliesUnlimitedScrollbackToCreatedScreen(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	app := newTestApp(t, "scrollback-profile")
+	t.Cleanup(app.Close)
+	app.scrollbackLines = 0
+	item := app.tree.AllItems()[0]
+	sessionID := app.tree.SessionKeyOf(item)
+	emulator := portalis.NewEmulator(sessionID, item.Name, "/bin/cat", nil)
+	emulator.SetScrollbackLimit(0)
+	screen := portalis.NewScreen(24, 80)
+	emulatorValue := reflect.ValueOf(emulator).Elem()
+	screenField := emulatorValue.FieldByName("screen")
+	reflect.NewAt(screenField.Type(), unsafe.Pointer(screenField.UnsafeAddr())).Elem().Set(reflect.ValueOf(screen))
+	app.emulatorCache = map[string]*portalis.Emulator{sessionID: emulator}
+
+	_, handled := app.routeCachedEmulatorMessage(portalis.PtyReadyMsg{SessionID: sessionID})
+	if !handled {
+		t.Fatal("ready message was not routed to cached emulator")
+	}
+	limitField := reflect.ValueOf(screen).Elem().FieldByName("scrollbackLimit")
+	if got := reflect.NewAt(limitField.Type(), unsafe.Pointer(limitField.UnsafeAddr())).Elem().Int(); got != 0 {
+		t.Fatalf("started screen scrollback limit = %d, want unlimited (0)", got)
+	}
+}
+
+func TestConfigureDebugLogDisabledWithoutExplicitPath(t *testing.T) {
+	var output bytes.Buffer
+	logger := log.New(&output, "", 0)
+	file, err := configureDebugLog("", logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file != nil {
+		t.Fatal("disabled debug log returned an open file")
+	}
+	logger.Print("must not be logged by default")
+	if output.Len() != 0 {
+		t.Fatalf("default debug output = %q, want no output", output.String())
+	}
+}
+
+func TestConfigureDebugLogReportsOpenFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "debug.log")
+	if _, err := configureDebugLog(path, log.New(io.Discard, "", 0)); err == nil {
+		t.Fatal("explicit debug log open failure was ignored")
+	}
+}
+
+func TestWriteHeapProfileProducesGzipProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "heap.prof")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeHeapProfile(file); err != nil {
+		t.Fatalf("write heap profile: %v", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(contents))
+	if err != nil {
+		t.Fatalf("heap profile is not gzip: %v", err)
+	}
+	profile, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read heap profile: %v", err)
+	}
+	if len(profile) == 0 {
+		t.Fatal("heap profile is empty")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOpenDebugLogAppendsWithoutTruncating(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "automata.log")
 	if err := os.WriteFile(path, []byte("before\n"), 0o644); err != nil {
@@ -1617,7 +1711,7 @@ func TestOpenDebugLogAppendsWithoutTruncating(t *testing.T) {
 	}
 }
 
-func TestWatcherRecoveryRecreatesClosedStatusAndSessionWatchers(t *testing.T) {
+func TestStatusWatcherRecoveryRecreatesOneSharedWatcher(t *testing.T) {
 	app := newTestApp(t, "")
 	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])
 	dir := filepath.Join(app.sessionBaseDir(), key)
@@ -1625,61 +1719,51 @@ func TestWatcherRecoveryRecreatesClosedStatusAndSessionWatchers(t *testing.T) {
 		t.Fatal(err)
 	}
 	app.setupStatusWatcher()
-	app.syncSessionWatchers()
-	oldStatus := app.statusWatcher
-	oldSession := app.sessionWatchers[key]
-	if oldStatus == nil || oldSession == nil {
-		t.Fatal("test setup did not create both status watchers")
+	cmds := app.syncSessionWatchers()
+	oldWatcher := app.statusWatcher
+	oldGeneration := app.statusGeneration
+	if oldWatcher == nil || app.sessionWatchers[key] != oldWatcher || len(cmds) != 1 {
+		t.Fatal("test setup did not mount exactly one shared watcher")
 	}
 	t.Cleanup(func() { app.Close() })
 
-	statusCmd := app.watchTreeStatusCmd()
-	if statusCmd == nil {
-		t.Fatal("status watcher command is nil")
+	_, cmd := app.Update(statusWatcherErrorMsg{
+		generation: oldGeneration,
+		watcher:    oldWatcher,
+		err:        errors.New("synthetic watcher failure"),
+	})
+	if cmd == nil {
+		t.Fatal("watcher recovery did not return a re-arm command")
 	}
-	statusMessages := make(chan tea.Msg, 1)
-	go func() { statusMessages <- statusCmd() }()
-	go func() { oldStatus.Errors <- errors.New("synthetic status watcher error") }()
-	select {
-	case msg := <-statusMessages:
-		errorMsg, ok := msg.(statusWatcherErrorMsg)
-		if !ok || errorMsg.err == nil {
-			t.Fatalf("status watcher error message = %#v", msg)
-		}
-		_, cmd := app.Update(msg)
-		if cmd == nil {
-			t.Fatal("status watcher recovery did not return a re-arm command")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("closed status watcher did not report recovery")
-	}
-	if app.statusWatcher == nil || app.statusWatcher == oldStatus {
+	if app.statusWatcher == nil || app.statusWatcher == oldWatcher {
 		t.Fatal("status watcher was not recreated")
 	}
+	if app.sessionWatchers[key] != app.statusWatcher {
+		t.Fatal("session index does not point to the recreated shared watcher")
+	}
+	if app.statusGeneration == oldGeneration {
+		t.Fatal("watcher generation was not advanced")
+	}
+}
 
-	app.sessionWatchPending[key] = false
-	sessionCmd := app.watchSessionCmd(key)
-	if sessionCmd == nil {
-		t.Fatal("session watcher command is nil")
+func TestStatusWatcherRejectsStaleEvents(t *testing.T) {
+	app := newTestApp(t, "")
+	app.setupStatusWatcher()
+	oldWatcher, oldGeneration := app.statusWatcher, app.statusGeneration
+	app.setupStatusWatcher()
+	currentWatcher, currentGeneration := app.statusWatcher, app.statusGeneration
+	t.Cleanup(func() { app.Close() })
+
+	_, cmd := app.Update(treeStatusChangedMsg{
+		generation: oldGeneration,
+		watcher:    oldWatcher,
+		path:       filepath.Join(app.sessionBaseDir(), "stale", "status.json"),
+	})
+	if cmd != nil {
+		t.Fatal("stale watcher event unexpectedly scheduled work")
 	}
-	sessionMessages := make(chan tea.Msg, 1)
-	go func() { sessionMessages <- sessionCmd() }()
-	go func() { oldSession.Errors <- errors.New("synthetic session watcher error") }()
-	select {
-	case msg := <-sessionMessages:
-		errorMsg, ok := msg.(sessionWatcherErrorMsg)
-		if !ok || errorMsg.err == nil {
-			t.Fatalf("session watcher error message = %#v", msg)
-		}
-		_, cmd := app.Update(msg)
-		if cmd == nil {
-			t.Fatal("session watcher recovery did not return a re-arm command")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("closed session watcher did not report recovery")
-	}
-	if app.sessionWatchers[key] == nil || app.sessionWatchers[key] == oldSession {
-		t.Fatal("session watcher was not recreated")
+	if app.statusWatcher != currentWatcher || app.statusGeneration != currentGeneration {
+		t.Fatal("stale watcher event changed the current watcher")
 	}
 }
 
@@ -1695,18 +1779,16 @@ func TestTreeStatusChangedMsgTriggersRefresh(t *testing.T) {
 		t.Fatalf("write status: %v", err)
 	}
 
-	// Mount the watcher (skipping Init's full wiring) so watchTreeStatusCmd
-	// has something to return.
+	// Mount the shared watcher and session directory index.
 	app.setupStatusWatcher()
-	t.Cleanup(func() {
-		app.statusWatcher.Close()
-		for _, w := range app.sessionWatchers {
-			w.Close()
-		}
-	})
-	app.statusWatchPending = false // allow the first re-arm
+	app.syncSessionWatchers()
+	t.Cleanup(func() { app.Close() })
 
-	_, cmd := app.Update(treeStatusChangedMsg{})
+	_, cmd := app.Update(treeStatusChangedMsg{
+		generation: app.statusGeneration,
+		watcher:    app.statusWatcher,
+		path:       filepath.Join(dir, "status.json"),
+	})
 
 	if got := app.tree.StatusBadge(app.tree.AllItems()[0]); got == "" {
 		t.Errorf("expected badge to be recomputed, got empty")
@@ -1764,69 +1846,138 @@ func TestSyncSessionWatchersReturnsCmdsOnlyForNewWatchers(t *testing.T) {
 	}
 }
 
-// TestPerSessionWatcherCmdChainReceivesEvents writes status.json inside a
-// session directory and asserts that watchSessionCmd for that key returns
-// treeStatusChangedMsg within a short timeout. This is the regression
-// test for the bug where per-session watchers were mounted but never
-// had a goroutine reading their Events channel.
-func TestPerSessionWatcherCmdChainReceivesEvents(t *testing.T) {
-	app := newTestApp(t, "")
-	it := app.tree.AllItems()[0]
-	key := app.tree.SessionKeyOf(it)
-	dir := filepath.Join(app.sessionBaseDir(), key)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "status.json"),
-		[]byte(`{"action":"thinking"}`), 0o644); err != nil {
-		t.Fatalf("write status: %v", err)
-	}
-
-	app.setupStatusWatcher()
-	watchCmds := app.syncSessionWatchers()
-	if len(watchCmds) == 0 {
-		t.Fatal("expected a session watcher command")
-	}
-	t.Cleanup(func() {
-		app.statusWatcher.Close()
-		for _, w := range app.sessionWatchers {
-			w.Close()
-		}
-	})
-
-	cmd := watchCmds[0]
+func waitForWatcherMessage(t *testing.T, cmd tea.Cmd, trigger func() error) tea.Msg {
+	t.Helper()
 	if cmd == nil {
-		t.Fatal("expected cmd for mounted watcher")
+		t.Fatal("watcher command is nil")
 	}
-
-	done := make(chan tea.Msg, 1)
-	go func() {
-		done <- cmd()
-	}()
-
-	// Trigger an event in a separate goroutine to give FSEvents/kqueue
-	// time to deliver the first read.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		_ = os.WriteFile(filepath.Join(dir, "status.json"),
-			[]byte(`{"action":"write"}`), 0o644)
-	}()
-
+	messages := make(chan tea.Msg, 1)
+	go func() { messages <- cmd() }()
+	if err := trigger(); err != nil {
+		t.Fatal(err)
+	}
 	select {
-	case msg := <-done:
-		if _, ok := msg.(treeStatusChangedMsg); !ok {
-			t.Errorf("expected treeStatusChangedMsg, got %T", msg)
-		}
+	case msg := <-messages:
+		return msg
 	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for per-session watcher event")
+		t.Fatal("timed out waiting for status watcher event")
+		return nil
 	}
 }
 
-// TestPerSessionWatcherRearmsAfterEvent verifies the cmd-chain keeps
-// firing after the first event. Without re-arming (see rearmSessionWatchers
-// in main.go) the blocking read is one-shot: subsequent writes to status.json
-// would be silently lost and the Tree badge would freeze.
-func TestPerSessionWatcherRearmsAfterEvent(t *testing.T) {
+func TestStatusWatcherUpdatesOnlyChangedBadgeAndFiltersFiles(t *testing.T) {
+	app := newTestApp(t, "test")
+	app.tree.AddChat("second")
+	items := app.tree.AllItems()
+	if len(items) != 2 {
+		t.Fatalf("chat items = %d, want 2", len(items))
+	}
+	keys := make(map[string]string, 2)
+	for _, item := range items {
+		key := app.tree.SessionKeyOf(item)
+		dir := filepath.Join(app.sessionBaseDir(), key)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		action := "read"
+		if item.Name == "second" {
+			action = "write"
+		}
+		if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"action":"`+action+`"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		keys[item.Name] = key
+	}
+	app.recomputeTreeStatusBadges()
+	app.setupStatusWatcher()
+	cmds := app.syncSessionWatchers()
+	if len(cmds) != 1 || app.sessionWatchers[keys["agent"]] != app.statusWatcher || app.sessionWatchers[keys["second"]] != app.statusWatcher {
+		t.Fatal("visible session directories do not share exactly one watcher command")
+	}
+	t.Cleanup(func() { app.Close() })
+
+	changedPath := filepath.Join(app.sessionBaseDir(), keys["agent"], "status.json")
+	msg := waitForWatcherMessage(t, cmds[0], func() error {
+		return os.WriteFile(changedPath, []byte(`{"action":"thinking"}`), 0o644)
+	})
+	statusChange, ok := msg.(treeStatusChangedMsg)
+	if !ok {
+		t.Fatalf("watcher message = %T, want treeStatusChangedMsg", msg)
+	}
+	if filepath.Clean(statusChange.path) != filepath.Clean(changedPath) {
+		t.Fatalf("event path = %q, want %q", statusChange.path, changedPath)
+	}
+	_, rearm := app.Update(statusChange)
+	for _, item := range items {
+		want := "~"
+		if item.Name == "second" {
+			want = "W"
+		}
+		if got := app.tree.StatusBadge(item); got != want {
+			t.Errorf("%s badge = %q, want %q", item.Name, got, want)
+		}
+	}
+
+	unrelatedPath := filepath.Join(filepath.Dir(changedPath), "unrelated.txt")
+	unrelated := waitForWatcherMessage(t, rearm, func() error {
+		return os.WriteFile(unrelatedPath, []byte("ignored"), 0o644)
+	})
+	unrelatedChange, ok := unrelated.(treeStatusChangedMsg)
+	if !ok {
+		t.Fatalf("unrelated event message = %T, want treeStatusChangedMsg", unrelated)
+	}
+	_, nextReader := app.Update(unrelatedChange)
+	if nextReader == nil {
+		t.Fatal("unrelated event did not re-arm the sole watcher")
+	}
+	for _, item := range items {
+		want := "~"
+		if item.Name == "second" {
+			want = "W"
+		}
+		if got := app.tree.StatusBadge(item); got != want {
+			t.Errorf("unrelated file changed %s badge to %q, want %q", item.Name, got, want)
+		}
+	}
+}
+
+func TestStatusWatcherDiscoversCreatedSessionDirectory(t *testing.T) {
+	app := newTestApp(t, "test")
+	item := app.tree.AllItems()[0]
+	key := app.tree.SessionKeyOf(item)
+	app.setupStatusWatcher()
+	cmds := app.syncSessionWatchers()
+	if len(cmds) != 1 {
+		t.Fatalf("initial watcher commands = %d, want 1", len(cmds))
+	}
+	t.Cleanup(func() { app.Close() })
+
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	msg := waitForWatcherMessage(t, cmds[0], func() error {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"action":"grep"}`), 0o644)
+	})
+	rootEvent, ok := msg.(treeStatusChangedMsg)
+	if !ok {
+		t.Fatalf("root event message = %T, want treeStatusChangedMsg", msg)
+	}
+	_, nextReader := app.Update(rootEvent)
+	if nextReader == nil {
+		t.Fatal("root event did not re-arm the watcher")
+	}
+	if app.sessionWatchers[key] != app.statusWatcher {
+		t.Fatal("new session directory was not attached to the shared watcher")
+	}
+	if got := app.tree.StatusBadge(item); got != "G" {
+		t.Fatalf("new session badge = %q, want G", got)
+	}
+}
+
+// TestSharedStatusWatcherReceivesSessionEvents verifies status.json events
+// from a mounted session directory reach the single shared watcher.
+func TestSharedStatusWatcherReceivesSessionEvents(t *testing.T) {
 	app := newTestApp(t, "")
 	it := app.tree.AllItems()[0]
 	key := app.tree.SessionKeyOf(it)
@@ -1844,71 +1995,186 @@ func TestPerSessionWatcherRearmsAfterEvent(t *testing.T) {
 	if len(watchCmds) == 0 {
 		t.Fatal("expected a session watcher command")
 	}
-	t.Cleanup(func() {
-		app.statusWatcher.Close()
-		for _, w := range app.sessionWatchers {
-			w.Close()
+	t.Cleanup(func() { app.Close() })
+
+	msg := waitForWatcherMessage(t, watchCmds[0], func() error {
+		return os.WriteFile(filepath.Join(dir, "status.json"),
+			[]byte(`{"action":"write"}`), 0o644)
+	})
+	if _, ok := msg.(treeStatusChangedMsg); !ok {
+		t.Errorf("expected treeStatusChangedMsg, got %T", msg)
+	}
+}
+
+// TestSharedStatusWatcherRearmsAfterEvent verifies Update re-arms the one
+// blocking reader after each event, so later status writes remain observable.
+func TestSharedStatusWatcherRearmsAfterEvent(t *testing.T) {
+	app := newTestApp(t, "")
+	item := app.tree.AllItems()[0]
+	key := app.tree.SessionKeyOf(item)
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(dir, "status.json")
+	if err := os.WriteFile(statusPath, []byte(`{"action":"thinking"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app.setupStatusWatcher()
+	cmds := app.syncSessionWatchers()
+	if len(cmds) != 1 {
+		t.Fatalf("initial watcher commands = %d, want 1", len(cmds))
+	}
+	t.Cleanup(func() { app.Close() })
+
+	first := waitForWatcherMessage(t, cmds[0], func() error {
+		return os.WriteFile(statusPath, []byte(`{"action":"write"}`), 0o644)
+	})
+	firstEvent, ok := first.(treeStatusChangedMsg)
+	if !ok {
+		t.Fatalf("first message = %T, want treeStatusChangedMsg", first)
+	}
+	_, rearm := app.Update(firstEvent)
+
+	second := waitForWatcherMessage(t, rearm, func() error {
+		return os.WriteFile(statusPath, []byte(`{"action":"grep"}`), 0o644)
+	})
+	secondEvent, ok := second.(treeStatusChangedMsg)
+	if !ok {
+		t.Fatalf("second message = %T, want treeStatusChangedMsg", second)
+	}
+	_, nextReader := app.Update(secondEvent)
+	if nextReader == nil {
+		t.Fatal("second event did not re-arm the sole watcher")
+	}
+}
+
+func TestMetadataSaveCoalescesRapidChangesAndDropsStaleTimers(t *testing.T) {
+	app := newTestApp(t, "metadata-coalesce")
+	item := app.tree.AllItems()[0]
+	writes := 0
+	app.tree.SetSaveStateFunc(func() error {
+		writes++
+		if item.CWD != "/work/99" {
+			t.Errorf("saved CWD = %q, want final value", item.CWD)
 		}
+		return nil
 	})
 
-	// Drain the first event to confirm the chain works once.
-	first := watchCmds[0]
-	if first == nil {
-		t.Fatal("expected first cmd")
+	var staleMessages []treeMetadataSaveMsg
+	var latest tea.Cmd
+	for index := range 100 {
+		item.CWD = fmt.Sprintf("/work/%d", index)
+		latest = app.scheduleMetadataSave()
+		staleMessages = append(staleMessages, treeMetadataSaveMsg{generation: app.metadataSaveGeneration - 1})
 	}
-	firstDone := make(chan tea.Msg, 1)
-	go func() { firstDone <- first() }()
+	for _, stale := range staleMessages {
+		_, _ = app.Update(stale)
+	}
+	if writes != 0 || !app.metadataSaveDirty {
+		t.Fatalf("stale timers wrote state or cleared dirty state: writes=%d dirty=%t", writes, app.metadataSaveDirty)
+	}
 
-	time.Sleep(50 * time.Millisecond)
-	if err := os.WriteFile(filepath.Join(dir, "status.json"),
-		[]byte(`{"action":"write"}`), 0o644); err != nil {
-		t.Fatalf("write status (1st trigger): %v", err)
+	msg := latest()
+	saveMessage, ok := msg.(treeMetadataSaveMsg)
+	if !ok {
+		t.Fatalf("metadata timer message = %T, want treeMetadataSaveMsg", msg)
 	}
-	select {
-	case msg := <-firstDone:
-		if _, ok := msg.(treeStatusChangedMsg); !ok {
-			t.Fatalf("expected treeStatusChangedMsg from first event, got %T", msg)
+	_, _ = app.Update(saveMessage)
+	if writes != 1 || app.metadataSaveDirty {
+		t.Fatalf("coalesced save = writes:%d dirty:%t, want one write and clean state", writes, app.metadataSaveDirty)
+	}
+	_, _ = app.Update(saveMessage)
+	if writes != 1 {
+		t.Fatalf("duplicate timer wrote state again: writes=%d", writes)
+	}
+}
+
+func TestEmulatorMetadataCallbacksScheduleDeferredSaves(t *testing.T) {
+	piDir := installFakePi(t)
+	t.Setenv("PATH", piDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	app := newTestApp(t, "metadata-callbacks")
+	item := app.tree.AllItems()[0]
+	em := app.newChatEmulator(app.tree.SessionKeyOf(item))
+	if em == nil {
+		t.Fatal("expected fake Pi emulator")
+	}
+	writes := 0
+	app.tree.SetSaveStateFunc(func() error {
+		writes++
+		return nil
+	})
+	t.Cleanup(func() { app.Close() })
+
+	em.OnCWDChange("/deferred/cwd")
+	em.OnCommandHistoryChanged([]string{"echo deferred"})
+	if item.CWD != "/deferred/cwd" || !reflect.DeepEqual(item.CommandHistory, []string{"echo deferred"}) {
+		t.Fatalf("metadata callbacks did not update Tree item: cwd=%q history=%v", item.CWD, item.CommandHistory)
+	}
+	if writes != 0 || !app.metadataSaveDirty || len(app.pendingBubbleTeaCmds) != 2 {
+		t.Fatalf("callbacks wrote synchronously or failed to queue saves: writes=%d dirty=%t commands=%d", writes, app.metadataSaveDirty, len(app.pendingBubbleTeaCmds))
+	}
+}
+
+func TestMetadataSaveFailureRemainsDirtyUntilRetry(t *testing.T) {
+	app := newTestApp(t, "metadata-retry")
+	attempts := 0
+	app.tree.SetSaveStateFunc(func() error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("injected metadata save failure")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("first event did not arrive")
+		return nil
+	})
+
+	firstTimer := app.scheduleMetadataSave()
+	firstMessage, ok := firstTimer().(treeMetadataSaveMsg)
+	if !ok {
+		t.Fatal("first timer did not return treeMetadataSaveMsg")
+	}
+	_, _ = app.Update(firstMessage)
+	if !app.metadataSaveDirty || app.tree.LastActionError() == nil {
+		t.Fatal("failed metadata save did not retain dirty state and visible warning")
 	}
 
-	// Now simulate what Update does: take the re-arm cmd and run it.
-	// The Update path returns tea.Batch(allCmds...), but rearmSessionWatchers
-	// is the relevant slice; if any of its entries fires on a fresh event,
-	// the chain is correctly re-armed.
-	app.sessionWatchPending[key] = false
-	rearm := app.rearmSessionWatchers()
-	if len(rearm) == 0 {
-		t.Fatal("expected rearmSessionWatchers to return at least one cmd")
+	secondTimer := app.scheduleMetadataSave()
+	secondMessage, ok := secondTimer().(treeMetadataSaveMsg)
+	if !ok {
+		t.Fatal("retry timer did not return treeMetadataSaveMsg")
 	}
-	for _, c := range rearm {
-		if c == nil {
-			t.Fatal("expected non-nil re-arm cmd")
-		}
+	_, _ = app.Update(secondMessage)
+	if attempts != 2 || app.metadataSaveDirty {
+		t.Fatalf("retry attempts=%d dirty=%t, want two attempts and clean state", attempts, app.metadataSaveDirty)
 	}
+}
 
-	// Pick the cmd for our specific key and verify it can fire on a new event.
-	target := rearm[0]
-	if target == nil {
-		t.Fatal("expected re-arm cmd for target key")
-	}
-	secondDone := make(chan tea.Msg, 1)
-	go func() { secondDone <- target() }()
+func TestAppCloseFlushesLatestTreeMetadata(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	app := newTestApp(t, "metadata-flush")
+	item := app.tree.AllItems()[0]
+	item.CWD = "/final/working-directory"
+	item.CommandHistory = []string{"first", "latest"}
+	app.metadataSaveDirty = true
 
-	time.Sleep(50 * time.Millisecond)
-	if err := os.WriteFile(filepath.Join(dir, "status.json"),
-		[]byte(`{"action":"grep"}`), 0o644); err != nil {
-		t.Fatalf("write status (2nd trigger): %v", err)
-	}
+	app.Close()
 
-	select {
-	case msg := <-secondDone:
-		if _, ok := msg.(treeStatusChangedMsg); !ok {
-			t.Errorf("expected treeStatusChangedMsg from re-armed chain, got %T", msg)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out — per-session cmd-chain did not re-arm after first event")
+	data, err := os.ReadFile(paths.StatePath("metadata-flush"))
+	if err != nil {
+		t.Fatalf("read persisted Tree state: %v", err)
+	}
+	var state tree.TreeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("decode persisted Tree state: %v", err)
+	}
+	if len(state.Items) != 1 || state.Items[0].CWD != item.CWD {
+		t.Fatalf("persisted Tree state = %+v, want latest CWD %q", state.Items, item.CWD)
+	}
+	if got := state.Items[0].CommandHistory; !reflect.DeepEqual(got, item.CommandHistory) {
+		t.Fatalf("persisted command history = %v, want %v", got, item.CommandHistory)
+	}
+	if app.metadataSaveDirty {
+		t.Fatal("Close left metadata dirty after successful flush")
 	}
 }
 

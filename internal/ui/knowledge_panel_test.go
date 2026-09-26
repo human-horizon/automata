@@ -31,6 +31,7 @@ func TestKnowledgePanelLateAttachesSessionAndJobsWatchersWithoutPolling(t *testi
 	defer k.Close()
 	k.SetProfile(profile)
 	k.SetSession(sessionID)
+	k.Activate()
 
 	if k.knowledgeWatcher == nil || k.knowledgeWatcherPath != paths.SessionsDir(profile) {
 		t.Fatalf("missing-session watcher = %q, want sessions parent %q", k.knowledgeWatcherPath, paths.SessionsDir(profile))
@@ -94,20 +95,65 @@ func TestKnowledgePanelRecoversClosedWatchers(t *testing.T) {
 	defer k.Close()
 	k.SetProfile(profile)
 	k.SetSession(sessionID)
+	k.Activate()
 	oldKnowledge := k.knowledgeWatcher
 	oldJobs := k.jobsWatcher
 	if oldKnowledge == nil || oldJobs == nil {
 		t.Fatal("test setup did not create both watchers")
 	}
 
-	k.Update(knowledgeWatcherErrorMsg{err: errors.New("synthetic knowledge watcher error")})
+	k.Update(knowledgeWatcherErrorMsg{generation: k.knowledgeGeneration, watcher: oldKnowledge, err: errors.New("synthetic knowledge watcher error")})
 	if k.knowledgeWatcher == nil || k.knowledgeWatcher == oldKnowledge {
 		t.Fatal("knowledge watcher was not recreated")
 	}
 
-	k.Update(jobsWatcherErrorMsg{err: errors.New("synthetic jobs watcher error")})
+	k.Update(jobsWatcherErrorMsg{generation: k.jobsGeneration, watcher: oldJobs, err: errors.New("synthetic jobs watcher error")})
 	if k.jobsWatcher == nil || k.jobsWatcher == oldJobs {
 		t.Fatal("jobs watcher was not recreated")
+	}
+}
+
+func TestKnowledgePanelDeactivateRejectsStaleEventsAndPreservesUIState(t *testing.T) {
+	profile := "knowledge-lifecycle"
+	sessionID := "knowledge-lifecycle__chat"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	if err := os.MkdirAll(filepath.Join(paths.SessionDir(profile, sessionID), "jobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	panel := NewKnowledgePanel()
+	defer panel.Close()
+	panel.SetProfile(profile)
+	panel.SetSession(sessionID)
+	panel.Activate()
+	panel.scrollOffset = 7
+	panel.plansCollapsed = true
+	panel.jobsCollapsed = true
+	panel.currentTask = "kept task"
+	oldKnowledge := panel.knowledgeWatcher
+	oldJobs := panel.jobsWatcher
+	oldKnowledgeGeneration := panel.knowledgeGeneration
+	oldJobsGeneration := panel.jobsGeneration
+	if oldKnowledge == nil || oldJobs == nil {
+		t.Fatal("Activate did not create both Knowledge watchers")
+	}
+
+	panel.Deactivate()
+	if panel.active || panel.knowledgeWatcher != nil || panel.jobsWatcher != nil {
+		t.Fatalf("Deactivate retained resources: active=%v knowledge=%v jobs=%v", panel.active, panel.knowledgeWatcher, panel.jobsWatcher)
+	}
+	panel.Update(knowledgeChangedMsg{generation: oldKnowledgeGeneration, watcher: oldKnowledge})
+	panel.Update(jobsChangedMsg{generation: oldJobsGeneration, watcher: oldJobs})
+	if panel.scrollOffset != 7 || !panel.plansCollapsed || !panel.jobsCollapsed || panel.currentTask != "kept task" {
+		t.Fatalf("deactivation or stale event discarded UI state: scroll=%d plansCollapsed=%v jobsCollapsed=%v task=%q", panel.scrollOffset, panel.plansCollapsed, panel.jobsCollapsed, panel.currentTask)
+	}
+
+	panel.Activate()
+	if !panel.active || panel.knowledgeWatcher == nil || panel.jobsWatcher == nil || panel.knowledgeWatcher == oldKnowledge || panel.jobsWatcher == oldJobs {
+		t.Fatal("reactivation did not create fresh Knowledge watchers")
+	}
+	if panel.scrollOffset != 7 || !panel.plansCollapsed || !panel.jobsCollapsed {
+		t.Fatal("reactivation discarded Knowledge view state")
 	}
 }
 

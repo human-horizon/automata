@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/HumanHorizon/automata/internal/scrollback"
 	"github.com/Starframe/portalis"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -21,12 +22,13 @@ type tmuxOutputMsg struct {
 // TmuxPanePanel reads a tmux pane's content in real-time via tmux control mode
 // (-C attach-session). Uses portalis Screen/Parser for ANSI rendering.
 type TmuxPanePanel struct {
-	tmuxID  string
-	screen  *portalis.Screen
-	parser  *portalis.Parser
-	width   int
-	height  int
-	started bool
+	tmuxID          string
+	screen          *portalis.Screen
+	parser          *portalis.Parser
+	width           int
+	height          int
+	started         bool
+	scrollbackLimit int
 
 	mu      sync.Mutex
 	cmd     *exec.Cmd
@@ -35,13 +37,38 @@ type TmuxPanePanel struct {
 	stopCh  chan struct{}
 }
 
-// NewTmuxPanePanel creates a panel that shows a tmux pane's content in real-time.
+// NewTmuxPanePanel creates a real-time tmux pane viewer with the default scrollback limit.
 func NewTmuxPanePanel(tmuxID string) *TmuxPanePanel {
 	return &TmuxPanePanel{
-		tmuxID: tmuxID,
-		dataCh: make(chan []byte, 64),
-		stopCh: make(chan struct{}),
+		tmuxID:          tmuxID,
+		scrollbackLimit: scrollback.DefaultLines,
+		dataCh:          make(chan []byte, 64),
+		stopCh:          make(chan struct{}),
 	}
+}
+
+// NewTmuxPanePanelWithScrollbackLimit creates a viewer with a configured history limit.
+func NewTmuxPanePanelWithScrollbackLimit(tmuxID string, limit int) (*TmuxPanePanel, error) {
+	if err := scrollback.Validate(limit); err != nil {
+		return nil, err
+	}
+	panel := NewTmuxPanePanel(tmuxID)
+	panel.scrollbackLimit = limit
+	return panel, nil
+}
+
+// SetScrollbackLimit updates the viewer and any Screen already in use.
+func (p *TmuxPanePanel) SetScrollbackLimit(limit int) error {
+	if err := scrollback.Validate(limit); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.scrollbackLimit = limit
+	if p.screen != nil {
+		p.screen.SetScrollbackLimit(limit)
+	}
+	return nil
 }
 
 // View renders the captured tmux pane content.
@@ -150,7 +177,7 @@ func (p *TmuxPanePanel) startControlMode() tea.Cmd {
 
 		p.mu.Lock()
 		p.screen = portalis.NewScreen(rows, cols)
-		p.screen.SetScrollbackLimit(1000)
+		p.screen.SetScrollbackLimit(p.scrollbackLimit)
 		p.parser = portalis.NewParser(p.screen)
 		p.mu.Unlock()
 

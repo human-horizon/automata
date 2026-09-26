@@ -52,6 +52,27 @@ func TestStatusBadgeFromMap(t *testing.T) {
 	}
 }
 
+func TestSetStatusBadgeUpdatesOneSession(t *testing.T) {
+	tr := New()
+	tr.AddChat("first").AddChat("second")
+	items := tr.AllItems()
+	firstKey := tr.SessionKeyOf(items[0])
+	secondKey := tr.SessionKeyOf(items[1])
+	tr.SetStatusBadges(map[string]string{firstKey: "R", secondKey: "W"})
+
+	tr.SetStatusBadge(firstKey, "G")
+	if got := tr.StatusBadge(items[0]); got != "G" {
+		t.Fatalf("updated badge = %q, want G", got)
+	}
+	if got := tr.StatusBadge(items[1]); got != "W" {
+		t.Fatalf("unrelated badge changed to %q, want W", got)
+	}
+	tr.SetStatusBadge(firstKey, "")
+	if got := tr.StatusBadge(items[0]); got != "" {
+		t.Fatalf("removed badge = %q, want empty", got)
+	}
+}
+
 // TestStatusBadgeEmpty verifies that no badges means no emoji in render.
 func TestStatusBadgeEmpty(t *testing.T) {
 	tr := New()

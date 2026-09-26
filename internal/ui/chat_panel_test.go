@@ -285,7 +285,7 @@ func TestExternalFamiliarRemovalRetriesCleanupFailure(t *testing.T) {
 			{name: "Main", panel: &fakePanel{}},
 			{name: "expert", panel: &fakePanel{}, familiarID: "test__expert"},
 		},
-		started: true,
+		active: true,
 	}
 	registryPath := cp.familiarStatePath()
 	if err := os.WriteFile(registryPath, []byte(`[]`), 0o644); err != nil {
@@ -345,7 +345,7 @@ func TestExternalFamiliarRemovalDropsTabAfterCommittedWarning(t *testing.T) {
 			{name: "Main", panel: &fakePanel{}},
 			{name: "expert", panel: &fakePanel{}, familiarID: "test__expert"},
 		},
-		started: true,
+		active: true,
 	}
 	if err := os.WriteFile(cp.familiarStatePath(), []byte(`[]`), 0o644); err != nil {
 		t.Fatal(err)
@@ -397,6 +397,55 @@ func TestCheckFamiliarsDetectsRemoved(t *testing.T) {
 	if !removedIDs["expert"] || !removedIDs["helper"] {
 		t.Fatalf("expected both 'expert' and 'helper' removed, got %v", removedIDs)
 	}
+}
+
+func TestChatPanelDeactivateClosesWatcherAndPreservesTabs(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	cp := NewChatPanel(portalis.NewEmulator("owner", "Main", "/bin/sh", nil), "owner", "")
+	cp.sessions = append(cp.sessions, &chatSession{
+		name:       "expert",
+		panel:      &fakePanel{},
+		familiarID: "owner__expert",
+	})
+	cp.activeIdx = 1
+	cp.known["expert"] = true
+	cp.familiarSessions["expert"] = "owner__expert"
+	registryPath := cp.familiarStatePath()
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal([]FamiliarState{{ID: "expert", SessionID: "owner__expert"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cp.Activate()
+	oldWatcher := cp.familiarWatcher
+	oldGeneration := cp.familiarGeneration
+	if oldWatcher == nil {
+		t.Fatal("Activate did not create a familiar watcher")
+	}
+	cp.Deactivate()
+	if cp.active || cp.familiarWatcher != nil || cp.familiarGeneration <= oldGeneration {
+		t.Fatalf("Deactivate did not invalidate watcher: active=%v watcher=%v generation=%d", cp.active, cp.familiarWatcher, cp.familiarGeneration)
+	}
+	if cp.activeIdx != 1 || len(cp.sessions) != 2 || !cp.known["expert"] {
+		t.Fatalf("Deactivate discarded UI state: activeIdx=%d sessions=%d known=%v", cp.activeIdx, len(cp.sessions), cp.known)
+	}
+
+	cp.Update(familiarRegistryChangedMsg{generation: oldGeneration, watcher: oldWatcher, path: registryPath})
+	if len(cp.sessions) != 2 || !cp.known["expert"] {
+		t.Fatalf("stale watcher event changed familiar state: sessions=%d known=%v", len(cp.sessions), cp.known)
+	}
+
+	cp.Activate()
+	if !cp.active || cp.familiarWatcher == nil || cp.familiarWatcher == oldWatcher {
+		t.Fatalf("reactivation did not create a fresh watcher: active=%v watcher=%v", cp.active, cp.familiarWatcher)
+	}
+	cp.Close()
 }
 
 func TestFamiliarOwnershipRejectsExternalActions(t *testing.T) {
@@ -749,7 +798,7 @@ func TestHandleMouseFamiliarCloseButtonTriggersConfirm(t *testing.T) {
 		activeIdx: 0,
 		width:     60,
 		height:    5,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{},
 	}
 	// Tab layout: " Main " (6) + space (1) + " expert " (8) + " ×" (2) = 17.
@@ -776,7 +825,7 @@ func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 			{name: "expert", familiarID: "owner__f1", em: portalis.NewEmulator("owner__f1", "owner__f1", "/bin/sh", nil), panel: &fakePanel{}},
 		},
 		activeIdx: 0,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{},
 	}
 	cp.SetOnCloseFamiliar(func(id string, em *portalis.Emulator) error {
@@ -819,7 +868,7 @@ func TestConfirmYesRemovesTabAfterCommittedCleanupWarning(t *testing.T) {
 			{name: "expert", familiarID: "owner__f1", em: familiar, panel: &fakePanel{}},
 		},
 		activeIdx: 0,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{"expert": true},
 	}
 	cleanupErr := errors.New("active-state persistence failed after stop")
@@ -849,7 +898,7 @@ func TestConfirmYesKeepsTabWhenHostCleanupFails(t *testing.T) {
 			{name: "expert", familiarID: "owner__f1", em: familiar, panel: &fakePanel{}},
 		},
 		activeIdx: 0,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{"expert": true},
 	}
 	cleanupErr := errors.New("unknown PID identity")
@@ -882,7 +931,7 @@ func TestClickOutsideCloseModalCancels(t *testing.T) {
 		activeIdx: 0,
 		width:     60,
 		height:    10,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{},
 	}
 	cp.pendingCloseFamiliar = "f1"
@@ -939,7 +988,7 @@ func TestDeadFamiliarPtyExitRemovesMatchingTab(t *testing.T) {
 			{name: "expert", familiarID: "f1", em: familiarEm, panel: &fakePanel{}},
 		},
 		activeIdx: 1,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{"expert": true},
 	}
 
@@ -968,7 +1017,7 @@ func TestMainPtyExitStaysInMainTabAndRoutesToPanel(t *testing.T) {
 			{name: "expert", familiarID: "f1", em: familiarEm, panel: &fakePanel{}},
 		},
 		activeIdx: 0,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{"expert": true},
 	}
 
@@ -997,7 +1046,7 @@ func TestConfirmEscLeavesTabIntact(t *testing.T) {
 			{name: "expert", familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil), panel: &fakePanel{}},
 		},
 		activeIdx: 0,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{},
 	}
 	cp.pendingCloseFamiliar = "f1"
@@ -1025,7 +1074,7 @@ func TestConfirmNoLeavesTabIntact(t *testing.T) {
 			{name: "expert", familiarID: "f1", em: portalis.NewEmulator("f1", "f1", "/bin/sh", nil)},
 		},
 		activeIdx: 0,
-		started:   true,
+		active:    true,
 		known:     map[string]bool{},
 	}
 	cp.pendingCloseFamiliar = "f1"
