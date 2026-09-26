@@ -748,10 +748,11 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 		if session.oldID == session.newID {
 			continue
 		}
-		if _, err := paths.MigrateSessionJSONL(session.oldID, session.newID, session.cwd, agentDir); err != nil {
+		migratedJSONL, err := paths.MigrateSessionJSONL(session.oldID, session.newID, session.cwd, agentDir)
+		if err != nil {
 			return fail(fmt.Errorf("migrate session JSONL %s: %w", session.oldID, err))
 		}
-		if paths.FindSessionJSONL(session.newID, session.cwd, agentDir) != "" {
+		if migratedJSONL != "" {
 			jsonlMoves = append(jsonlMoves, renameJSONLMove{oldID: session.oldID, newID: session.newID, cwd: session.cwd})
 		}
 	}
@@ -776,10 +777,11 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 		); err != nil {
 			return fail(fmt.Errorf("move familiar session %s: %w", familiar.oldID, err))
 		}
-		if _, err := paths.MigrateSessionJSONL(familiar.oldID, familiar.newID, familiar.cwd, agentDir); err != nil {
+		migratedJSONL, err := paths.MigrateSessionJSONL(familiar.oldID, familiar.newID, familiar.cwd, agentDir)
+		if err != nil {
 			return fail(fmt.Errorf("migrate familiar JSONL %s: %w", familiar.oldID, err))
 		}
-		if paths.FindSessionJSONL(familiar.newID, familiar.cwd, agentDir) != "" {
+		if migratedJSONL != "" {
 			jsonlMoves = append(jsonlMoves, renameJSONLMove{oldID: familiar.oldID, newID: familiar.newID, cwd: familiar.cwd})
 		}
 	}
