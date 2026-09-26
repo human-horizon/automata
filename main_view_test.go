@@ -1524,7 +1524,6 @@ func TestSetupStatusWatcherAttachesPerSession(t *testing.T) {
 	for _, key := range keys {
 		app.activeSessions[key] = struct{}{}
 	}
-	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	_ = app.syncSessionWatchers()
 	t.Cleanup(func() {
@@ -1557,6 +1556,7 @@ func TestSyncSessionWatchersPrunesHidden(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
+	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	_ = app.syncSessionWatchers()
 	t.Cleanup(func() {
