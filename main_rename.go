@@ -100,14 +100,7 @@ func fullRenameSessionID(profile string, folders []string, name string) string {
 }
 
 func (a *App) renameAgentDir() string {
-	if a.piAgentDir != "" {
-		return a.piAgentDir
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		home = "/Users/a"
-	}
-	return filepath.Join(home, ".ai", "just", "pi")
+	return a.piAgentDir
 }
 
 func appendRenamePath(parts []string, name string) []string {
@@ -290,6 +283,11 @@ func checkRenamePath(oldPath, newPath, label string) error {
 
 func (a *App) prepareRenamePlan(plan *renamePlan) error {
 	agentDir := a.renameAgentDir()
+	for _, session := range plan.sessions {
+		if session.oldID != session.newID && agentDir == "" {
+			return fmt.Errorf("refuse to rename/move session %q without piAgentDir", session.oldID)
+		}
+	}
 	plan.taskMoves = nil
 	seenTaskTargets := make(map[string]struct{})
 	seenSessionTargets := make(map[string]struct{}, len(plan.sessions))
@@ -307,8 +305,14 @@ func (a *App) prepareRenamePlan(plan *renamePlan) error {
 		if err := checkRenamePath(oldDir, newDir, "session"); err != nil {
 			return err
 		}
-		oldJSONL := paths.FindSessionJSONL(session.oldID, session.cwd, agentDir)
-		newJSONL := paths.FindSessionJSONL(session.newID, session.cwd, agentDir)
+		oldJSONL, err := paths.FindSessionJSONLChecked(session.oldID, session.cwd, agentDir)
+		if err != nil {
+			return fmt.Errorf("inspect source session JSONL %s: %w", session.oldID, err)
+		}
+		newJSONL, err := paths.FindSessionJSONLChecked(session.newID, session.cwd, agentDir)
+		if err != nil {
+			return fmt.Errorf("inspect target session JSONL %s: %w", session.newID, err)
+		}
 		if newJSONL != "" && newJSONL != oldJSONL {
 			return fmt.Errorf("session JSONL target already exists: %s", newJSONL)
 		}

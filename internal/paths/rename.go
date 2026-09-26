@@ -69,8 +69,17 @@ func MigrateSessionJSONL(oldID, newID, cwd, agentDir string) (string, error) {
 	if oldID == newID {
 		return "", nil
 	}
-	oldPath := FindSessionJSONL(oldID, cwd, agentDir)
-	newPath := FindSessionJSONL(newID, cwd, agentDir)
+	if agentDir == "" {
+		return "", fmt.Errorf("agentDir is required for safe session migration")
+	}
+	oldPath, err := FindSessionJSONLChecked(oldID, cwd, agentDir)
+	if err != nil {
+		return "", fmt.Errorf("inspect source session JSONL for %q: %w", oldID, err)
+	}
+	newPath, err := FindSessionJSONLChecked(newID, cwd, agentDir)
+	if err != nil {
+		return "", fmt.Errorf("inspect target session JSONL for %q: %w", newID, err)
+	}
 	if newPath != "" && newPath != oldPath {
 		return "", fmt.Errorf("target session JSONL already exists for %q", newID)
 	}

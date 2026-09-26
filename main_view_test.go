@@ -1718,6 +1718,7 @@ func TestStatusWatcherRecoveryRecreatesOneSharedWatcher(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	cmds := app.syncSessionWatchers()
 	oldWatcher := app.statusWatcher
@@ -1779,7 +1780,8 @@ func TestTreeStatusChangedMsgTriggersRefresh(t *testing.T) {
 		t.Fatalf("write status: %v", err)
 	}
 
-	// Mount the shared watcher and session directory index.
+	// Mount the shared watcher and active session directory index.
+	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	app.syncSessionWatchers()
 	t.Cleanup(func() { app.Close() })
@@ -1821,7 +1823,9 @@ func TestSyncSessionWatchersReturnsCmdsOnlyForNewWatchers(t *testing.T) {
 		if it.IsFolder || it.IsTerminal {
 			continue
 		}
-		dir := filepath.Join(app.sessionBaseDir(), app.tree.SessionKeyOf(it))
+		key := app.tree.SessionKeyOf(it)
+		app.activeSessions[key] = struct{}{}
+		dir := filepath.Join(app.sessionBaseDir(), key)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
@@ -1889,10 +1893,14 @@ func TestStatusWatcherUpdatesOnlyChangedBadgeAndFiltersFiles(t *testing.T) {
 		keys[item.Name] = key
 	}
 	app.recomputeTreeStatusBadges()
+	app.activeSessions[keys["agent"]] = struct{}{}
 	app.setupStatusWatcher()
 	cmds := app.syncSessionWatchers()
-	if len(cmds) != 1 || app.sessionWatchers[keys["agent"]] != app.statusWatcher || app.sessionWatchers[keys["second"]] != app.statusWatcher {
-		t.Fatal("visible session directories do not share exactly one watcher command")
+	if len(cmds) != 1 || app.sessionWatchers[keys["agent"]] != app.statusWatcher {
+		t.Fatal("active session directory did not mount on the shared watcher")
+	}
+	if _, watched := app.sessionWatchers[keys["second"]]; watched {
+		t.Fatal("inactive session unexpectedly consumed a status watch")
 	}
 	t.Cleanup(func() { app.Close() })
 
@@ -1941,10 +1949,11 @@ func TestStatusWatcherUpdatesOnlyChangedBadgeAndFiltersFiles(t *testing.T) {
 	}
 }
 
-func TestStatusWatcherDiscoversCreatedSessionDirectory(t *testing.T) {
+func TestStatusWatcherMountsActiveSessionDirectory(t *testing.T) {
 	app := newTestApp(t, "test")
 	item := app.tree.AllItems()[0]
 	key := app.tree.SessionKeyOf(item)
+	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	cmds := app.syncSessionWatchers()
 	if len(cmds) != 1 {
@@ -1953,25 +1962,23 @@ func TestStatusWatcherDiscoversCreatedSessionDirectory(t *testing.T) {
 	t.Cleanup(func() { app.Close() })
 
 	dir := filepath.Join(app.sessionBaseDir(), key)
+	if app.sessionWatchers[key] != app.statusWatcher {
+		t.Fatal("active session directory was not attached to the shared watcher")
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		t.Fatalf("active session directory was not materialized: %v", err)
+	}
+
 	msg := waitForWatcherMessage(t, cmds[0], func() error {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
 		return os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"action":"grep"}`), 0o644)
 	})
-	rootEvent, ok := msg.(treeStatusChangedMsg)
+	event, ok := msg.(treeStatusChangedMsg)
 	if !ok {
-		t.Fatalf("root event message = %T, want treeStatusChangedMsg", msg)
+		t.Fatalf("status event message = %T, want treeStatusChangedMsg", msg)
 	}
-	_, nextReader := app.Update(rootEvent)
-	if nextReader == nil {
-		t.Fatal("root event did not re-arm the watcher")
-	}
-	if app.sessionWatchers[key] != app.statusWatcher {
-		t.Fatal("new session directory was not attached to the shared watcher")
-	}
+	_, _ = app.Update(event)
 	if got := app.tree.StatusBadge(item); got != "G" {
-		t.Fatalf("new session badge = %q, want G", got)
+		t.Fatalf("active session badge = %q, want G", got)
 	}
 }
 
@@ -1990,6 +1997,7 @@ func TestSharedStatusWatcherReceivesSessionEvents(t *testing.T) {
 		t.Fatalf("write status: %v", err)
 	}
 
+	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	watchCmds := app.syncSessionWatchers()
 	if len(watchCmds) == 0 {
@@ -2021,6 +2029,7 @@ func TestSharedStatusWatcherRearmsAfterEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	cmds := app.syncSessionWatchers()
 	if len(cmds) != 1 {
@@ -2047,6 +2056,25 @@ func TestSharedStatusWatcherRearmsAfterEvent(t *testing.T) {
 	_, nextReader := app.Update(secondEvent)
 	if nextReader == nil {
 		t.Fatal("second event did not re-arm the sole watcher")
+	}
+}
+
+func TestStatusWatcherTracksOnlyActiveChats(t *testing.T) {
+	app := newTestApp(t, "active-watch-scope")
+	for i := 0; i < 20; i++ {
+		app.tree.AddChat(fmt.Sprintf("inactive-%d", i))
+	}
+	active := app.tree.SessionKeyOf(app.tree.AllItems()[0])
+	app.activeSessions[active] = struct{}{}
+	app.setupStatusWatcher()
+	_ = app.syncSessionWatchers()
+	defer app.Close()
+
+	if len(app.sessionWatchers) != 1 {
+		t.Fatalf("status watch count = %d, want 1 active chat", len(app.sessionWatchers))
+	}
+	if app.sessionWatchers[active] != app.statusWatcher {
+		t.Fatal("active chat is not mounted on the shared watcher")
 	}
 }
 

@@ -470,6 +470,44 @@ func TestKnowledgePanelUsesExplicitCanonicalDomainForTasks(t *testing.T) {
 	}
 }
 
+func TestKnowledgePanelCurrentTaskRefreshIsEventDriven(t *testing.T) {
+	profile := "Task Refresh"
+	sessionID := "task-refresh__chat"
+	domain := "task-refresh-domain"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	dir := kanban.KanbanDir(domain, profile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "task.md")
+	write := func(status string) {
+		contents := "---\ntitle: Target task\nstatus: " + status + "\nassigned_to: " + sessionID + "\n---\n"
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("progress")
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile(profile)
+	k.SetSession(sessionID)
+	k.SetDomain(domain)
+	k.Activate()
+	if k.currentTask != "Target task" {
+		t.Fatalf("initial current task = %q", k.currentTask)
+	}
+	if k.kanbanWatcher == nil {
+		t.Fatal("active Knowledge panel did not attach a Kanban watcher")
+	}
+
+	write("done")
+	k.refreshCurrentTask()
+	if k.currentTask != "" {
+		t.Fatalf("current task stayed stale after immediate task update: %q", k.currentTask)
+	}
+}
+
 // TestKnowledgePanelEmpty ensures an uninitialised panel renders without crashing.
 func TestKnowledgePanelEmpty(t *testing.T) {
 	k := NewKnowledgePanel()

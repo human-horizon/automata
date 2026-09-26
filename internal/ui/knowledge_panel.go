@@ -49,6 +49,17 @@ type jobsWatcherErrorMsg struct {
 	err        error
 }
 
+type knowledgeKanbanChangedMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+}
+
+type knowledgeKanbanWatcherErrorMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+	err        error
+}
+
 // sessionDataPath returns the per-session directory that owns status.json,
 // plans.json, settings.json and the jobs/ subdirectory. Notes live one level
 // up under the domain directory, so they have their own watcher set up by
@@ -106,16 +117,23 @@ type KnowledgePanel struct {
 	jobsWatcher     *fsnotify.Watcher
 	jobsWatcherPath string
 
+	// kanbanWatcher keeps the current-task label synchronized with external
+	// task-file changes while this chat's Knowledge panel is visible.
+	kanbanWatcher     *fsnotify.Watcher
+	kanbanWatcherPath string
+
 	// active gates filesystem resources while the panel is hidden.
 	active bool
 
 	// Independent generations bind each blocking reader to its watcher.
 	knowledgeGeneration uint64
 	jobsGeneration      uint64
+	kanbanGeneration    uint64
 
 	// Pending flags guarantee at most one blocking reader per watcher.
 	knowledgeWatchPending bool
 	jobsWatchPending      bool
+	kanbanWatchPending    bool
 }
 
 // NewKnowledgePanel creates an empty panel; data loads on the first Refresh.
@@ -160,10 +178,14 @@ func (k *KnowledgePanel) SetDomain(domain string) {
 	if k.domain == domain {
 		return
 	}
+	k.resetKanbanWatcher()
 	k.domain = domain
 	k.currentTask = ""
 	k.lastTaskRefresh = time.Time{}
 	k.refreshCurrentTask()
+	if k.active {
+		k.attachKanbanWatcherIfMissing()
+	}
 }
 
 // SetSession switches the panel to a different session. Forces a refresh on
@@ -192,6 +214,7 @@ func (k *KnowledgePanel) SetSession(sessionID string) {
 func (k *KnowledgePanel) closeWatchers() {
 	k.knowledgeGeneration++
 	k.jobsGeneration++
+	k.kanbanGeneration++
 	if k.knowledgeWatcher != nil {
 		_ = k.knowledgeWatcher.Close()
 		k.knowledgeWatcher = nil
@@ -200,10 +223,16 @@ func (k *KnowledgePanel) closeWatchers() {
 		_ = k.jobsWatcher.Close()
 		k.jobsWatcher = nil
 	}
+	if k.kanbanWatcher != nil {
+		_ = k.kanbanWatcher.Close()
+		k.kanbanWatcher = nil
+	}
 	k.knowledgeWatcherPath = ""
 	k.jobsWatcherPath = ""
+	k.kanbanWatcherPath = ""
 	k.knowledgeWatchPending = false
 	k.jobsWatchPending = false
+	k.kanbanWatchPending = false
 }
 
 // Activate refreshes the panel and starts its filesystem watchers.
@@ -212,6 +241,7 @@ func (k *KnowledgePanel) Activate() tea.Cmd {
 		k.active = true
 		k.knowledgeGeneration++
 		k.jobsGeneration++
+		k.kanbanGeneration++
 		k.setupWatchers()
 		k.refreshKnowledgeData()
 	}
@@ -220,7 +250,7 @@ func (k *KnowledgePanel) Activate() tea.Cmd {
 
 // Deactivate releases watchers without clearing the panel's UI state.
 func (k *KnowledgePanel) Deactivate() {
-	if !k.active && k.knowledgeWatcher == nil && k.jobsWatcher == nil {
+	if !k.active && k.knowledgeWatcher == nil && k.jobsWatcher == nil && k.kanbanWatcher == nil {
 		return
 	}
 	k.active = false
@@ -242,6 +272,7 @@ func (k *KnowledgePanel) setupWatchers() {
 	}
 	k.attachKnowledgeWatcherIfMissing()
 	k.attachJobsWatcherIfMissing()
+	k.attachKanbanWatcherIfMissing()
 }
 
 // attachKnowledgeWatcherIfMissing watches the session directory directly, or
@@ -511,6 +542,22 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 			k.attachJobsWatcherIfMissing()
 			k.refreshJobsData()
 		}
+	case knowledgeKanbanChangedMsg:
+		if k.isCurrentKanbanWatcher(msg.generation, msg.watcher) {
+			k.kanbanWatchPending = false
+			k.attachKanbanWatcherIfMissing()
+			k.refreshCurrentTask()
+		}
+	case knowledgeKanbanWatcherErrorMsg:
+		if k.isCurrentKanbanWatcher(msg.generation, msg.watcher) {
+			k.kanbanWatchPending = false
+			if msg.err != nil {
+				log.Printf("automata: knowledge Kanban watcher failed: %v", msg.err)
+			}
+			k.resetKanbanWatcher()
+			k.attachKanbanWatcherIfMissing()
+			k.refreshCurrentTask()
+		}
 	}
 
 	return tea.Batch(baseCmd, k.armWatchers())
@@ -533,6 +580,12 @@ func (k *KnowledgePanel) armWatchers() tea.Cmd {
 			cmds = append(cmds, cmd)
 		}
 	}
+	if k.kanbanWatcher != nil && !k.kanbanWatchPending {
+		k.kanbanWatchPending = true
+		if cmd := k.watchKanbanCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -542,6 +595,10 @@ func (k *KnowledgePanel) isCurrentKnowledgeWatcher(generation uint64, watcher *f
 
 func (k *KnowledgePanel) isCurrentJobsWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
 	return k.active && watcher != nil && watcher == k.jobsWatcher && generation == k.jobsGeneration
+}
+
+func (k *KnowledgePanel) isCurrentKanbanWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
+	return k.active && watcher != nil && watcher == k.kanbanWatcher && generation == k.kanbanGeneration
 }
 
 // attachJobsWatcherIfMissing ensures the per-session jobs/ subdirectory has
@@ -567,6 +624,16 @@ func (k *KnowledgePanel) resetJobsWatcher() {
 	k.jobsWatcherPath = ""
 }
 
+func (k *KnowledgePanel) resetKanbanWatcher() {
+	k.kanbanGeneration++
+	k.kanbanWatchPending = false
+	if k.kanbanWatcher != nil {
+		_ = k.kanbanWatcher.Close()
+		k.kanbanWatcher = nil
+	}
+	k.kanbanWatcherPath = ""
+}
+
 func (k *KnowledgePanel) refreshKnowledgeData() {
 	k.contextReader.Invalidate(k.profile, k.sessionID)
 	// The session-level watcher fires both for data changes and for creation
@@ -574,6 +641,7 @@ func (k *KnowledgePanel) refreshKnowledgeData() {
 	// after either kind of event.
 	k.attachKnowledgeWatcherIfMissing()
 	k.attachJobsWatcherIfMissing()
+	k.attachKanbanWatcherIfMissing()
 	data, contextErr := k.contextReader.ReadForProfile(k.profile, k.sessionID)
 	if data != nil {
 		k.data = data
@@ -640,6 +708,34 @@ func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
 	k.jobsWatcherPath = watchPath
 }
 
+func (k *KnowledgePanel) attachKanbanWatcherIfMissing() {
+	if !k.active || k.domain == "" {
+		return
+	}
+	kanbanDir := kanban.KanbanDir(k.domain, k.profile)
+	watchPath := kanbanDir
+	if info, err := os.Stat(kanbanDir); err != nil || !info.IsDir() {
+		watchPath = filepath.Dir(kanbanDir)
+		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+			return
+		}
+	}
+	if k.kanbanWatcher != nil && k.kanbanWatcherPath == watchPath {
+		return
+	}
+	k.resetKanbanWatcher()
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return
+	}
+	if err := w.Add(watchPath); err != nil {
+		_ = w.Close()
+		return
+	}
+	k.kanbanWatcher = w
+	k.kanbanWatcherPath = watchPath
+}
+
 // watchKnowledgeCmd blocks on the session-level fsnotify watcher and
 // returns a single knowledgeChangedMsg when an event arrives.
 func (k *KnowledgePanel) watchKnowledgeCmd() tea.Cmd {
@@ -688,9 +784,32 @@ func (k *KnowledgePanel) watchJobsCmd() tea.Cmd {
 	}
 }
 
+func (k *KnowledgePanel) watchKanbanCmd() tea.Cmd {
+	if k.kanbanWatcher == nil {
+		return nil
+	}
+	w := k.kanbanWatcher
+	generation := k.kanbanGeneration
+	return func() tea.Msg {
+		select {
+		case _, ok := <-w.Events:
+			if !ok {
+				return knowledgeKanbanWatcherErrorMsg{generation: generation, watcher: w}
+			}
+			return knowledgeKanbanChangedMsg{generation: generation, watcher: w}
+		case err, ok := <-w.Errors:
+			if !ok {
+				return knowledgeKanbanWatcherErrorMsg{generation: generation, watcher: w}
+			}
+			return knowledgeKanbanWatcherErrorMsg{generation: generation, watcher: w, err: err}
+		}
+	}
+}
+
 // refreshCurrentTask reads kanban tasks and finds the one in progress for this session.
 func (k *KnowledgePanel) refreshCurrentTask() {
-	if k.sessionID == "" || time.Since(k.lastTaskRefresh) < 2*time.Second {
+	if k.sessionID == "" {
+		k.currentTask = ""
 		return
 	}
 	k.lastTaskRefresh = time.Now()

@@ -1599,6 +1599,7 @@ func writeTaskRemovedFromChat(profile, sessionID, taskTitle string) error {
 	}
 	status["action"] = "task_removed"
 	status["task_title"] = taskTitle
+	delete(status, "task_path")
 	status["substatus"] = ""
 	status["updatedAt"] = time.Now().Format(time.RFC3339)
 

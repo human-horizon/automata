@@ -114,6 +114,37 @@ func TestReadFamiliarsRejectsUnownedOrUnsafeSessionIDs(t *testing.T) {
 	}
 }
 
+func TestMigrateSessionJSONLRequiresExplicitAgentDir(t *testing.T) {
+	if _, err := MigrateSessionJSONL("old", "new", "/work", ""); err == nil {
+		t.Fatal("empty agentDir was accepted for destructive session migration")
+	}
+}
+
+func TestMigrateSessionJSONLRejectsMalformedSourceHeader(t *testing.T) {
+	home := t.TempDir()
+	agentDir := filepath.Join(home, ".ai", "just", "pi")
+	cwd := "/work"
+	dir := filepath.Join(agentDir, "sessions", EncodeCwdDir(cwd))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "broken.jsonl")
+	original := []byte("not-json\nmessage\n")
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MigrateSessionJSONL("old", "new", cwd, agentDir); err == nil {
+		t.Fatal("malformed source JSONL was treated as missing")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("malformed source changed: %q", got)
+	}
+}
+
 func TestRewriteFamiliarSessionIDsRejectsMalformedChildBeforeWrite(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	const (

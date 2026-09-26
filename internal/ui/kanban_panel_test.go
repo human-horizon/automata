@@ -718,6 +718,9 @@ func TestTaskStatusWritesUseExplicitProfilePath(t *testing.T) {
 	if !strings.Contains(string(data), `"action": "task_removed"`) {
 		t.Fatalf("removed status = %s", data)
 	}
+	if strings.Contains(string(data), `"task_path"`) {
+		t.Fatalf("removed status retained stale task_path: %s", data)
+	}
 }
 
 func TestKanbanPanelLateAttachesWatcherWhenDirectoryAppears(t *testing.T) {

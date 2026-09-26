@@ -282,8 +282,13 @@ func newApp(profile, piAgentDir string) (a *App) {
 			stopFamiliars:   true,
 			persistInactive: true,
 		}); err != nil {
-			log.Printf("automata: stop session %s: %v", sessionID, err)
+			warning := fmt.Errorf("stop session %s: %w", sessionID, err)
+			log.Printf("automata: %v", warning)
+			if a.tree != nil {
+				a.tree.RecordActionWarning(warning)
+			}
 		}
+		a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.syncSessionWatchers()...)
 	})
 
 	pendingDeleteCleanup := make(map[*tree.Item]*preparedDeleteRuntime)
@@ -570,14 +575,6 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 			a.sessionWatchPending[key] = false
 		}
 		changedPath := filepath.Clean(msg.path)
-		baseDir := filepath.Clean(a.sessionBaseDir())
-		if filepath.Dir(changedPath) == baseDir {
-			cmds := a.syncSessionWatchers()
-			if a.statusSetChanged {
-				a.recomputeTreeStatusBadges()
-			}
-			return a, tea.Batch(cmds...)
-		}
 		if sessionID, ok := a.statusSessionDirs[filepath.Dir(changedPath)]; ok {
 			name := filepath.Base(changedPath)
 			if name == "status.json" {
@@ -860,6 +857,7 @@ func (a *App) startAssignedTaskSession(sessionID string) (tea.Cmd, error) {
 		a.activeSessions = make(map[string]struct{})
 	}
 	a.activeSessions[sessionID] = struct{}{}
+	a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.syncSessionWatchers()...)
 	if err := a.persistRuntimeActiveSessions(); err != nil {
 		log.Printf("automata: persist assigned task session %q: %v", sessionID, err)
 		return em.Listen(), &ui.CommittedActionError{Err: fmt.Errorf("persist assigned task session: %w", err)}
@@ -924,7 +922,8 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 			if err := a.stopSessionRuntime(sessionID, stopSessionOptions{persistInactive: true}); err != nil {
 				log.Printf("automata: persist exited session %q: %v", sessionID, err)
 			}
-			// Let the active ChatPanel remove the dead tab and keep polling.
+			a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.syncSessionWatchers()...)
+			// Let the active ChatPanel remove the dead tab and reconcile its registry.
 			return nil, false
 		}
 	}
@@ -959,6 +958,7 @@ func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 				log.Printf("automata: persist active session %q: %v", sessionID, err)
 			}
 		}
+		a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.syncSessionWatchers()...)
 	}
 	return em.Update(msg), true
 }
@@ -979,10 +979,17 @@ func ptyMessageSessionID(msg tea.Msg) (string, bool) {
 }
 
 func (a *App) startEmulatorSync(em *portalis.Emulator, env []string) error {
+	var err error
 	if a.startEmulatorSyncFn != nil {
-		return a.startEmulatorSyncFn(em, env)
+		err = a.startEmulatorSyncFn(em, env)
+	} else {
+		err = em.StartSync(env)
 	}
-	return em.StartSync(env)
+	if err != nil {
+		return err
+	}
+	em.SetScrollbackLimit(a.scrollbackLines)
+	return nil
 }
 
 type clearSessionErrorMsg struct {
@@ -1163,7 +1170,10 @@ func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 	if em != nil {
 		em.Stop()
 		cwd := em.CWD()
-		if paths.FindSessionJSONL(familiarID, cwd, a.piAgentDir) != "" {
+		historyPath, findErr := paths.FindSessionJSONLChecked(familiarID, cwd, a.piAgentDir)
+		if findErr != nil {
+			cleanupFailures = append(cleanupFailures, fmt.Errorf("inspect familiar JSONL %q: %w", familiarID, findErr))
+		} else if historyPath != "" {
 			if _, err := paths.DeleteSessionJSONL(familiarID, cwd, a.piAgentDir); err != nil {
 				cleanupFailures = append(cleanupFailures, fmt.Errorf("delete familiar JSONL %q: %w", familiarID, err))
 			}
@@ -1221,8 +1231,9 @@ type treeMetadataSaveMsg struct {
 
 const metadataSaveDelay = 250 * time.Millisecond
 
-// setupStatusWatcher creates one watcher for the sessions root. Session
-// directories are added to the same fsnotify object by syncSessionWatchers.
+// setupStatusWatcher creates one shared watcher object. Only currently active
+// chat directories are added by syncSessionWatchers; the sessions root itself
+// is deliberately not watched because kqueue opens descriptors for every entry.
 func (a *App) setupStatusWatcher() {
 	a.resetStatusWatcher()
 	base := a.sessionBaseDir()
@@ -1233,11 +1244,6 @@ func (a *App) setupStatusWatcher() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Printf("automata: cannot create status watcher: %v", err)
-		return
-	}
-	if err := watcher.Add(base); err != nil {
-		log.Printf("automata: cannot watch %s: %v", base, err)
-		_ = watcher.Close()
 		return
 	}
 	a.statusWatcher = watcher
@@ -1279,17 +1285,14 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 	}
 
 	desired := make(map[string]string)
-	for _, item := range a.tree.AllItems() {
+	for key := range a.activeSessions {
+		item := a.tree.FindItemBySessionID(key)
 		if item == nil || item.IsFolder || item.IsTerminal {
 			continue
 		}
-		key := a.tree.SessionKeyOf(item)
-		if key == "" {
-			continue
-		}
 		dir := paths.SessionDir(a.profile, key)
-		info, err := os.Stat(dir)
-		if err != nil || !info.IsDir() {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Printf("automata: cannot create active session directory %s: %v", key, err)
 			continue
 		}
 		desired[key] = filepath.Clean(dir)
