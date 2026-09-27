@@ -6,7 +6,6 @@ import (
 
 	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/Starframe/portalis"
-	"github.com/fsnotify/fsnotify"
 )
 
 func TestStopSessionRuntimeClearsOwnerAndFamiliarState(t *testing.T) {
