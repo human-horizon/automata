@@ -1484,6 +1484,29 @@ func TestRecomputeTreeStatusBadgesReadsAction(t *testing.T) {
 	}
 }
 
+func TestRecomputeTreeStatusBadgesShowsCorruptStatusWarning(t *testing.T) {
+	app := newTestApp(t, "test")
+	item := app.tree.AllItems()[0]
+	key := app.tree.SessionKeyOf(item)
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte("not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app.activeSessions[key] = struct{}{}
+
+	app.recomputeTreeStatusBadges()
+
+	if got := app.tree.StatusBadge(item); got != "?" {
+		t.Fatalf("corrupt status badge = %q, want ?", got)
+	}
+	if warning := app.tree.LastActionError(); warning == nil || !strings.Contains(warning.Error(), "decode status") {
+		t.Fatalf("corrupt status warning = %v, want decode diagnostic", warning)
+	}
+}
+
 func TestRecomputeTreeStatusBadgesIgnoresInactiveStaleStatus(t *testing.T) {
 	app := newTestApp(t, "test")
 	item := app.tree.AllItems()[0]

@@ -565,7 +565,7 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 			name := filepath.Base(changedPath)
 			if name == "status.json" {
 				a.statusReader.Invalidate(sessionID)
-				a.tree.SetStatusBadge(sessionID, status.Emoji(a.statusReader.Read(sessionID)))
+				a.refreshStatusBadge(sessionID)
 			}
 		}
 		return a, a.watchTreeStatusCmd()
@@ -1316,13 +1316,26 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 		a.statusSessionDirs[dir] = key
 		// status.json may have been written before this watch was attached.
 		a.statusReader.Invalidate(key)
-		a.tree.SetStatusBadge(key, status.Emoji(a.statusReader.Read(key)))
+		a.refreshStatusBadge(key)
 	}
 
 	if cmd := a.watchTreeStatusCmd(); cmd != nil {
 		return []tea.Cmd{cmd}
 	}
 	return nil
+}
+
+func (a *App) refreshStatusBadge(sessionID string) {
+	if a.tree == nil || a.statusReader == nil || sessionID == "" {
+		return
+	}
+	action, err := a.statusReader.Read(sessionID)
+	if err != nil {
+		a.recordInfrastructureWarning(fmt.Errorf("read status for %s: %w", sessionID, err))
+		a.tree.SetStatusBadge(sessionID, "?")
+		return
+	}
+	a.tree.SetStatusBadge(sessionID, status.Emoji(action))
 }
 
 func (a *App) statusSessionDirsByID() map[string]string {
@@ -1437,7 +1450,12 @@ func (a *App) recomputeTreeStatusBadges() {
 		if item == nil || item.IsFolder || item.IsTerminal {
 			continue
 		}
-		action := a.statusReader.Read(key)
+		action, err := a.statusReader.Read(key)
+		if err != nil {
+			a.recordInfrastructureWarning(fmt.Errorf("read status for %s: %w", key, err))
+			badges[key] = "?"
+			continue
+		}
 		if badge := status.Emoji(action); badge != "" {
 			badges[key] = badge
 		}

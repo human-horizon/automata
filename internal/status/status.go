@@ -5,6 +5,7 @@ package status
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -61,58 +62,56 @@ func (r *CachedReader) Invalidate(sessionID string) {
 	r.mu.Unlock()
 }
 
-func (r *CachedReader) Read(sessionID string) string {
+func (r *CachedReader) Read(sessionID string) (string, error) {
 	if sessionID == "" {
-		return ""
+		return "", nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	path := statusPath(r.profile, sessionID)
-
-	// Check mtime cache
 	fi, err := os.Stat(path)
 	if err != nil {
-		// File doesn't exist or can't be read — cache empty result
-		r.cache.Add(sessionID, cachedEntry{value: "", mtime: time.Time{}})
-		return ""
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("stat status %s: %w", path, err)
 	}
 	if entry, ok := r.cache.Get(sessionID); ok && entry.info != nil &&
 		entry.mtime.Equal(fi.ModTime()) && entry.size == fi.Size() && os.SameFile(entry.info, fi) {
-		return entry.value
+		return entry.value, nil
 	}
 
-	// Read file
 	data, err := os.ReadFile(path)
 	if err != nil {
-		r.cache.Add(sessionID, cachedEntry{value: "", mtime: fi.ModTime(), size: fi.Size(), info: fi})
-		return ""
+		return "", fmt.Errorf("read status %s: %w", path, err)
 	}
 	var rec Record
 	if err := json.Unmarshal(data, &rec); err != nil {
-		r.cache.Add(sessionID, cachedEntry{value: "", mtime: fi.ModTime(), size: fi.Size(), info: fi})
-		return ""
+		return "", fmt.Errorf("decode status %s: %w", path, err)
 	}
 	r.cache.Add(sessionID, cachedEntry{value: rec.Action, mtime: fi.ModTime(), size: fi.Size(), info: fi})
-	return rec.Action
+	return rec.Action, nil
 }
 
-// Read is a convenience function that creates a one-shot reader without caching.
-// Use CachedReader for repeated reads.
-func Read(profile, sessionID string) string {
+// Read returns the action from one status file without caching.
+func Read(profile, sessionID string) (string, error) {
 	if sessionID == "" {
-		return ""
+		return "", nil
 	}
 	path := statusPath(profile, sessionID)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read status %s: %w", path, err)
 	}
 	var rec Record
 	if err := json.Unmarshal(data, &rec); err != nil {
-		return ""
+		return "", fmt.Errorf("decode status %s: %w", path, err)
 	}
-	return rec.Action
+	return rec.Action, nil
 }
 
 // Emoji returns the single-glyph indicator for a status action, or "" when

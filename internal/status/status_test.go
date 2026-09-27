@@ -113,11 +113,19 @@ func TestReadUsesCanonicalSessionPaths(t *testing.T) {
 				}
 			}
 
-			if got := Read(test.profile, test.session); got != test.action {
+			got, err := Read(test.profile, test.session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.action {
 				t.Fatalf("Read = %q, want %q", got, test.action)
 			}
 			reader := NewCachedReader(test.profile)
-			if got := reader.Read(test.session); got != test.action {
+			got, err = reader.Read(test.session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.action {
 				t.Fatalf("CachedReader.Read = %q, want %q", got, test.action)
 			}
 		})
@@ -152,7 +160,11 @@ func TestCachedReaderNoticesSameMtimeReplacement(t *testing.T) {
 	}
 
 	reader := NewCachedReader("")
-	if got := reader.Read(sessionID); got != "old" {
+	got, err := reader.Read(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "old" {
 		t.Fatalf("initial status = %q, want old", got)
 	}
 	oldInfo, err := os.Stat(statusPath)
@@ -179,7 +191,11 @@ func TestCachedReaderNoticesSameMtimeReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := reader.Read(sessionID); got != "new" {
+	got, err = reader.Read(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "new" {
 		t.Fatalf("status after same-mtime replacement = %q, want new", got)
 	}
 }
@@ -201,7 +217,11 @@ func TestCachedReaderInvalidateForcesRefresh(t *testing.T) {
 	}
 
 	reader := NewCachedReader("")
-	if got := reader.Read(sessionID); got != "old" {
+	got, err := reader.Read(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "old" {
 		t.Fatalf("initial status = %q, want old", got)
 	}
 	if err := os.WriteFile(statusPath, []byte(`{"action":"new"}`), 0o644); err != nil {
@@ -210,12 +230,20 @@ func TestCachedReaderInvalidateForcesRefresh(t *testing.T) {
 	if err := os.Chtimes(statusPath, mtime, mtime); err != nil {
 		t.Fatal(err)
 	}
-	if got := reader.Read(sessionID); got != "old" {
+	got, err = reader.Read(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "old" {
 		t.Fatalf("cached same-signature status = %q, want stale old before invalidation", got)
 	}
 
 	reader.Invalidate(sessionID)
-	if got := reader.Read(sessionID); got != "new" {
+	got, err = reader.Read(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "new" {
 		t.Fatalf("invalidated status = %q, want new", got)
 	}
 }
@@ -224,7 +252,9 @@ func TestCachedReaderBoundsSessionEntries(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	reader := NewCachedReader("")
 	for index := range statusCacheCapacity + 100 {
-		reader.Read(fmt.Sprintf("status-session-%d", index))
+		if _, err := reader.Read(fmt.Sprintf("status-session-%d", index)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if got := reader.cache.Len(); got > statusCacheCapacity {
 		t.Fatalf("status cache entries = %d, exceeds capacity %d", got, statusCacheCapacity)
@@ -252,7 +282,7 @@ func TestCachedReaderConcurrentReadAndInvalidate(t *testing.T) {
 				if (worker+iteration)%2 == 0 {
 					reader.Invalidate(sessionID)
 				}
-				reader.Read(sessionID)
+				_, _ = reader.Read(sessionID)
 			}
 		}(worker)
 	}
@@ -260,13 +290,21 @@ func TestCachedReaderConcurrentReadAndInvalidate(t *testing.T) {
 }
 
 func TestReadMissingFile(t *testing.T) {
-	if got := Read("nope", "nosession"); got != "" {
+	got, err := Read("nope", "nosession")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
 		t.Errorf("expected empty for missing file, got %q", got)
 	}
 }
 
 func TestReadEmptySessionID(t *testing.T) {
-	if got := Read("profile", ""); got != "" {
+	got, err := Read("profile", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
 		t.Errorf("expected empty for empty sessionID, got %q", got)
 	}
 }
@@ -284,8 +322,31 @@ func TestReadActionFromFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"action":"read"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := Read(profile, sid); got != "read" {
+	got, err := Read(profile, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "read" {
 		t.Errorf("Read = %q, want read", got)
+	}
+}
+
+func TestCachedReaderReportsBadJSON(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "cached-broken"
+	dir := paths.SessionDir("", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte("not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reader := NewCachedReader("")
+	if _, err := reader.Read(sessionID); err == nil {
+		t.Fatal("cached reader silently treated bad JSON as empty status")
+	}
+	if got := reader.cache.Len(); got != 0 {
+		t.Fatalf("bad status was cached as a normal value: cache entries=%d", got)
 	}
 }
 
@@ -301,7 +362,7 @@ func TestReadBadJSON(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`not json`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := Read("default", sid); got != "" {
-		t.Errorf("expected empty for bad json, got %q", got)
+	if _, err := Read("default", sid); err == nil {
+		t.Fatal("bad JSON was silently treated as empty status")
 	}
 }
