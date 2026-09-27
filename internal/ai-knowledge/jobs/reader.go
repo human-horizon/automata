@@ -648,7 +648,6 @@ func readJSON(path string, v any) error {
 type CachedReader struct {
 	mu            sync.Mutex
 	cache         *cache.LRU[string, cachedJobsEntry]
-	listFn        func(string) ([]Job, error)
 	listProfileFn func(string, string) ([]Job, error)
 }
 
@@ -660,7 +659,6 @@ type cachedJobsEntry struct {
 func NewCachedReader() *CachedReader {
 	return &CachedReader{
 		cache:         cache.NewLRU[string, cachedJobsEntry](cache.ReaderCacheCapacity),
-		listFn:        List,
 		listProfileFn: ListForProfile,
 	}
 }
@@ -668,7 +666,6 @@ func NewCachedReader() *CachedReader {
 func newCachedReader(listFn func(string) ([]Job, error)) *CachedReader {
 	return &CachedReader{
 		cache:         cache.NewLRU[string, cachedJobsEntry](cache.ReaderCacheCapacity),
-		listFn:        listFn,
 		listProfileFn: func(_ string, sessionID string) ([]Job, error) { return listFn(sessionID) },
 	}
 }
@@ -730,11 +727,7 @@ func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) 
 	}
 	r.cache.Delete(cacheKey)
 
-	listFn := r.listProfileFn
-	if listFn == nil {
-		listFn = func(_ string, id string) ([]Job, error) { return r.listFn(id) }
-	}
-	jobs, err := listFn(profile, sessionID)
+	jobs, err := r.listProfileFn(profile, sessionID)
 	if err != nil {
 		return jobs, err
 	}
