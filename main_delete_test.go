@@ -14,7 +14,6 @@ import (
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/Starframe/portalis"
-	"github.com/fsnotify/fsnotify"
 )
 
 func TestNewAppLogsInvalidTreeSnapshotAndBlocksOverwrite(t *testing.T) {
@@ -150,7 +149,7 @@ func TestCleanupDeletedTreeItemStopsRuntimeAndRemovesGhostState(t *testing.T) {
 		activeSessions:        map[string]struct{}{sessionID: {}, familiarID: {}},
 		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "Chat", "", nil)},
 		familiarEmulatorCache: map[string]*portalis.Emulator{familiarID: portalis.NewEmulator(familiarID, "Expert", "", nil)},
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 	}
 
 	if err := app.cleanupDeletedTreeItem(folder); err != nil {
