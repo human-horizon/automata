@@ -68,7 +68,7 @@ func sessionDataPath(profile, sessionID string) string {
 }
 
 // KnowledgePanel renders ai-knowledge data for a single session. Filesystem
-// watchers keep its data synchronized without periodic polling.
+// watchers keep its data synchronized from filesystem events.
 type KnowledgePanel struct {
 	profile   string
 	sessionID string
@@ -264,7 +264,7 @@ func (k *KnowledgePanel) Close() {
 // setupWatchers attaches fsnotify watchers to the session directory (for
 // status/plans/settings) and to the jobs/ subdirectory. Missing directories
 // are watched through their nearest existing parent, so creation is handled
-// by an event instead of a polling tick.
+// by a filesystem event.
 func (k *KnowledgePanel) setupWatchers() {
 	if !k.active || k.sessionID == "" {
 		return
@@ -621,7 +621,7 @@ func (k *KnowledgePanel) resetKanbanWatcher() {
 func (k *KnowledgePanel) refreshKnowledgeData() {
 	k.contextReader.Invalidate(k.profile, k.sessionID)
 	// The session-level watcher fires both for data changes and for creation
-	// of the jobs/ directory. Reattaching both watchers keeps the chain alive
+	// of the jobs/ directory. Reattaching all watchers keeps the chain alive
 	// after either kind of event.
 	k.attachKnowledgeWatcherIfMissing()
 	k.attachJobsWatcherIfMissing()

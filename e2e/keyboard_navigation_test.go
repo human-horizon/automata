@@ -13,15 +13,9 @@ func TestKeyboardHelpOpens(t *testing.T) {
 	profile := "cue-test-keyboard-help"
 	writeSessionFixture(t, profile, nil)
 	app, page := launchAutomataForSession(t, profile)
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
-	if err := page.Press("F1"); err != nil {
-		t.Fatalf("press F1: %v", err)
-	}
+	requireCue(t, "Press", page.Press("F1"))
 	page.WaitStable(200 * time.Millisecond)
 	text, err := page.Text()
 	if err != nil {
@@ -45,9 +39,7 @@ func TestKeyboardHelpOpens(t *testing.T) {
 		t.Fatalf("Help is still inside the Tree panel: column %d\n%s", helpColumn, text)
 	}
 
-	if err := page.Press("Escape"); err != nil {
-		t.Fatalf("press Escape: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Escape"))
 	page.WaitStable(100 * time.Millisecond)
 	text, err = page.Text()
 	if err != nil {
@@ -62,11 +54,7 @@ func TestSettingsMenuOpensAndPersistsTheme(t *testing.T) {
 	profile := "cue-test-settings-theme"
 	profileDir := writeSessionFixture(t, profile, nil)
 	app, page := launchAutomataForSession(t, profile)
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	lines, err := page.Lines()
 	if err != nil {
@@ -84,9 +72,7 @@ func TestSettingsMenuOpensAndPersistsTheme(t *testing.T) {
 	if footerRow < 0 {
 		t.Fatalf("Settings button is missing from footer:\n%s", strings.Join(lines, "\n"))
 	}
-	if err := page.MouseClick(settingsColumn, footerRow); err != nil {
-		t.Fatalf("open settings: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(settingsColumn, footerRow))
 	page.WaitStable(150 * time.Millisecond)
 	text, err := page.Text()
 	if err != nil {
@@ -116,9 +102,7 @@ func TestSettingsMenuOpensAndPersistsTheme(t *testing.T) {
 	if themeRow < 0 {
 		t.Fatalf("Dinosaur Earth item is missing from settings menu:\n%s", strings.Join(lines, "\n"))
 	}
-	if err := page.MouseClick(themeColumn+1, themeRow); err != nil {
-		t.Fatalf("select theme: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(themeColumn+1, themeRow))
 	page.WaitStable(150 * time.Millisecond)
 	data, err := os.ReadFile(filepath.Join(profileDir, "state.json"))
 	if err != nil {
@@ -164,19 +148,11 @@ func TestRootMenuSortsByName(t *testing.T) {
 		{Name: "bravo"},
 	})
 	app, page := launchAutomataForSession(t, profile)
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
-	if err := page.Press("F10"); err != nil {
-		t.Fatalf("open root menu: %v", err)
-	}
+	requireCue(t, "Press", page.Press("F10"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("confirm root sort: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(300 * time.Millisecond)
 
 	data, err := os.ReadFile(filepath.Join(profileDir, "state.json"))

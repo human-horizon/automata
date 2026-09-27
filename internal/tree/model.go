@@ -4,9 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1010,19 +1008,6 @@ func (t *Tree) unbindFolderChecked(item *Item) error {
 	})
 }
 
-func fileManagerCommand(goos, path string) (*exec.Cmd, error) {
-	switch goos {
-	case "darwin":
-		return exec.Command("open", path), nil
-	case "linux":
-		return exec.Command("xdg-open", path), nil
-	case "windows":
-		return exec.Command("explorer.exe", path), nil
-	default:
-		return nil, fmt.Errorf("file-manager reveal is unsupported on %s", goos)
-	}
-}
-
 // revealInFileManager opens the bound directory in the platform file manager
 // and returns validation or launch errors to the caller.
 func revealInFileManager(path string) error {
@@ -1036,24 +1021,10 @@ func revealInFileManager(path string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("bound path %q is not a directory", path)
 	}
-	command, err := fileManagerCommand(runtime.GOOS, path)
-	if err != nil {
-		return err
-	}
-	if err := childproc.StartAndReap(command); err != nil {
+	if err := childproc.OpenPath(path); err != nil {
 		return fmt.Errorf("reveal %q in file manager: %w", path, err)
 	}
 	return nil
-}
-
-func (t *Tree) addChildFolder(parent *Item, name string) error {
-	_, err := t.CreateChildFolder(parent, name)
-	return err
-}
-
-func (t *Tree) addChildChat(parent *Item, name string) error {
-	_, err := t.CreateChildChat(parent, name)
-	return err
 }
 
 // sortChildrenAlphabetically reorders parent.Children in place: folders

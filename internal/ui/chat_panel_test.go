@@ -104,6 +104,9 @@ func (p *messageRecordingPanel) Update(msg tea.Msg) tea.Cmd {
 	return nil
 }
 
+// recordingPanel captures every warp.ResizeMsg it receives so tests can
+// assert how ChatPanel resized its children.
+
 func assertCompleteSGRSequences(t *testing.T, value string) {
 	t.Helper()
 	for offset := 0; offset < len(value); {
@@ -153,7 +156,7 @@ func TestCheckFamiliarsDetectsNew(t *testing.T) {
 		{ID: "expert", SessionID: "test__expert", Created: "2024-01-01"},
 	})
 
-	// Override HOME so familiarStatePath resolves inside tempDir.
+	// Temporarily override HOME so familiarStatePath resolves inside tempDir.
 	t.Setenv("HOME", tempDir)
 
 	cp := &ChatPanel{

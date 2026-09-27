@@ -27,11 +27,7 @@ func TestMouseESCDebug(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	page := app.Page()
 
@@ -46,14 +42,10 @@ func TestMouseESCDebug(t *testing.T) {
 	// Try clicking without EnableMouse; the terminal should rely only on
 	// Bubble Tea's emitted mouse-mode escape sequences.
 	t.Log("Clicking + button at (17, 0) WITHOUT explicit mouse enable")
-	if err := page.MouseClick(17, 0); err != nil {
-		t.Fatalf("click add button without explicit mouse enable: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(17, 0))
 	page.WaitStable(200 * time.Millisecond)
 	// Click "+ Chat" popover item (second item, at x=18, y=2).
-	if err := page.MouseClick(18, 2); err != nil {
-		t.Fatalf("click chat option without explicit mouse enable: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(18, 2))
 	page.WaitStable(500 * time.Millisecond)
 
 	text, _ = page.Text()
@@ -68,20 +60,14 @@ func TestMouseESCDebug(t *testing.T) {
 	}
 
 	// Now enable mouse and try again
-	if err := page.EnableMouse(); err != nil {
-		t.Fatalf("enable mouse: %v", err)
-	}
+	requireCue(t, "EnableMouse", page.EnableMouse())
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Log("Clicking + button at (17, 0) WITH explicit mouse enable")
-	if err := page.MouseClick(17, 0); err != nil {
-		t.Fatalf("click add button with explicit mouse enable: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(17, 0))
 	page.WaitStable(200 * time.Millisecond)
 	// Click "+ Chat" popover item (second item, at x=18, y=2).
-	if err := page.MouseClick(18, 2); err != nil {
-		t.Fatalf("click chat option with explicit mouse enable: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(18, 2))
 	page.WaitStable(500 * time.Millisecond)
 
 	text, _ = page.Text()

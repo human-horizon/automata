@@ -210,7 +210,7 @@ func TestModalInputEscape(t *testing.T) {
 	tr := New()
 	tr.width = 80
 	tr.height = 24
-	tr.startCheckedInput("Folder name", func(string) error { return nil })
+	startInputForTest(tr, "Folder name", func(string) {})
 
 	// Mouse handling for modals is now in warp.
 	// Tree handles keyboard input only.
@@ -230,7 +230,7 @@ func TestModalInputButtons(t *testing.T) {
 	tr.width = 80
 	tr.height = 24
 	var called string
-	tr.startCheckedInput("Folder name", func(name string) error { called = name; return nil })
+	startInputForTest(tr, "Folder name", func(name string) { called = name })
 	tr.inputValue = "Work"
 
 	// Mouse handling for modals is now in warp.
@@ -245,7 +245,7 @@ func TestModalInputButtons(t *testing.T) {
 
 	// Test keyboard Esc to cancel.
 	called = ""
-	tr.startCheckedInput("Folder name", func(name string) error { called = name; return nil })
+	startInputForTest(tr, "Folder name", func(name string) { called = name })
 	tr.inputValue = "Test"
 	tr.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
 	if called != "" {
@@ -260,7 +260,7 @@ func TestModalInputNarrowPanel(t *testing.T) {
 	tr := New()
 	tr.width = 23
 	tr.height = 24
-	tr.startCheckedInput("Folder name", func(string) error { return nil })
+	startInputForTest(tr, "Folder name", func(string) {})
 
 	// Mouse handling for modals is now in warp.
 	// Test that keyboard still works in narrow panel.
@@ -334,7 +334,7 @@ func TestModalCloseButton(t *testing.T) {
 	tr := New()
 	tr.width = 80
 	tr.height = 24
-	tr.startCheckedInput("Folder name", func(string) error { return nil })
+	startInputForTest(tr, "Folder name", func(string) {})
 
 	// Mouse handling for modals is now in warp.
 	// Test keyboard Esc to close.
@@ -349,7 +349,7 @@ func TestModalCloseButton(t *testing.T) {
 	}
 
 	// Re-open and test Enter to confirm.
-	tr.startCheckedInput("Folder name", func(string) error { return nil })
+	startInputForTest(tr, "Folder name", func(string) {})
 	tr.inputValue = "Test"
 	tr.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
 	if tr.inputMode {
@@ -361,7 +361,7 @@ func TestModalInputCursorAndSpaces(t *testing.T) {
 	tr := New()
 	tr.width = 80
 	tr.height = 24
-	tr.startCheckedInput("Terminal name", func(string) error { return nil })
+	startInputForTest(tr, "Terminal name", func(string) {})
 
 	// Type "ab cd" with cursor movement.
 	tr.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})

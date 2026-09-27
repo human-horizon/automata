@@ -104,13 +104,9 @@ func writeSessionMarker(t *testing.T, page *cue.Page) {
 	t.Helper()
 	const marker = "/tmp/automata-e2e-session-id.txt"
 	cmd := `echo "$AUTOMATA_SESSION_ID" > ` + marker + "\n"
-	if err := page.Type(cmd); err != nil {
-		t.Fatalf("type session marker command: %v", err)
-	}
+	requireCue(t, "Type", page.Type(cmd))
 	page.WaitStable(300 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("execute session marker command: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(1 * time.Second)
 }
 
@@ -131,35 +127,19 @@ func TestRenameChatWithF2(t *testing.T) {
 	})
 
 	app, page := launchAutomataForSession(t, profile)
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
-	if err := page.Press("F6"); err != nil {
-		t.Fatalf("focus tree: %v", err)
-	}
+	requireCue(t, "Press", page.Press("F6"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Down"); err != nil {
-		t.Fatalf("select chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Down"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("F2"); err != nil {
-		t.Fatalf("open rename: %v", err)
-	}
+	requireCue(t, "Press", page.Press("F2"))
 	page.WaitStable(100 * time.Millisecond)
 	for range "Old Chat" {
-		if err := page.Press("Backspace"); err != nil {
-			t.Fatalf("erase old chat name: %v", err)
-		}
+		requireCue(t, "Press", page.Press("Backspace"))
 	}
-	if err := page.Type("Renamed Chat"); err != nil {
-		t.Fatalf("type renamed chat: %v", err)
-	}
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("confirm rename: %v", err)
-	}
+	requireCue(t, "Type", page.Type("Renamed Chat"))
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(300 * time.Millisecond)
 
 	text, err := page.Text()
@@ -189,20 +169,12 @@ func TestRootChatSessionID(t *testing.T) {
 	})
 
 	app, page := launchAutomataForSession(t, "cue-test-session")
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	// Select the only chat and open it.
-	if err := page.Press("Down"); err != nil {
-		t.Fatalf("move selection down: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Down"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("open selected chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
@@ -228,24 +200,14 @@ func TestFolderChatSessionID(t *testing.T) {
 	})
 
 	app, page := launchAutomataForSession(t, "cue-test-session-folder")
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	// Select "My Chat" inside "Сегодня" (first and only child).
-	if err := page.Press("Down"); err != nil {
-		t.Fatalf("move selection to folder chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Down"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Down"); err != nil {
-		t.Fatalf("move selection to nested chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Down"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("open folder chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
@@ -279,26 +241,16 @@ func TestUniqueSessionID(t *testing.T) {
 	})
 
 	app, page := launchAutomataForSession(t, "cue-test-session-unique")
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	// Flat list: Сегодня(0), My Chat in Сегодня(1), Проекты(2), My Chat in Проекты(3).
 
 	// Open first "My Chat" (Сегодня is row 0, My Chat is row 1).
-	if err := page.Press("Down"); err != nil {
-		t.Fatalf("move selection to first folder: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Down"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Down"); err != nil {
-		t.Fatalf("move selection to first duplicate chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Down"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("open first duplicate chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
@@ -307,17 +259,11 @@ func TestUniqueSessionID(t *testing.T) {
 
 	// Return focus to tree and click the second "My Chat".
 	// Flat list rows: header(0), Сегодня(1), My Chat(2), Проекты(3), My Chat(4).
-	if err := page.Press("F6"); err != nil {
-		t.Fatalf("focus tree before second chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("F6"))
 	page.WaitStable(200 * time.Millisecond)
-	if err := page.MouseClick(4, 4); err != nil {
-		t.Fatalf("select second duplicate chat: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(4, 4))
 	page.WaitStable(200 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("open second duplicate chat: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)

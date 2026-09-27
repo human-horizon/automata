@@ -1441,8 +1441,11 @@ func (a *App) recoverStatusWatcher() tea.Cmd {
 // currently considers active. Stale status.json from a previous run must never
 // make an inactive Tree row look live.
 func (a *App) recomputeTreeStatusBadges() {
-	if a.tree == nil {
+	if a == nil || a.tree == nil {
 		return
+	}
+	if a.statusReader == nil {
+		a.statusReader = status.NewCachedReader(a.profile)
 	}
 	badges := map[string]string{}
 	for key := range a.activeSessions {

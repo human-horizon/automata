@@ -12,31 +12,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func TestFileManagerCommandByPlatform(t *testing.T) {
-	tests := []struct {
-		goos string
-		want string
-	}{
-		{goos: "darwin", want: "open"},
-		{goos: "linux", want: "xdg-open"},
-		{goos: "windows", want: "explorer.exe"},
-	}
-	for _, test := range tests {
-		t.Run(test.goos, func(t *testing.T) {
-			cmd, err := fileManagerCommand(test.goos, "/tmp/example")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := cmd.Args[0]; got != test.want {
-				t.Fatalf("command = %q, want %q", got, test.want)
-			}
-		})
-	}
-	if _, err := fileManagerCommand("plan9", "/tmp/example"); err == nil {
-		t.Fatal("unsupported OS did not return an error")
-	}
-}
-
 func TestNew(t *testing.T) {
 	tr := New()
 	if tr == nil {
@@ -334,12 +309,11 @@ func TestF2StartsRenameForSelectedItem(t *testing.T) {
 func TestInputMode(t *testing.T) {
 	tr := New()
 	called := false
-	tr.startCheckedInput("Test:", func(name string) error {
+	startInputForTest(tr, "Test:", func(name string) {
 		called = true
 		if name != "hello" {
 			t.Errorf("expected 'hello', got %q", name)
 		}
-		return nil
 	})
 
 	if !tr.inputMode {
@@ -373,7 +347,7 @@ func TestAddChildFolder(t *testing.T) {
 	tr := New()
 	tr.AddFolder("parent")
 	parent := tr.root[0]
-	if err := tr.addChildFolder(parent, "child"); err != nil {
+	if err := addChildFolderForTest(tr, parent, "child"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -467,11 +441,11 @@ func TestMoveItemIntoDescendantNoop(t *testing.T) {
 	tr := New()
 	tr.AddFolder("outer")
 	outer := tr.root[0]
-	if err := tr.addChildFolder(outer, "inner"); err != nil {
+	if err := addChildFolderForTest(tr, outer, "inner"); err != nil {
 		t.Fatal(err)
 	}
 	inner := outer.Children[0]
-	if err := tr.addChildChat(inner, "chat"); err != nil {
+	if err := addChildChatForTest(tr, inner, "chat"); err != nil {
 		t.Fatal(err)
 	}
 	chat := inner.Children[0]
@@ -731,7 +705,7 @@ func TestEffectiveBoundPathAncestor(t *testing.T) {
 	tr := New()
 	tr.AddFolder("parent")
 	parent := tr.root[0]
-	if err := tr.addChildFolder(parent, "child"); err != nil {
+	if err := addChildFolderForTest(tr, parent, "child"); err != nil {
 		t.Fatal(err)
 	}
 	child := parent.Children[0]
@@ -744,7 +718,7 @@ func TestEffectiveBoundPathAncestor(t *testing.T) {
 		t.Fatalf("child's own path should win, got %q", got)
 	}
 	// Chat in child should also see the child's bound path.
-	if err := tr.addChildChat(child, "chat1"); err != nil {
+	if err := addChildChatForTest(tr, child, "chat1"); err != nil {
 		t.Fatal(err)
 	}
 	if len(child.Children) == 0 {
@@ -778,7 +752,7 @@ func TestMoveSelectedOutFromNestedFolder(t *testing.T) {
 	tr := New()
 	tr.AddFolder("outer")
 	outer := tr.root[0]
-	if err := tr.addChildFolder(outer, "inner"); err != nil {
+	if err := addChildFolderForTest(tr, outer, "inner"); err != nil {
 		t.Fatal(err)
 	}
 	inner := outer.Children[0]
@@ -833,11 +807,11 @@ func TestMoveSelectedOutRunsMigrationBeforeMutation(t *testing.T) {
 	tr := New()
 	tr.AddFolder("outer")
 	outer := tr.root[0]
-	if err := tr.addChildFolder(outer, "inner"); err != nil {
+	if err := addChildFolderForTest(tr, outer, "inner"); err != nil {
 		t.Fatal(err)
 	}
 	inner := outer.Children[0]
-	if err := tr.addChildChat(inner, "chat"); err != nil {
+	if err := addChildChatForTest(tr, inner, "chat"); err != nil {
 		t.Fatal(err)
 	}
 	chat := inner.Children[0]
@@ -865,11 +839,11 @@ func TestMoveSelectedOutSaveFailureRestoresTargetTreeBeforeRollback(t *testing.T
 	tr := New()
 	tr.AddFolder("outer")
 	outer := tr.root[0]
-	if err := tr.addChildFolder(outer, "inner"); err != nil {
+	if err := addChildFolderForTest(tr, outer, "inner"); err != nil {
 		t.Fatal(err)
 	}
 	inner := outer.Children[0]
-	if err := tr.addChildChat(inner, "chat"); err != nil {
+	if err := addChildChatForTest(tr, inner, "chat"); err != nil {
 		t.Fatal(err)
 	}
 	chat := inner.Children[0]

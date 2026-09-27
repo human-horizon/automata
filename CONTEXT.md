@@ -25,6 +25,8 @@
 
 ## Последние исправления
 
+[2026-09-27] Проблема: после слияния tree-тест использовал `return nil` в callback helper-а с void-сигнатурой → Решение: удалить возврат, отформатировать тест и повторно пройти `go test ./internal/tree -count=1`.
+[2026-09-27] Проблема: diff-scoped golangci-lint выявил дублирующий неиспользуемый package-level `must` рядом с локальным helper-ом в manual harness → Решение: удалить дубль, локальную обработку перевести с `os.Exit` на panic для выполнения defer-cleanup и повторно пройти lint.
 [2026-09-25] Проблема: компиляция единого status watcher выявила повторное объявление `activeChatSessionID` → Решение: перед добавлением helper-а искать существующие определения и повторно использовать уже имеющийся метод.
 [2026-09-25] Проблема: root tests обнаружили, что runtime cleanup полагался на удаление per-session watcher для очистки `sessionWatchPending` → Решение: удалять только compatibility pending entry, сохраняя shared watcher mount для всё ещё видимого Tree chat.
 [2026-09-25] Проблема: первый metadata debounce compile обнаружил отсутствующий импорт `time` после удаления blink timer → Решение: добавлять нужные импорты по актуальным timer API и запускать пакетный compile после каждого нового механизма.

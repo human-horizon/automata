@@ -10,6 +10,7 @@
 package testutil
 
 import (
+	"fmt"
 	"os"
 	"testing"
 )
@@ -30,6 +31,7 @@ func RunMain(m *testing.M) {
 	if err != nil {
 		panic("testutil: cannot create temp HOME: " + err.Error())
 	}
+
 	// HOME drives os.UserHomeDir(); paths.dataHome() honours
 	// AI_DATA_HOME, so we set both for belt-and-suspenders coverage.
 	if err := os.Setenv("HOME", tmp); err != nil {
@@ -51,8 +53,11 @@ func RunMain(m *testing.M) {
 	} else {
 		_ = os.Unsetenv("AI_DATA_HOME")
 	}
-	if err := os.RemoveAll(tmp); err != nil && code == 0 {
-		code = 1
+	if err := os.RemoveAll(tmp); err != nil {
+		fmt.Fprintln(os.Stderr, "testutil: remove temp HOME:", err)
+		if code == 0 {
+			code = 1
+		}
 	}
 	os.Exit(code)
 }

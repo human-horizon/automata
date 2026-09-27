@@ -418,7 +418,7 @@ func TestStructuralMutationsRollbackOnSaveFailure(t *testing.T) {
 				tr.AddFolder("source")
 				tr.AddFolder("target")
 				source, target := tr.root[0], tr.root[1]
-				if err := tr.addChildChat(source, "moving"); err != nil {
+				if err := addChildChatForTest(tr, source, "moving"); err != nil {
 					t.Fatal(err)
 				}
 				moving := source.Children[0]
@@ -449,10 +449,10 @@ func TestStructuralMutationsRollbackOnSaveFailure(t *testing.T) {
 				tr := New()
 				tr.AddFolder("parent")
 				parent := tr.root[0]
-				if err := tr.addChildChat(parent, "z"); err != nil {
+				if err := addChildChatForTest(tr, parent, "z"); err != nil {
 					t.Fatal(err)
 				}
-				if err := tr.addChildChat(parent, "a"); err != nil {
+				if err := addChildChatForTest(tr, parent, "a"); err != nil {
 					t.Fatal(err)
 				}
 				return tr, func() bool { return parent.Children[0].Name == "z" && parent.Children[1].Name == "a" }

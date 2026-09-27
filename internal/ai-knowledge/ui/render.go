@@ -1,6 +1,6 @@
 // Package ui provides a stateless renderer for ai-knowledge data, suitable
 // for embedding inside another Bubble Tea tree (no tea.NewProgram, no
-// goroutines, no tickers — caller drives Refresh + Render).
+// goroutines, no background workers — callers provide current data and drive Render).
 package ui
 
 import (

@@ -49,17 +49,11 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	page := app.Page()
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.EnableMouse(); err != nil {
-		t.Fatalf("enable mouse: %v", err)
-	}
+	requireCue(t, "EnableMouse", page.EnableMouse())
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Cleanup(func() {
@@ -75,9 +69,7 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	}
 
 	// Open the seeded chat (first item is at row 1).
-	if err := page.MouseClick(4, 1); err != nil {
-		t.Fatalf("open seeded chat: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(4, 1))
 	if err := page.WaitFor("AUTOMATA_CHAT_RESIZE_MARKER", 5*time.Second); err != nil {
 		text, _ := page.Text()
 		t.Fatalf("fake chat process did not start: %v\n%s", err, text)
@@ -101,9 +93,7 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	t.Logf("rendered chat BEFORE collapse: left=%d border=%d width=%d cells", beforeLeftEdge, beforeBorderCol, beforeWidth)
 
 	// Click the collapse affordance on the expanded Tree border.
-	if err := page.MouseClick(29, 0); err != nil {
-		t.Fatalf("collapse tree: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(29, 0))
 	page.WaitStable(100 * time.Millisecond)
 
 	if err := page.WaitFor("[× auto]", 2*time.Second); err != nil {

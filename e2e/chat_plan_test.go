@@ -31,17 +31,11 @@ func TestChatOpensWithPlanPane(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	page := app.Page()
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.EnableMouse(); err != nil {
-		t.Fatalf("enable mouse: %v", err)
-	}
+	requireCue(t, "EnableMouse", page.EnableMouse())
 	page.WaitStable(500 * time.Millisecond)
 	if err := page.WaitFor("Automata", 5*time.Second); err != nil {
 		text, _ := page.Text()
@@ -67,9 +61,7 @@ func TestChatOpensWithPlanPane(t *testing.T) {
 		t.Fatalf("toolbar + button is missing from header:\n%s", strings.Join(lines, "\n"))
 	}
 	plusColumn := ansi.StringWidth(lines[0][:plusByteColumn])
-	if err := page.MouseClick(plusColumn, 0); err != nil {
-		t.Fatalf("click add menu: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(plusColumn, 0))
 	if err := page.WaitFor("+ Chat", 2*time.Second); err != nil {
 		text, _ := page.Text()
 		t.Fatalf("chat creation menu did not open: %v\n%s", err, text)
@@ -88,28 +80,20 @@ func TestChatOpensWithPlanPane(t *testing.T) {
 	if chatRow < 0 {
 		t.Fatalf("+ Chat option is missing from menu:\n%s", strings.Join(lines, "\n"))
 	}
-	if err := page.MouseClick(chatColumn+1, chatRow); err != nil {
-		t.Fatalf("click Chat menu item: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(chatColumn+1, chatRow))
 	if err := page.WaitFor("Chat name", 2*time.Second); err != nil {
 		t.Fatalf("chat creation modal did not open: %v", err)
 	}
-	if err := page.Type("plan_chat_test"); err != nil {
-		t.Fatalf("type chat name: %v", err)
-	}
+	requireCue(t, "Type", page.Type("plan_chat_test"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("confirm chat name: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	if err := page.WaitFor("plan_chat_test", 2*time.Second); err != nil {
 		t.Fatalf("chat was not created: %v", err)
 	}
 
 	// Click the chat to open it.
 	// Header is one row, so the first item is at row 1.
-	if err := page.MouseClick(4, 1); err != nil {
-		t.Fatalf("open chat: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(4, 1))
 	page.WaitStable(2 * time.Second)
 
 	// Wait longer for ai-knowledge to render its first frame.

@@ -78,8 +78,7 @@ func main() {
 		cue.WithEnv("TERM=xterm-256color", "AUTOMATA_ELEMENTS_PORT_FILE="+portFile),
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "launch automata: %v\n", err)
-		os.Exit(1)
+		panic(fmt.Errorf("launch automata: %w", err))
 	}
 	defer func() {
 		if err := app.Close(); err != nil {
@@ -99,39 +98,33 @@ func main() {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if httpPort == "" {
-		fmt.Fprintf(os.Stderr, "AUTOMATA_ELEMENTS_PORT_FILE not written\n")
-		os.Exit(1)
+		panic("AUTOMATA_ELEMENTS_PORT_FILE not written")
 	}
 	elemsURL := "http://127.0.0.1:" + httpPort + "/elements"
 
 	find := func(role, name, action string) (warp.Element, bool) {
 		resp, err := http.Get(elemsURL)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "get elements: %v\n", err)
-			os.Exit(1)
+			panic(fmt.Errorf("get elements: %w", err))
 		}
 		body, readErr := io.ReadAll(resp.Body)
 		closeErr := resp.Body.Close()
 		if readErr != nil {
-			fmt.Fprintf(os.Stderr, "read elements response: %v\n", readErr)
-			os.Exit(1)
+			panic(fmt.Errorf("read elements response: %w", readErr))
 		}
 		if closeErr != nil {
-			fmt.Fprintf(os.Stderr, "close elements response: %v\n", closeErr)
-			os.Exit(1)
+			panic(fmt.Errorf("close elements response: %w", closeErr))
 		}
 		var elems []warp.Element
 		if err := json.Unmarshal(body, &elems); err != nil {
-			fmt.Fprintf(os.Stderr, "decode elements: %v\n", err)
-			os.Exit(1)
+			panic(fmt.Errorf("decode elements: %w", err))
 		}
 		return warp.FindElement(elems, role, name, action)
 	}
 
 	must := func(action string, err error) {
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: %v\n", action, err)
-			os.Exit(1)
+			panic(fmt.Errorf("%s: %w", action, err))
 		}
 	}
 
@@ -146,11 +139,10 @@ func main() {
 			time.Sleep(50 * time.Millisecond)
 		}
 		if !ok {
-			fmt.Fprintf(os.Stderr, "element not found: role=%q name=%q action=%q\n", role, name, action)
-			os.Exit(1)
+			panic(fmt.Errorf("element not found: role=%q name=%q action=%q", role, name, action))
 		}
 		x, y := el.Bounds.Center()
-		must("mouse click", page.MouseClick(x, y))
+		must("MouseClick", page.MouseClick(x, y))
 	}
 
 	fmt.Println("=== Step 1: Initial render ===")
@@ -160,7 +152,7 @@ func main() {
 	click("button", "+Folder", "add-folder")
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
-	must("type folder name", page.Type("Work"))
+	must("Type", page.Type("Work"))
 	page.WaitStable(100 * time.Millisecond)
 	printScreen(page)
 	click("button", "[Create]", "create")
@@ -176,7 +168,7 @@ func main() {
 	click("button", "+Chat", "add-chat")
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
-	must("type chat name", page.Type("notes"))
+	must("Type", page.Type("notes"))
 	page.WaitStable(100 * time.Millisecond)
 	printScreen(page)
 	click("button", "[Create]", "create")
@@ -187,9 +179,9 @@ func main() {
 	click("chat", "notes", "")
 	page.WaitStable(1 * time.Second)
 	printScreen(page)
-	must("type session command", page.Type(`echo "$AUTOMATA_SESSION_ID"`))
+	must("Type", page.Type(`echo "$AUTOMATA_SESSION_ID"`))
 	page.WaitStable(300 * time.Millisecond)
-	must("execute session command", page.Press("Enter"))
+	must("Press", page.Press("Enter"))
 	page.WaitStable(1 * time.Second)
 	printScreen(page)
 
@@ -202,7 +194,7 @@ func main() {
 	click("action", "rename:notes", "rename")
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
-	must("type renamed chat name", page.Type("todo"))
+	must("Type", page.Type("todo"))
 	page.WaitStable(100 * time.Millisecond)
 	printScreen(page)
 	click("button", "[Create]", "create")
@@ -222,20 +214,11 @@ func main() {
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
 	title, _ := find("title-bar", "Folder name", "")
-	if err := page.MouseDown(0, title.Bounds.X, title.Bounds.Y); err != nil {
-		fmt.Fprintf(os.Stderr, "mouse down modal title: %v\n", err)
-		return
-	}
+	must("MouseDown", page.MouseDown(0, title.Bounds.X, title.Bounds.Y))
 	page.WaitStable(50 * time.Millisecond)
-	if err := page.MouseMove(title.Bounds.X, title.Bounds.Y+5); err != nil {
-		fmt.Fprintf(os.Stderr, "drag modal title: %v\n", err)
-		return
-	}
+	must("MouseMove", page.MouseMove(title.Bounds.X, title.Bounds.Y+5))
 	page.WaitStable(50 * time.Millisecond)
-	if err := page.MouseUp(0, title.Bounds.X, title.Bounds.Y+5); err != nil {
-		fmt.Fprintf(os.Stderr, "mouse up modal title: %v\n", err)
-		return
-	}
+	must("MouseUp", page.MouseUp(0, title.Bounds.X, title.Bounds.Y+5))
 	page.WaitStable(200 * time.Millisecond)
 	printScreen(page)
 	// Use the close (✕) button for cancelling the input modal, which is more
@@ -247,7 +230,7 @@ func main() {
 	// Re-create a chat so we can open its delete confirmation.
 	click("button", "+Chat", "add-chat")
 	page.WaitStable(300 * time.Millisecond)
-	must("type temporary chat name", page.Type("temp"))
+	must("Type", page.Type("temp"))
 	page.WaitStable(100 * time.Millisecond)
 	click("button", "[Create]", "create")
 	page.WaitStable(800 * time.Millisecond)
@@ -257,20 +240,11 @@ func main() {
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
 	title, _ = find("title-bar", "Delete chat", "")
-	if err := page.MouseDown(0, title.Bounds.X, title.Bounds.Y); err != nil {
-		fmt.Fprintf(os.Stderr, "mouse down modal title: %v\n", err)
-		return
-	}
+	must("MouseDown", page.MouseDown(0, title.Bounds.X, title.Bounds.Y))
 	page.WaitStable(50 * time.Millisecond)
-	if err := page.MouseMove(title.Bounds.X, title.Bounds.Y+5); err != nil {
-		fmt.Fprintf(os.Stderr, "drag modal title: %v\n", err)
-		return
-	}
+	must("MouseMove", page.MouseMove(title.Bounds.X, title.Bounds.Y+5))
 	page.WaitStable(50 * time.Millisecond)
-	if err := page.MouseUp(0, title.Bounds.X, title.Bounds.Y+5); err != nil {
-		fmt.Fprintf(os.Stderr, "mouse up modal title: %v\n", err)
-		return
-	}
+	must("MouseUp", page.MouseUp(0, title.Bounds.X, title.Bounds.Y+5))
 	page.WaitStable(200 * time.Millisecond)
 	printScreen(page)
 	// Use the cancel/esc button by action; the rendered label varies with width.
@@ -281,10 +255,7 @@ func main() {
 	fmt.Println("\n=== Step 11: Delete 'temp' chat via hover ✕ action ===")
 	el, _ := find("folder", "temp", "")
 	// Hover over the temp folder row so action icons appear.
-	if err := page.MouseMove(el.Bounds.X+el.Bounds.W/2, el.Bounds.Y); err != nil {
-		fmt.Fprintf(os.Stderr, "hover temp chat: %v\n", err)
-		return
-	}
+	must("MouseMove", page.MouseMove(el.Bounds.X+el.Bounds.W/2, el.Bounds.Y))
 	page.WaitStable(100 * time.Millisecond)
 	click("action", "delete:temp", "delete")
 	page.WaitStable(300 * time.Millisecond)

@@ -28,11 +28,7 @@ func TestMouseRawDebug(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	page := app.Page()
 
@@ -74,14 +70,10 @@ func TestMouseRawDebug(t *testing.T) {
 	// regardless of whether mouse tracking was enabled.
 	t.Log("")
 	t.Log("=== Testing mouse click WITHOUT EnableMouse() ===")
-	if err := page.MouseClick(17, 0); err != nil {
-		t.Fatalf("click add button without explicit mouse enable: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(17, 0))
 	page.WaitStable(200 * time.Millisecond)
 	// Click "+ Chat" popover item (second item, at x=18, y=2).
-	if err := page.MouseClick(18, 2); err != nil {
-		t.Fatalf("click chat option without explicit mouse enable: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(18, 2))
 	page.WaitStable(500 * time.Millisecond)
 
 	text, _ := page.Text()
@@ -96,19 +88,13 @@ func TestMouseRawDebug(t *testing.T) {
 	// Now test WITH page.EnableMouse()
 	t.Log("")
 	t.Log("=== Testing mouse click WITH EnableMouse() ===")
-	if err := page.EnableMouse(); err != nil {
-		t.Fatalf("enable mouse: %v", err)
-	}
+	requireCue(t, "EnableMouse", page.EnableMouse())
 	page.WaitStable(500 * time.Millisecond)
 
-	if err := page.MouseClick(17, 0); err != nil {
-		t.Fatalf("click add button with explicit mouse enable: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(17, 0))
 	page.WaitStable(200 * time.Millisecond)
 	// Click "+ Chat" popover item (second item, at x=18, y=2).
-	if err := page.MouseClick(18, 2); err != nil {
-		t.Fatalf("click chat option with explicit mouse enable: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(18, 2))
 	page.WaitStable(500 * time.Millisecond)
 
 	text, _ = page.Text()

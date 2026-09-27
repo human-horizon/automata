@@ -39,16 +39,10 @@ func TestTerminalDoesNotHang(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	page := app.Page()
-	if err := page.EnableMouse(); err != nil {
-		t.Fatalf("enable mouse: %v", err)
-	}
+	requireCue(t, "EnableMouse", page.EnableMouse())
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Cleanup(func() {
@@ -62,30 +56,20 @@ func TestTerminalDoesNotHang(t *testing.T) {
 	// Click "+" toolbar button (after title, approx x=17). Clicking it opens
 	// a popover at (17, 0); then click the "+ Terminal" option (third item,
 	// at x=18, y=3).
-	if err := page.MouseClick(17, 0); err != nil {
-		t.Fatalf("click add terminal button: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(17, 0))
 	page.WaitStable(200 * time.Millisecond)
-	if err := page.MouseClick(18, 3); err != nil {
-		t.Fatalf("click terminal option: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(18, 3))
 	page.WaitStable(200 * time.Millisecond)
 
 	// Type terminal name and confirm.
-	if err := page.Type("hangtest"); err != nil {
-		t.Fatalf("type terminal name: %v", err)
-	}
+	requireCue(t, "Type", page.Type("hangtest"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("confirm terminal name: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(500 * time.Millisecond)
 
 	// Click on the newly created terminal item to open it.
 	// Header is one row, so the first item is at row 1.
-	if err := page.MouseClick(4, 1); err != nil {
-		t.Fatalf("open terminal: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(4, 1))
 	page.WaitStable(1 * time.Second)
 
 	// The terminal should be created and selected; the right panel should
@@ -102,13 +86,9 @@ func TestTerminalDoesNotHang(t *testing.T) {
 	}
 
 	// Try typing a command in the terminal panel.
-	if err := page.Type("echo ok"); err != nil {
-		t.Fatalf("type terminal command: %v", err)
-	}
+	requireCue(t, "Type", page.Type("echo ok"))
 	page.WaitStable(200 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("execute terminal command: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(1 * time.Second)
 
 	text, _ = page.Text()
@@ -139,16 +119,10 @@ func TestTerminalRestoresCWD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer func() {
-		if err := app.Close(); err != nil {
-			t.Errorf("close automata: %v", err)
-		}
-	}()
+	t.Cleanup(func() { closeCueApp(t, app) })
 
 	page := app.Page()
-	if err := page.EnableMouse(); err != nil {
-		t.Fatalf("enable mouse: %v", err)
-	}
+	requireCue(t, "EnableMouse", page.EnableMouse())
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Cleanup(func() {
@@ -162,37 +136,23 @@ func TestTerminalRestoresCWD(t *testing.T) {
 	// Create a terminal via the toolbar. The "+" button is after the title
 	// (approx x=17). Clicking it opens a popover at (17, 0); then click the
 	// "+ Terminal" option (third item, at x=18, y=3).
-	if err := page.MouseClick(17, 0); err != nil {
-		t.Fatalf("click add CWD terminal button: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(17, 0))
 	page.WaitStable(200 * time.Millisecond)
-	if err := page.MouseClick(18, 3); err != nil {
-		t.Fatalf("click CWD terminal option: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(18, 3))
 	page.WaitStable(200 * time.Millisecond)
-	if err := page.Type("cwdtest"); err != nil {
-		t.Fatalf("type terminal name: %v", err)
-	}
+	requireCue(t, "Type", page.Type("cwdtest"))
 	page.WaitStable(100 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("confirm CWD terminal name: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(500 * time.Millisecond)
 
 	// Open the terminal. With a fresh profile the only item is on row 1.
-	if err := page.MouseClick(4, 1); err != nil {
-		t.Fatalf("open CWD terminal: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(4, 1))
 	page.WaitStable(2 * time.Second)
 
 	// Change directory and hit Enter.
-	if err := page.Type("cd /tmp"); err != nil {
-		t.Fatalf("type cd command: %v", err)
-	}
+	requireCue(t, "Type", page.Type("cd /tmp"))
 	page.WaitStable(200 * time.Millisecond)
-	if err := page.Press("Enter"); err != nil {
-		t.Fatalf("execute cd command: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Enter"))
 	page.WaitStable(1 * time.Second)
 
 	text, _ := page.Text()
@@ -202,9 +162,7 @@ func TestTerminalRestoresCWD(t *testing.T) {
 	}
 
 	// Exit the shell with Ctrl+D.
-	if err := page.Press("Ctrl+D"); err != nil {
-		t.Fatalf("exit terminal shell: %v", err)
-	}
+	requireCue(t, "Press", page.Press("Ctrl+D"))
 	page.WaitStable(2 * time.Second)
 
 	text, _ = page.Text()
@@ -245,13 +203,9 @@ func TestTerminalRestoresCWD(t *testing.T) {
 
 	// Re-open the terminal and verify the shell starts in /tmp.
 	// Return focus to the tree first because the terminal panel was focused.
-	if err := page.Press("F6"); err != nil {
-		t.Fatalf("focus tree: %v", err)
-	}
+	requireCue(t, "Press", page.Press("F6"))
 	page.WaitStable(200 * time.Millisecond)
-	if err := page.MouseClick(4, 1); err != nil {
-		t.Fatalf("reopen terminal: %v", err)
-	}
+	requireCue(t, "MouseClick", page.MouseClick(4, 1))
 	page.WaitStable(2 * time.Second)
 
 	text, _ = page.Text()

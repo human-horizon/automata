@@ -1438,6 +1438,15 @@ func TestAppCloseStopsWatchersAndEmulators(t *testing.T) {
 	}
 }
 
+func closeStatusWatcherForTest(t *testing.T, app *App) {
+	t.Helper()
+	if app != nil && app.statusWatcher != nil {
+		if err := app.statusWatcher.Close(); err != nil {
+			t.Errorf("close status watcher: %v", err)
+		}
+	}
+}
+
 func newTestApp(t *testing.T, profile string) *App {
 	t.Helper()
 	home := t.TempDir()
@@ -1461,6 +1470,16 @@ func newTestApp(t *testing.T, profile string) *App {
 // matching on-disk status.json and pushes the resulting emoji map to the
 // Tree. We assert the map contains the right key→glyph and that the Tree
 // exposes it through StatusBadge.
+func TestRecomputeTreeStatusBadgesInitializesMissingReader(t *testing.T) {
+	app := &App{tree: tree.New(), profile: "lazy-status"}
+	app.tree.Profile = app.profile
+	app.tree.AddChat("chat")
+	app.recomputeTreeStatusBadges()
+	if app.statusReader == nil {
+		t.Fatal("badge recompute did not initialize the status reader")
+	}
+}
+
 func TestRecomputeTreeStatusBadgesReadsAction(t *testing.T) {
 	app := newTestApp(t, "test")
 	key := app.tree.SessionKeyOf(app.tree.AllItems()[0])
@@ -1566,9 +1585,7 @@ func TestSetupStatusWatcherCreatesMissingBase(t *testing.T) {
 	if _, err := os.Stat(base); err != nil {
 		t.Fatalf("expected base dir to be created, got %v", err)
 	}
-	if err := app.statusWatcher.Close(); err != nil {
-		t.Errorf("close status watcher: %v", err)
-	}
+	closeStatusWatcherForTest(t, app)
 }
 
 // TestSetupStatusWatcherAttachesActiveSessions confirms all active chats are
@@ -1596,11 +1613,7 @@ func TestSetupStatusWatcherAttachesActiveSessions(t *testing.T) {
 	}
 	app.setupStatusWatcher()
 	_ = app.syncSessionWatchers()
-	t.Cleanup(func() {
-		if err := app.statusWatcher.Close(); err != nil {
-			t.Errorf("close status watcher: %v", err)
-		}
-	})
+	t.Cleanup(func() { closeStatusWatcherForTest(t, app) })
 
 	if app.statusWatcher == nil {
 		t.Fatal("expected parent statusWatcher to be created")
@@ -1627,11 +1640,7 @@ func TestSyncSessionWatchersPrunesRemovedTreeSession(t *testing.T) {
 	app.activeSessions[key] = struct{}{}
 	app.setupStatusWatcher()
 	_ = app.syncSessionWatchers()
-	t.Cleanup(func() {
-		if err := app.statusWatcher.Close(); err != nil {
-			t.Errorf("close status watcher: %v", err)
-		}
-	})
+	t.Cleanup(func() { closeStatusWatcherForTest(t, app) })
 	if _, ok := app.sessionWatchers[key]; !ok {
 		t.Fatal("expected watcher after setup")
 	}
@@ -1898,11 +1907,7 @@ func TestSyncSessionWatchersReturnsCmdsOnlyForNewWatchers(t *testing.T) {
 	}
 
 	app.setupStatusWatcher()
-	t.Cleanup(func() {
-		if err := app.statusWatcher.Close(); err != nil {
-			t.Errorf("close status watcher: %v", err)
-		}
-	})
+	t.Cleanup(func() { closeStatusWatcherForTest(t, app) })
 
 	first := app.syncSessionWatchers()
 	if len(first) == 0 {
