@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestFindSessionJSONLFallsBackWhenCWDChanged(t *testing.T) {
+func TestFindSessionJSONLCheckedFallsBackWhenCWDChanged(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -22,14 +22,17 @@ func TestFindSessionJSONLFallsBackWhenCWDChanged(t *testing.T) {
 	t.Logf("Дано: сессия AI#2 создана в %s", createdCWD)
 	t.Logf("Когда: Clear ищет её из %s", currentCWD)
 
-	got := FindSessionJSONL(sessionID, currentCWD, "")
+	got, err := FindSessionJSONLChecked(sessionID, currentCWD, filepath.Join(home, ".ai", "just", "pi"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got != want {
 		t.Fatalf("Тогда: должен быть найден исходный JSONL\nожидалось: %s\nполучено:   %s", want, got)
 	}
 }
 
-func TestFindSessionJSONLPrefersCurrentCWD(t *testing.T) {
+func TestFindSessionJSONLCheckedPrefersCurrentCWD(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -39,14 +42,17 @@ func TestFindSessionJSONLPrefersCurrentCWD(t *testing.T) {
 	want := writeSessionFixture(t, home, currentCWD, sessionID, time.Now().Add(-time.Hour))
 	writeSessionFixture(t, home, otherCWD, sessionID, time.Now())
 
-	got := FindSessionJSONL(sessionID, currentCWD, "")
+	got, err := FindSessionJSONLChecked(sessionID, currentCWD, filepath.Join(home, ".ai", "just", "pi"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got != want {
 		t.Fatalf("current cwd must have priority\nexpected: %s\nactual:   %s", want, got)
 	}
 }
 
-func TestFindSessionJSONLMatchesExactSessionID(t *testing.T) {
+func TestFindSessionJSONLCheckedMatchesExactSessionID(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -54,14 +60,17 @@ func TestFindSessionJSONLMatchesExactSessionID(t *testing.T) {
 	writeSessionFixture(t, home, "/current", sessionID+"0", time.Now())
 	want := writeSessionFixture(t, home, "/created", sessionID, time.Now().Add(-time.Hour))
 
-	got := FindSessionJSONL(sessionID, "/current", "")
+	got, err := FindSessionJSONLChecked(sessionID, "/current", filepath.Join(home, ".ai", "just", "pi"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got != want {
 		t.Fatalf("similar session id must not match\nexpected: %s\nactual:   %s", want, got)
 	}
 }
 
-func TestFindSessionJSONLFallbackChoosesNewestMatch(t *testing.T) {
+func TestFindSessionJSONLCheckedFallbackChoosesNewestMatch(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -69,7 +78,10 @@ func TestFindSessionJSONLFallbackChoosesNewestMatch(t *testing.T) {
 	writeSessionFixture(t, home, "/older", sessionID, time.Now().Add(-time.Hour))
 	want := writeSessionFixture(t, home, "/newer", sessionID, time.Now())
 
-	got := FindSessionJSONL(sessionID, "/missing", "")
+	got, err := FindSessionJSONLChecked(sessionID, "/missing", filepath.Join(home, ".ai", "just", "pi"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got != want {
 		t.Fatalf("fallback must choose newest matching JSONL\nexpected: %s\nactual:   %s", want, got)
@@ -106,86 +118,35 @@ func TestDeleteSessionJSONLFallsBackAndDeletesOnlyExactMatch(t *testing.T) {
 // ~/.ai/<agent>/pi/sessions/ directory that exists on the machine, not
 // only the default just one. Without this, Clear on a non-just agent
 // (e.g. --pi getic) cannot find its JSONL and silently fails.
-func TestSessionRootsDiscoversAllAgents(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	for _, agent := range []string{"just", "getic", "synth"} {
-		if err := os.MkdirAll(filepath.Join(home, ".ai", agent, "pi", "sessions"), 0o755); err != nil {
-			t.Fatalf("mkdir %s: %v", agent, err)
-		}
-	}
-
-	roots := SessionRoots()
-	want := map[string]bool{
-		filepath.Join(home, ".ai", "just", "pi", "sessions"):  false,
-		filepath.Join(home, ".ai", "getic", "pi", "sessions"): false,
-		filepath.Join(home, ".ai", "synth", "pi", "sessions"): false,
-	}
-	for _, r := range roots {
-		if _, ok := want[r]; ok {
-			want[r] = true
-		}
-	}
-	for path, seen := range want {
-		if !seen {
-			t.Errorf("expected %q in SessionRoots(), got %v", path, roots)
-		}
-	}
-}
-
 // TestFindSessionJSONLLocatesAcrossAgents confirms that a session created
 // under a non-just pi agent (--pi getic) is discoverable by Clear even
 // when called with an arbitrary cwd. Pre-fix, SessionRoots only knew
 // about ~/.ai/just/pi/sessions/ and the lookup returned "".
-func TestFindSessionJSONLLocatesAcrossAgents(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	if err := os.MkdirAll(filepath.Join(home, ".ai", "getic", "pi", "sessions"), 0o755); err != nil {
-		t.Fatalf("mkdir getic: %v", err)
-	}
-
-	const sessionID = "getic__shop.sym-8285.ai-2"
-	cwd := "/Users/a/Space/Projects/Getic"
-	dir := filepath.Join(home, ".ai", "getic", "pi", "sessions", EncodeCwdDir(cwd))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir session dir: %v", err)
-	}
-	path := filepath.Join(dir, fmt.Sprintf("%d_%s.jsonl", time.Now().UnixNano(), sessionID))
-	header := fmt.Sprintf("{\"type\":\"session\",\"version\":3,\"id\":%q,\"cwd\":%q}\n", sessionID, cwd)
-	if err := os.WriteFile(path, []byte(header), 0o600); err != nil {
-		t.Fatalf("write fixture: %v", err)
-	}
-
-	got := FindSessionJSONL(sessionID, cwd, "")
-	if got != path {
-		t.Fatalf("expected to find JSONL in getic agent\nwant: %s\ngot:  %s", path, got)
-	}
-}
-
 // TestFindSessionJSONLRespectsAgentFilter confirms the agent filter cuts
 // off other agents' sessions. The legacy behaviour (no agent filter) still
 // finds them; the new safe path used by Clear does not.
-func TestFindSessionJSONLRespectsAgentFilter(t *testing.T) {
+func TestFindSessionJSONLCheckedRespectsAgentFilter(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
 	const sessionID = "humanhorizon__human-horizon.automata.ai-2"
 	justPath := writeSessionFixture(t, home, "/anywhere", sessionID, time.Now())
 
-	// Safe path: ask for getic, hit a session that lives in just — must miss.
-	if got := FindSessionJSONL(sessionID, "/anywhere", filepath.Join(home, ".ai", "getic", "pi")); got != "" {
+	geticAgent := filepath.Join(home, ".ai", "getic", "pi")
+	got, err := FindSessionJSONLChecked(sessionID, "/anywhere", geticAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
 		t.Fatalf("agent filter must not pick up just session\nexpected empty\nactual:   %s", got)
 	}
 
-	// Legacy path: empty agentDir falls back to dynamic discovery and finds it.
-	if got := FindSessionJSONL(sessionID, "/anywhere", ""); got != justPath {
-		t.Fatalf("legacy fallback should still find it\nexpected: %s\nactual:   %s", justPath, got)
+	justAgent := filepath.Join(home, ".ai", "just", "pi")
+	got, err = FindSessionJSONLChecked(sessionID, "/anywhere", justAgent)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// Same-agent filter does find it.
-	if got := FindSessionJSONL(sessionID, "/anywhere", filepath.Join(home, ".ai", "just", "pi")); got != justPath {
+	if got != justPath {
 		t.Fatalf("same-agent filter must find it\nexpected: %s\nactual:   %s", justPath, got)
 	}
 }
@@ -193,6 +154,12 @@ func TestFindSessionJSONLRespectsAgentFilter(t *testing.T) {
 // TestDeleteSessionJSONLRefusesCrossAgent is the safety net: a Clear in
 // getic must NOT delete a JSONL that lives in just, even with a matching
 // sessionID. We also assert the file is still present afterwards.
+func TestFindSessionJSONLCheckedRequiresAgentDir(t *testing.T) {
+	if _, err := FindSessionJSONLChecked("session", "/work", ""); err == nil {
+		t.Fatal("empty agentDir was accepted for session lookup")
+	}
+}
+
 func TestDeleteSessionJSONLRefusesCrossAgent(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

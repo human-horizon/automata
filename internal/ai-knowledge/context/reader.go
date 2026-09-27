@@ -198,14 +198,6 @@ func readForProfile(profile, sessionID string) (*Data, error) {
 
 // Read resolves legacy sessions through existing profile directories, then
 // falls back to the session prefix, AI_PROFILE and canonical default.
-func Read(sessionID string) (*Data, error) {
-	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
-	if err != nil {
-		return nil, err
-	}
-	return readForProfile(profile, sessionID)
-}
-
 // ReadForProfile returns context data using the explicit canonical profile.
 func ReadForProfile(profile, sessionID string) (*Data, error) {
 	return readForProfile(profile, sessionID)
@@ -269,16 +261,6 @@ func (r *CachedReader) Invalidate(profile, sessionID string) {
 	r.mu.Lock()
 	r.cache.Delete(contextCacheKey(profile, sessionID))
 	r.mu.Unlock()
-}
-
-// Read returns the context data for a session, cached by the complete
-// existence/size/mtime signature of plans.json, status.json and settings.json.
-func (r *CachedReader) Read(sessionID string) (*Data, error) {
-	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
-	if err != nil {
-		return nil, err
-	}
-	return r.ReadForProfile(profile, sessionID)
 }
 
 // ReadForProfile reads and caches context data under an explicit profile.

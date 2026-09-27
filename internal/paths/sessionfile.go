@@ -16,36 +16,6 @@ import (
 // currently exists on this machine. Each just-pi-style agent keeps its
 // sessions under its own pi/ subdirectory, so new agents work without code
 // changes. When no agent directory exists, the default just path is returned.
-func SessionRoots() []string {
-	home, err := HomeDir()
-	if err != nil {
-		return nil
-	}
-	base := filepath.Join(home, ".ai")
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		return []string{filepath.Join(base, "just", "pi", "sessions")}
-	}
-	var roots []string
-	seen := make(map[string]bool)
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		sessionsDir := filepath.Join(base, e.Name(), "pi", "sessions")
-		if info, err := os.Stat(sessionsDir); err == nil && info.IsDir() {
-			if !seen[sessionsDir] {
-				roots = append(roots, sessionsDir)
-				seen[sessionsDir] = true
-			}
-		}
-	}
-	if len(roots) == 0 {
-		return []string{filepath.Join(base, "just", "pi", "sessions")}
-	}
-	return roots
-}
-
 // EncodeCwdDir returns the subdirectory name used by pi for a given working directory.
 // Format: leading and trailing dashes around the path with /, \\, : replaced by -.
 func EncodeCwdDir(cwd string) string {
@@ -59,55 +29,44 @@ func EncodeCwdDir(cwd string) string {
 // that one profile cannot pick up another profile's sessions. When agentDir is
 // empty the search falls back to all known roots (discovered by SessionRoots),
 // which is the legacy behaviour used by tools and tests.
-func FindSessionJSONL(sessionID, cwd, agentDir string) string {
-	path, _ := FindSessionJSONLChecked(sessionID, cwd, agentDir)
-	return path
-}
-
-// FindSessionJSONLChecked returns a matching session file or a diagnostic when
-// a candidate cannot be inspected safely. The error-free wrapper is retained
-// for legacy read-only callers.
+// FindSessionJSONLChecked returns a matching session file within one explicit
+// Pi agent, or a diagnostic when the agent/session data cannot be inspected safely.
 func FindSessionJSONLChecked(sessionID, cwd, agentDir string) (string, error) {
 	if err := ValidateSessionID(sessionID); err != nil {
 		return "", err
 	}
-
-	roots := sessionRootsFor(agentDir)
-	subdir := EncodeCwdDir(cwd)
-	preferred := sessionFileCandidate{}
-	for _, root := range roots {
-		candidate, ok, err := newestSessionFileChecked(filepath.Join(root, subdir), sessionID)
-		if err != nil {
-			return "", err
-		}
-		if ok && candidate.newerThan(preferred) {
-			preferred = candidate
-		}
+	if agentDir == "" {
+		return "", fmt.Errorf("agentDir is required for safe session lookup")
 	}
-	if preferred.path != "" {
+
+	root := filepath.Join(agentDir, "sessions")
+	subdir := EncodeCwdDir(cwd)
+	preferred, ok, err := newestSessionFileChecked(filepath.Join(root, subdir), sessionID)
+	if err != nil {
+		return "", err
+	}
+	if ok {
 		return preferred.path, nil
 	}
 
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read session root %s: %w", root, err)
+	}
 	fallback := sessionFileCandidate{}
-	for _, root := range roots {
-		entries, err := os.ReadDir(root)
-		if os.IsNotExist(err) {
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == subdir {
 			continue
 		}
+		candidate, ok, err := newestSessionFileChecked(filepath.Join(root, entry.Name()), sessionID)
 		if err != nil {
-			return "", fmt.Errorf("read session root %s: %w", root, err)
+			return "", err
 		}
-		for _, entry := range entries {
-			if !entry.IsDir() || entry.Name() == subdir {
-				continue
-			}
-			candidate, ok, err := newestSessionFileChecked(filepath.Join(root, entry.Name()), sessionID)
-			if err != nil {
-				return "", err
-			}
-			if ok && candidate.newerThan(fallback) {
-				fallback = candidate
-			}
+		if ok && candidate.newerThan(fallback) {
+			fallback = candidate
 		}
 	}
 	return fallback.path, nil
@@ -116,13 +75,6 @@ func FindSessionJSONLChecked(sessionID, cwd, agentDir string) (string, error) {
 // sessionRootsFor returns the search roots for FindSessionJSONL. When agentDir
 // is non-empty, only that agent's sessions dir is returned; otherwise all
 // known roots are used.
-func sessionRootsFor(agentDir string) []string {
-	if agentDir == "" {
-		return SessionRoots()
-	}
-	return []string{filepath.Join(agentDir, "sessions")}
-}
-
 type sessionFileCandidate struct {
 	path    string
 	modTime time.Time

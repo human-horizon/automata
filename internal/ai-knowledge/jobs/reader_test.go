@@ -78,11 +78,11 @@ func TestCachedReaderNoticesNestedJobMetadataChange(t *testing.T) {
 		return []Job{{ID: "call_" + strconv.Itoa(calls)}}, nil
 	})
 
-	first, err := reader.List(sessionID)
+	first, err := reader.ListForProfile("test", sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cached, err := reader.List(sessionID)
+	cached, err := reader.ListForProfile("test", sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestCachedReaderNoticesNestedJobMetadataChange(t *testing.T) {
 	if err := os.WriteFile(metaPath, []byte(`{"status":"exited","changed":true}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	updated, err := reader.List(sessionID)
+	updated, err := reader.ListForProfile("test", sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,27 +124,6 @@ func TestRunningCountForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("explicit profile running count = %d, want 1", count)
 	}
-	legacy, err := RunningCount(sessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if legacy != 1 {
-		t.Fatalf("legacy running count did not honor session profile prefix: %d", legacy)
-	}
-	listed, err := List(sessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(listed) != 1 || listed[0].ID != "job_active" {
-		t.Fatalf("legacy list did not honor session profile prefix: %#v", listed)
-	}
-	cached, err := NewCachedReader().List(sessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cached) != 1 || cached[0].ID != "job_active" {
-		t.Fatalf("cached legacy list did not honor session profile prefix: %#v", cached)
-	}
 }
 
 func TestRunningCountForEmptyExplicitProfileUsesDefault(t *testing.T) {
@@ -173,176 +152,6 @@ func TestRunningCountForEmptyExplicitProfileUsesDefault(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("empty explicit profile running count = %d, want 1 from default", count)
-	}
-}
-
-func TestLegacyJobReadersResolveProfilePrefixEnvironmentAndDefault(t *testing.T) {
-	dataHome := t.TempDir()
-	t.Setenv("AI_DATA_HOME", dataHome)
-	t.Setenv("AI_PROFILE", "wrong-profile")
-	writeRunningJob := func(profile, sessionID, jobID string) {
-		t.Helper()
-		jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", jobID)
-		if err := os.MkdirAll(jobDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		data := []byte(`{"id":"` + jobID + `","pid":` + strconv.Itoa(os.Getpid()) + `,"status":"running"}`)
-		if err := os.WriteFile(filepath.Join(jobDir, "job.json"), data, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	assertSession := func(sessionID, wantID string, wantCount int) {
-		t.Helper()
-		listed, err := List(sessionID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(listed) != 1 || listed[0].ID != wantID {
-			t.Fatalf("List(%q) = %#v, want job %q", sessionID, listed, wantID)
-		}
-		cached, err := NewCachedReader().List(sessionID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(cached) != 1 || cached[0].ID != wantID {
-			t.Fatalf("CachedReader.List(%q) = %#v, want job %q", sessionID, cached, wantID)
-		}
-		count, err := RunningCount(sessionID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if count != wantCount {
-			t.Fatalf("RunningCount(%q) = %d, want %d", sessionID, count, wantCount)
-		}
-	}
-
-	writeRunningJob("Encoded Profile", "encoded-profile__chat", "encoded-job")
-	writeRunningJob("wrong-profile", "encoded-profile__chat", "wrong-prefix-job")
-	assertSession("encoded-profile__chat", "encoded-job", 1)
-
-	writeRunningJob("wrong-profile", "legacy-chat", "environment-job")
-	writeRunningJob("", "legacy-chat", "default-decoy")
-	assertSession("legacy-chat", "environment-job", 1)
-
-	t.Setenv("AI_PROFILE", "")
-	writeRunningJob("", "default-chat", "default-job")
-	writeRunningJob("wrong-profile", "default-chat", "environment-decoy")
-	assertSession("default-chat", "default-job", 1)
-}
-
-func TestLegacyReadersAndKillResolveDefaultFamiliarSession(t *testing.T) {
-	t.Setenv("AI_DATA_HOME", t.TempDir())
-	t.Setenv("AI_PROFILE", "")
-	const (
-		sessionID = "chat__expert"
-		jobID     = "default-familiar-job"
-	)
-	startedAt := time.Now().UTC().Format(time.RFC3339)
-	jobDir, metaPath := writeScopedJobRecord(t, "", sessionID, jobID, os.Getpid(), startedAt)
-	if _, err := os.Stat(paths.SessionDir("chat", sessionID)); !os.IsNotExist(err) {
-		t.Fatalf("unexpected profile-chat session directory: %v", err)
-	}
-
-	previousSignal := processSignal
-	previousPS := psRunnerOverride
-	previousProbe := processProbeFn
-	t.Cleanup(func() {
-		processSignal = previousSignal
-		psRunnerOverride = previousPS
-		processProbeFn = previousProbe
-	})
-	signals := 0
-	processSignal = func(int, syscall.Signal) error {
-		signals++
-		return nil
-	}
-	psRunnerOverride = matchingPSRunner()
-	processProbeFn = func(int) bool { return false }
-
-	listed, err := List(sessionID)
-	if err != nil || len(listed) != 1 || listed[0].ID != jobID {
-		t.Fatalf("List(%q) = %#v, err=%v, want default familiar job", sessionID, listed, err)
-	}
-	cached, err := NewCachedReader().List(sessionID)
-	if err != nil || len(cached) != 1 || cached[0].ID != jobID {
-		t.Fatalf("CachedReader.List(%q) = %#v, err=%v, want default familiar job", sessionID, cached, err)
-	}
-	count, err := RunningCount(sessionID)
-	if err != nil || count != 1 {
-		t.Fatalf("RunningCount(%q) = %d, err=%v, want 1", sessionID, count, err)
-	}
-	if err := KillSession(sessionID); err != nil {
-		t.Fatalf("KillSession(%q): %v", sessionID, err)
-	}
-	if signals != 1 {
-		t.Fatalf("signals = %d, want exactly one default-profile job signal", signals)
-	}
-	var record JobRecord
-	if err := readJSON(metaPath, &record); err != nil {
-		t.Fatal(err)
-	}
-	if record.Status != "exited" {
-		t.Fatalf("default familiar job status = %q, want exited", record.Status)
-	}
-	if _, err := os.Stat(jobDir); err != nil {
-		t.Fatalf("default familiar job directory was not preserved: %v", err)
-	}
-}
-
-func TestLegacyDestructiveResolutionRejectsAmbiguousFamiliarSession(t *testing.T) {
-	t.Setenv("AI_DATA_HOME", t.TempDir())
-	t.Setenv("AI_PROFILE", "")
-	const sessionID = "foo__bar"
-	startedAt := time.Now().UTC().Format(time.RFC3339)
-	fooJobDir, fooMetaPath := writeScopedJobRecord(t, "foo", sessionID, "foo-job", os.Getpid(), startedAt)
-	defaultJobDir, defaultMetaPath := writeScopedJobRecord(t, "", sessionID, "default-job", os.Getpid(), startedAt)
-
-	previousSignal := processSignal
-	previousPS := psRunnerOverride
-	previousProbe := processProbeFn
-	t.Cleanup(func() {
-		processSignal = previousSignal
-		psRunnerOverride = previousPS
-		processProbeFn = previousProbe
-	})
-	signals := 0
-	processSignal = func(int, syscall.Signal) error {
-		signals++
-		return nil
-	}
-	psRunnerOverride = matchingPSRunner()
-	processProbeFn = func(int) bool { return false }
-
-	if err := KillSession(sessionID); !errors.Is(err, paths.ErrAmbiguousLegacySessionProfile) {
-		t.Fatalf("KillSession error = %v, want ambiguous-profile error", err)
-	}
-	if signals != 0 {
-		t.Fatalf("ambiguous KillSession sent %d signals, want zero", signals)
-	}
-	assertRunningRecord := func(metaPath string) {
-		t.Helper()
-		var record JobRecord
-		if err := readJSON(metaPath, &record); err != nil {
-			t.Fatal(err)
-		}
-		if record.Status != "running" {
-			t.Fatalf("job %q status = %q, want unchanged running", record.ID, record.Status)
-		}
-	}
-	assertRunningRecord(fooMetaPath)
-	assertRunningRecord(defaultMetaPath)
-
-	_, fooMetaPath = writeScopedJobRecord(t, "foo", sessionID, "foo-job", 0, "")
-	_, defaultMetaPath = writeScopedJobRecord(t, "", sessionID, "default-job", 0, "")
-	if err := PruneStaleSession(sessionID); !errors.Is(err, paths.ErrAmbiguousLegacySessionProfile) {
-		t.Fatalf("PruneStaleSession error = %v, want ambiguous-profile error", err)
-	}
-	assertRunningRecord(fooMetaPath)
-	assertRunningRecord(defaultMetaPath)
-	for _, jobDir := range []string{fooJobDir, defaultJobDir} {
-		if _, err := os.Stat(jobDir); err != nil {
-			t.Fatalf("ambiguous prune removed job directory %q: %v", jobDir, err)
-		}
 	}
 }
 
@@ -497,7 +306,7 @@ func TestPruneStaleSessionMarksDeadJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := PruneStaleSession(sessionID); err != nil {
+	if err := PruneStaleSessionForProfile("test", sessionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(jobDir); err != nil {
@@ -511,7 +320,7 @@ func TestPruneStaleSessionMarksDeadJobs(t *testing.T) {
 		t.Fatalf("pruned job status = %q, want exited", record.Status)
 	}
 
-	count, err := RunningCount(sessionID)
+	count, err := RunningCountForProfile("test", sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,7 +484,7 @@ func TestKillSessionDoesNotSignalRecycledPIDAndCleansStaleRecord(t *testing.T) {
 	}
 
 	jobDir, _ := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
-	if err := KillSession(sessionID); err != nil {
+	if err := KillSessionForProfile("test", sessionID); err != nil {
 		t.Fatal(err)
 	}
 	if called != 0 {
@@ -701,7 +510,7 @@ func TestKillSessionDoesNotSignalDeadPIDAndCleansStaleRecord(t *testing.T) {
 	}
 
 	jobDir, _ := writeKillSessionRecord(t, sessionID, 2_147_483_647, time.Now().UTC().Format(time.RFC3339))
-	if err := KillSession(sessionID); err != nil {
+	if err := KillSessionForProfile("test", sessionID); err != nil {
 		t.Fatal(err)
 	}
 	if called != 0 {
@@ -754,7 +563,7 @@ func TestKillSessionFailsClosedForUnknownPIDIdentity(t *testing.T) {
 			psRunnerOverride = tt.psResponse
 
 			_, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), tt.startedAt)
-			if err := KillSession(sessionID); err == nil {
+			if err := KillSessionForProfile("test", sessionID); err == nil {
 				t.Fatal("KillSession succeeded with unknown PID identity")
 			}
 			if called != 0 {
@@ -789,7 +598,7 @@ func TestKillSessionLeavesMetadataRunningWhenProcessSurvivesSIGTERM(t *testing.T
 	processProbeFn = func(int) bool { return true }
 
 	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
-	if err := KillSession(sessionID); err == nil || !strings.Contains(err.Error(), "still running") {
+	if err := KillSessionForProfile("test", sessionID); err == nil || !strings.Contains(err.Error(), "still running") {
 		t.Fatalf("KillSession error = %v, want still-running error", err)
 	}
 	var record JobRecord
@@ -829,7 +638,7 @@ func TestKillSessionSignalsMatchingLivePIDAndWritesExitedMetadata(t *testing.T) 
 	processProbeFn = func(int) bool { return false }
 
 	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
-	if err := KillSession(sessionID); err != nil {
+	if err := KillSessionForProfile("test", sessionID); err != nil {
 		t.Fatal(err)
 	}
 	if signaledPID != os.Getpid() || signaledSignal != syscall.SIGTERM {
@@ -864,7 +673,7 @@ func TestKillSessionReturnsSignalErrorAndPreservesLiveMetadata(t *testing.T) {
 	psRunnerOverride = matchingPSRunner()
 
 	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
-	if err := KillSession(sessionID); err == nil || !strings.Contains(err.Error(), "signal denied") {
+	if err := KillSessionForProfile("test", sessionID); err == nil || !strings.Contains(err.Error(), "signal denied") {
 		t.Fatalf("KillSession error = %v, want signal error", err)
 	}
 	var record JobRecord

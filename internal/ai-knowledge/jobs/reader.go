@@ -287,14 +287,6 @@ func listForProfile(profile, sessionID string) ([]Job, error) {
 
 // List resolves a legacy session by existing profile directories, then uses
 // the session-prefix, AI_PROFILE and default fallback order.
-func List(sessionID string) ([]Job, error) {
-	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
-	if err != nil {
-		return nil, err
-	}
-	return listForProfile(profile, sessionID)
-}
-
 // ListForProfile returns running jobs under an explicit canonical profile.
 func ListForProfile(profile, sessionID string) ([]Job, error) {
 	return listForProfile(profile, sessionID)
@@ -345,14 +337,6 @@ func pruneStaleSessionForProfile(profile, sessionID string) error {
 
 // PruneStaleSession resolves a legacy session before mutation and fails closed
 // when its directory exists under multiple candidate profiles.
-func PruneStaleSession(sessionID string) error {
-	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileDestructive)
-	if err != nil {
-		return err
-	}
-	return pruneStaleSessionForProfile(profile, sessionID)
-}
-
 // PruneStaleSessionForProfile marks dead jobs under an explicit profile.
 func PruneStaleSessionForProfile(profile, sessionID string) error {
 	return pruneStaleSessionForProfile(profile, sessionID)
@@ -392,14 +376,6 @@ func runningCountForProfile(profile, sessionID string) (int, error) {
 
 // RunningCount resolves a legacy session by existing profile directories,
 // then uses the session-prefix, AI_PROFILE and default fallback order.
-func RunningCount(sessionID string) (int, error) {
-	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
-	if err != nil {
-		return 0, err
-	}
-	return runningCountForProfile(profile, sessionID)
-}
-
 // RunningCountForProfile returns the number of running records under an
 // explicit canonical profile.
 func RunningCountForProfile(profile, sessionID string) (int, error) {
@@ -450,14 +426,6 @@ func materializeStaleJob(_ string, metaPath string, rec *JobRecord) error {
 
 // KillSession resolves the legacy session directory and fails closed when
 // multiple candidate profiles contain it.
-func KillSession(sessionID string) error {
-	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileDestructive)
-	if err != nil {
-		return err
-	}
-	return KillSessionForProfile(profile, sessionID)
-}
-
 type killCandidate struct {
 	jobDirName string
 	record     JobRecord
@@ -744,14 +712,6 @@ func (r *CachedReader) Invalidate(profile, sessionID string) {
 	r.mu.Lock()
 	r.cache.Delete(profile + "\x00" + sessionID)
 	r.mu.Unlock()
-}
-
-func (r *CachedReader) List(sessionID string) ([]Job, error) {
-	profile, err := paths.ResolveLegacySessionProfile(sessionID, paths.LegacySessionProfileReadOnly)
-	if err != nil {
-		return nil, err
-	}
-	return r.ListForProfile(profile, sessionID)
 }
 
 func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) {
