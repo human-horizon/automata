@@ -20,10 +20,7 @@ type stateFile struct {
 }
 
 func TestTerminalDoesNotHang(t *testing.T) {
-	binary := os.Getenv("AUTOMATA_BIN")
-	if binary == "" {
-		binary = "../automata"
-	}
+	binary := automataBinary(t)
 
 	// Use a clean profile directory so repeated test runs do not accumulate
 	// duplicate terminal items in state.
@@ -123,10 +120,7 @@ func TestTerminalDoesNotHang(t *testing.T) {
 }
 
 func TestTerminalRestoresCWD(t *testing.T) {
-	binary := os.Getenv("AUTOMATA_BIN")
-	if binary == "" {
-		binary = "../automata"
-	}
+	binary := automataBinary(t)
 
 	// Use a clean profile directory so repeated test runs do not accumulate
 	// duplicate terminal items in state.

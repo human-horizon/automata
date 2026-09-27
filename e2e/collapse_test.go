@@ -17,10 +17,7 @@ import (
 // expands into the freed space and the application stays alive.
 // Regression test for "chat does not resize when tree panel is collapsed".
 func TestChatResizesOnTreeCollapse(t *testing.T) {
-	binary := os.Getenv("AUTOMATA_BIN")
-	if binary == "" {
-		binary = "../automata"
-	}
+	binary := automataBinary(t)
 
 	// Isolate all profile and diagnostic data from the user's home.
 	t.Setenv("HOME", t.TempDir())

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -31,17 +32,23 @@ func projectRoot() string {
 
 func main() {
 	root := projectRoot()
+	binary, cleanupBinary, err := buildAutomataBinary(root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	defer cleanupBinary()
 
 	// Request an element-tree HTTP server from Automata and wait for it to
 	// write the listening port to a temp file.
-	portFile := filepath.Join(root, fmt.Sprintf(".automata-port-%d", os.Getpid()))
+	portFile := filepath.Join(os.TempDir(), fmt.Sprintf("automata-port-%d", os.Getpid()))
 	defer func() {
 		if err := os.Remove(portFile); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "remove port file: %v\n", err)
 		}
 	}()
 
-	app, err := cue.Launch(filepath.Join(root, "automata"),
+	app, err := cue.Launch(binary,
 		cue.WithDir(root),
 		cue.WithSize(80, 24),
 		cue.WithEnv("TERM=xterm-256color", "AUTOMATA_ELEMENTS_PORT_FILE="+portFile),

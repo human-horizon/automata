@@ -10,10 +10,7 @@ import (
 )
 
 func TestMouseESCDebug(t *testing.T) {
-	binary := os.Getenv("AUTOMATA_BIN")
-	if binary == "" {
-		binary = "../automata"
-	}
+	binary := automataBinary(t)
 
 	home, err := os.UserHomeDir()
 	if err != nil {
