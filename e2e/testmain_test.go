@@ -5,10 +5,35 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
+func goEnvValue(name string) (string, error) {
+	cmd := exec.Command("go", "env", name)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("go env %s: %w", name, err)
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "" {
+		return "", fmt.Errorf("go env %s returned an empty value", name)
+	}
+	return value, nil
+}
+
 func TestMain(m *testing.M) {
+	originalGoPath, err := goEnvValue("GOPATH")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolve E2E GOPATH: %v\n", err)
+		os.Exit(1)
+	}
+	originalGoCache, err := goEnvValue("GOCACHE")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolve E2E GOCACHE: %v\n", err)
+		os.Exit(1)
+	}
+
 	sandbox, err := os.MkdirTemp("", "automata-e2e-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create E2E sandbox: %v\n", err)
@@ -34,6 +59,12 @@ func TestMain(m *testing.M) {
 	}
 	if err := os.Setenv("HOME", homeDir); err != nil {
 		failSetup("set E2E HOME: %v", err)
+	}
+	if err := os.Setenv("GOPATH", originalGoPath); err != nil {
+		failSetup("set E2E GOPATH: %v", err)
+	}
+	if err := os.Setenv("GOCACHE", originalGoCache); err != nil {
+		failSetup("set E2E GOCACHE: %v", err)
 	}
 	if err := os.Setenv("AI_DATA_HOME", dataDir); err != nil {
 		failSetup("set E2E AI_DATA_HOME: %v", err)
