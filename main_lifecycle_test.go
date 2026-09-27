@@ -18,7 +18,7 @@ func TestStopSessionRuntimeClearsOwnerAndFamiliarState(t *testing.T) {
 		runningSessions:       map[string]struct{}{"owner": {}, "owner__expert": {}},
 		emulatorCache:         map[string]*portalis.Emulator{"owner": portalis.NewEmulator("owner", "owner", "", nil)},
 		familiarEmulatorCache: map[string]*portalis.Emulator{"owner__expert": portalis.NewEmulator("owner__expert", "expert", "", nil)},
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 	}
 	killed := make([]string, 0, 2)
 	app.killSessionFn = func(_, sessionID string) error {
@@ -66,7 +66,7 @@ func TestStopSessionRuntimeSurfacesActiveSessionPersistenceFailure(t *testing.T)
 		runningSessions:       map[string]struct{}{sessionID: {}},
 		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "owner", "", nil)},
 		familiarEmulatorCache: make(map[string]*portalis.Emulator),
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 	}
 
 	err := app.stopSessionRuntime(sessionID, stopSessionOptions{persistInactive: true})
@@ -132,7 +132,7 @@ func TestCleanupDeletedTreeItemAbortsOnActiveSessionPersistenceFailure(t *testin
 		runningSessions:       map[string]struct{}{sessionID: {}},
 		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "chat", "", nil)},
 		familiarEmulatorCache: make(map[string]*portalis.Emulator),
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 	}
 
 	if err := app.cleanupDeletedTreeItem(item); err == nil {
@@ -157,7 +157,7 @@ func TestCleanupDeletedTreeItemLeavesRuntimeOnJobPreflightFailure(t *testing.T) 
 		runningSessions:       map[string]struct{}{sessionID: {}},
 		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "chat", "", nil)},
 		familiarEmulatorCache: make(map[string]*portalis.Emulator),
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 	}
 	stopErr := errors.New("job preflight failed")
 	app.prepareJobSessionFn = func(string, string) error { return stopErr }
@@ -193,7 +193,7 @@ func TestCleanupDeletedTreeItemCommitsRuntimeOnSignalFailure(t *testing.T) {
 		runningSessions:       map[string]struct{}{sessionID: {}},
 		emulatorCache:         map[string]*portalis.Emulator{sessionID: portalis.NewEmulator(sessionID, "chat", "", nil)},
 		familiarEmulatorCache: make(map[string]*portalis.Emulator),
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 	}
 	app.killSessionFn = func(string, string) error {
 		return errors.New("signal failed")
@@ -220,7 +220,7 @@ func TestStopSessionRuntimePreflightsAllSessionsBeforeSignals(t *testing.T) {
 		runningSessions:       map[string]struct{}{"owner": {}, "owner__expert": {}},
 		emulatorCache:         map[string]*portalis.Emulator{"owner": portalis.NewEmulator("owner", "owner", "", nil)},
 		familiarEmulatorCache: map[string]*portalis.Emulator{"owner__expert": portalis.NewEmulator("owner__expert", "expert", "", nil)},
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 	}
 	prepared := make([]string, 0, 2)
 	prepareErr := errors.New("unknown PID identity")
@@ -255,7 +255,7 @@ func TestStopSessionRuntimeCleansAllTargetsAfterPartialSignalFailure(t *testing.
 		runningSessions:       map[string]struct{}{"owner": {}, "owner__expert": {}},
 		emulatorCache:         map[string]*portalis.Emulator{"owner": portalis.NewEmulator("owner", "owner", "", nil)},
 		familiarEmulatorCache: map[string]*portalis.Emulator{"owner__expert": portalis.NewEmulator("owner__expert", "expert", "", nil)},
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 	}
 	calls := 0
 	app.killSessionFn = func(_, sessionID string) error {

@@ -89,8 +89,8 @@ type App struct {
 	// statusWatcher observes only currently active chat directories.
 	statusWatcher *fsnotify.Watcher
 
-	// sessionWatchers indexes active session paths registered on the shared watcher.
-	sessionWatchers   map[string]*fsnotify.Watcher
+	// sessionWatchers is the set of active session IDs registered on statusWatcher.
+	sessionWatchers   map[string]struct{}
 	statusSessionDirs map[string]string
 
 	// statusWatchPending guards the single blocking reader for statusWatcher.
@@ -317,7 +317,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 		scrollbackLines:       scrollback.DefaultLines,
 		piAgentDir:            piAgentDir,
 		statusReader:          status.NewCachedReader(profile),
-		sessionWatchers:       make(map[string]*fsnotify.Watcher),
+		sessionWatchers:       make(map[string]struct{}),
 		statusSessionDirs:     make(map[string]string),
 		pendingMovePlans:      make(map[*tree.Item]*renamePlan),
 		pendingRenamePlans:    make(map[*tree.Item]*renamePlan),
@@ -1264,7 +1264,7 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 		return nil
 	}
 	if a.sessionWatchers == nil {
-		a.sessionWatchers = make(map[string]*fsnotify.Watcher)
+		a.sessionWatchers = make(map[string]struct{})
 	}
 	if a.statusSessionDirs == nil {
 		a.statusSessionDirs = make(map[string]string)
@@ -1300,7 +1300,7 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 	}
 
 	for key, dir := range desired {
-		if current, exists := a.sessionWatchers[key]; exists && current == a.statusWatcher {
+		if _, exists := a.sessionWatchers[key]; exists {
 			if a.statusSessionDirs[dir] == key {
 				continue
 			}
@@ -1312,7 +1312,7 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 			a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable for %s: %w", key, err))
 			continue
 		}
-		a.sessionWatchers[key] = a.statusWatcher
+		a.sessionWatchers[key] = struct{}{}
 		a.statusSessionDirs[dir] = key
 		// status.json may have been written before this watch was attached.
 		a.statusReader.Invalidate(key)

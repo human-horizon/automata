@@ -1449,7 +1449,7 @@ func newTestApp(t *testing.T, profile string) *App {
 		piAgentDir:        filepath.Join(home, ".ai", profile, "pi"),
 		activeSessions:    make(map[string]struct{}),
 		statusReader:      status.NewCachedReader(profile),
-		sessionWatchers:   make(map[string]*fsnotify.Watcher),
+		sessionWatchers:   make(map[string]struct{}),
 		statusSessionDirs: make(map[string]string),
 	}
 }
@@ -1570,9 +1570,6 @@ func TestSetupStatusWatcherAttachesActiveSessions(t *testing.T) {
 	_ = app.syncSessionWatchers()
 	t.Cleanup(func() {
 		app.statusWatcher.Close()
-		for _, w := range app.sessionWatchers {
-			w.Close()
-		}
 	})
 
 	if app.statusWatcher == nil {
@@ -1602,9 +1599,6 @@ func TestSyncSessionWatchersPrunesRemovedTreeSession(t *testing.T) {
 	_ = app.syncSessionWatchers()
 	t.Cleanup(func() {
 		app.statusWatcher.Close()
-		for _, w := range app.sessionWatchers {
-			w.Close()
-		}
 	})
 	if _, ok := app.sessionWatchers[key]; !ok {
 		t.Fatal("expected watcher after setup")
@@ -1771,7 +1765,7 @@ func TestStatusWatcherRecoveryRecreatesOneSharedWatcher(t *testing.T) {
 	cmds := app.syncSessionWatchers()
 	oldWatcher := app.statusWatcher
 	oldGeneration := app.statusGeneration
-	if oldWatcher == nil || app.sessionWatchers[key] != oldWatcher || len(cmds) != 1 {
+	if _, watched := app.sessionWatchers[key]; oldWatcher == nil || !watched || len(cmds) != 1 {
 		t.Fatal("test setup did not mount exactly one shared watcher")
 	}
 	t.Cleanup(func() { app.Close() })
@@ -1787,8 +1781,8 @@ func TestStatusWatcherRecoveryRecreatesOneSharedWatcher(t *testing.T) {
 	if app.statusWatcher == nil || app.statusWatcher == oldWatcher {
 		t.Fatal("status watcher was not recreated")
 	}
-	if app.sessionWatchers[key] != app.statusWatcher {
-		t.Fatal("session index does not point to the recreated shared watcher")
+	if _, watched := app.sessionWatchers[key]; !watched {
+		t.Fatal("session index was not restored on the recreated shared watcher")
 	}
 	if app.statusGeneration == oldGeneration {
 		t.Fatal("watcher generation was not advanced")
@@ -1872,9 +1866,6 @@ func TestSyncSessionWatchersReturnsCmdsOnlyForNewWatchers(t *testing.T) {
 	app.setupStatusWatcher()
 	t.Cleanup(func() {
 		app.statusWatcher.Close()
-		for _, w := range app.sessionWatchers {
-			w.Close()
-		}
 	})
 
 	first := app.syncSessionWatchers()
@@ -1934,7 +1925,7 @@ func TestStatusWatcherUpdatesOnlyChangedBadgeAndFiltersFiles(t *testing.T) {
 	app.activeSessions[keys["agent"]] = struct{}{}
 	app.setupStatusWatcher()
 	cmds := app.syncSessionWatchers()
-	if len(cmds) != 1 || app.sessionWatchers[keys["agent"]] != app.statusWatcher {
+	if _, watched := app.sessionWatchers[keys["agent"]]; len(cmds) != 1 || !watched {
 		t.Fatal("active session directory did not mount on the shared watcher")
 	}
 	if _, watched := app.sessionWatchers[keys["second"]]; watched {
@@ -2000,7 +1991,7 @@ func TestStatusWatcherMountsActiveSessionDirectory(t *testing.T) {
 	t.Cleanup(func() { app.Close() })
 
 	dir := filepath.Join(app.sessionBaseDir(), key)
-	if app.sessionWatchers[key] != app.statusWatcher {
+	if _, watched := app.sessionWatchers[key]; !watched {
 		t.Fatal("active session directory was not attached to the shared watcher")
 	}
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
@@ -2111,7 +2102,7 @@ func TestStatusWatcherTracksOnlyActiveChats(t *testing.T) {
 	if len(app.sessionWatchers) != 1 {
 		t.Fatalf("status watch count = %d, want 1 active chat", len(app.sessionWatchers))
 	}
-	if app.sessionWatchers[active] != app.statusWatcher {
+	if _, watched := app.sessionWatchers[active]; !watched {
 		t.Fatal("active chat is not mounted on the shared watcher")
 	}
 }
