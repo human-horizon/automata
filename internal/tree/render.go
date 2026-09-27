@@ -441,8 +441,8 @@ func (t *Tree) renderHeader(width int) string {
 	}
 
 	titlePart := styles.titleStyle.Render(title)
-	rootMenuPart := styles.actionIconHoverStyle.Copy().Bold(true).Render(rootMenuBtn)
-	plusPart := styles.activeStyle.Copy().Bold(true).Render(plusBtn)
+	rootMenuPart := styles.actionIconHoverStyle.Bold(true).Render(rootMenuBtn)
+	plusPart := styles.activeStyle.Bold(true).Render(plusBtn)
 
 	line := titlePart
 	lineW := lipgloss.Width(stripANSI(line)) + lipgloss.Width(stripANSI(rootMenuPart)) + lipgloss.Width(stripANSI(plusPart))

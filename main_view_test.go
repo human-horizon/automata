@@ -955,7 +955,9 @@ func TestCloseFamiliarCleansHostState(t *testing.T) {
 	}
 	app.tree.Profile = profile
 
-	app.closeFamiliar(famSID, familiarEm)
+	if err := app.closeFamiliar(famSID, familiarEm); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, ok := app.emulatorCache[famSID]; ok {
 		t.Fatal("familiar remained in emulatorCache")

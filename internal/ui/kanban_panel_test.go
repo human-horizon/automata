@@ -709,7 +709,9 @@ func TestTaskStatusWritesUseExplicitProfilePath(t *testing.T) {
 	profile := "Profile Ω"
 	sessionID := "profile-ω__chat"
 
-	writeTaskToChatStatus(profile, sessionID, "Build", "/tmp/build.md")
+	if err := writeTaskToChatStatus(profile, sessionID, "Build", "/tmp/build.md"); err != nil {
+		t.Fatal(err)
+	}
 	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 	data, err := os.ReadFile(statusPath)
 	if err != nil {
@@ -719,7 +721,9 @@ func TestTaskStatusWritesUseExplicitProfilePath(t *testing.T) {
 		t.Fatalf("assigned status = %s", data)
 	}
 
-	writeTaskRemovedFromChat(profile, sessionID, "Build")
+	if err := writeTaskRemovedFromChat(profile, sessionID, "Build"); err != nil {
+		t.Fatal(err)
+	}
 	data, err = os.ReadFile(statusPath)
 	if err != nil {
 		t.Fatal(err)

@@ -235,7 +235,7 @@ func newApp(profile, piAgentDir string) (a *App) {
 		delete(a.pendingMovePlans, item)
 		if plan != nil {
 			a.applyRenameMappings(plan)
-			a.finalizeRenamePlan(plan)
+			_ = a.finalizeRenamePlan(plan)
 		}
 	})
 

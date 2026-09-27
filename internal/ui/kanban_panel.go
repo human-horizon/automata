@@ -749,7 +749,7 @@ func (k *KanbanPanel) createTask() error {
 
 func (k *KanbanPanel) createTaskAt(createdAt time.Time) error {
 	if k.domain == "" {
-		return errors.New("Kanban domain is not selected")
+		return errors.New("kanban domain is not selected")
 	}
 	dir := kanban.KanbanDir(k.domain, k.profile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -989,7 +989,7 @@ func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
 	borderStyle := styles.border
 	bgStyle := styles.background
 	if isHover {
-		borderStyle = styles.border.Copy().Foreground(lipgloss.Color(palette.Border))
+		borderStyle = styles.border.Foreground(lipgloss.Color(palette.Border))
 		bgStyle = styles.backgroundHover
 	}
 

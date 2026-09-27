@@ -75,15 +75,6 @@ func (t *Tree) flatIndexAt(screenY int) int {
 	return t.rowToFlat[screenY]
 }
 
-// menuAction is a function that executes a context menu action.
-type menuAction func()
-
-// menuItem is an item in the context menu.
-type menuItem struct {
-	Name   string
-	Action menuAction
-}
-
 // ItemSelectedMsg is emitted when any tree item is selected.
 type ItemSelectedMsg struct {
 	Item *Item
@@ -415,7 +406,7 @@ func (t *Tree) RecordActionWarning(err error) {
 	if t.lastActionError != nil {
 		err = errors.Join(t.lastActionError, err)
 	}
-	t.recordActionError(err)
+	_ = t.recordActionError(err)
 }
 
 // StateLoadError returns the startup snapshot error that blocks persistence.
@@ -730,7 +721,7 @@ func (t *Tree) MoveSelectedOutChecked() (bool, error) {
 			}
 			return false, t.recordActionError(err)
 		}
-		t.recordActionError(err)
+		_ = t.recordActionError(err)
 	} else {
 		t.lastActionError = nil
 	}
@@ -1065,11 +1056,6 @@ func (t *Tree) addChildChat(parent *Item, name string) error {
 	return err
 }
 
-func (t *Tree) addChildTerminal(parent *Item, name string) error {
-	_, err := t.CreateChildTerminal(parent, name)
-	return err
-}
-
 // sortChildrenAlphabetically reorders parent.Children in place: folders
 // first (A→Z), then chats (A→Z), then terminals (A→Z). Stable sort
 // preserves the original relative order of items sharing a name+kind, so
@@ -1220,7 +1206,7 @@ func (t *Tree) renameItem(item *Item, name string) error {
 	t.rebuildFlat()
 	if err := t.SaveState(); err != nil {
 		if stateCommitWasApplied(err) {
-			t.recordActionError(err)
+			_ = t.recordActionError(err)
 			if t.onRenameCommitted != nil {
 				t.onRenameCommitted(item, oldName, name)
 			}
@@ -1316,7 +1302,7 @@ func (t *Tree) DeleteItem(item *Item) error {
 		return t.recordActionError(saveErr)
 	}
 	if saveErr != nil {
-		t.recordActionError(saveErr)
+		_ = t.recordActionError(saveErr)
 	} else {
 		t.lastActionError = nil
 	}
@@ -1468,7 +1454,7 @@ func (t *Tree) MoveItemChecked(item, target *Item) error {
 	t.reselectItem(oldSelectedItem)
 	if err := t.SaveState(); err != nil {
 		if stateCommitWasApplied(err) {
-			t.recordActionError(err)
+			_ = t.recordActionError(err)
 			if oldID != newID && t.onItemMoved != nil {
 				t.onItemMoved(item, oldID, newID)
 			}
@@ -1552,7 +1538,7 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 			items = append(items, []warp.PopoverItem{
 				{Name: "Reveal in File Manager", Action: func() {
 					if err := revealInFileManager(sel.BoundPath); err != nil {
-						t.recordActionError(err)
+						_ = t.recordActionError(err)
 					}
 				}},
 				{Name: "Unbind", Action: func() { t.unbindFolder(sel) }},
@@ -1568,7 +1554,7 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 			{Name: "Delete", Action: func() { t.startConfirm(sel) }},
 		}...)
 	} else if sel != nil && !sel.IsFolder {
-		deleteLabel := "Delete"
+		var deleteLabel string
 		if sel.IsTerminal {
 			deleteLabel = "Delete terminal"
 		} else {
@@ -1724,35 +1710,6 @@ func (t *Tree) toggleArchive(item *Item) {
 	})
 }
 
-func (t *Tree) showCreateMenu(parent *Item, x, y int) {
-	var items []warp.PopoverItem
-	if parent != nil {
-		items = []warp.PopoverItem{
-			{Name: "New Folder", Action: func() {
-				t.startCreateInput("Folder name:", func(name string) (*Item, error) { return t.CreateChildFolder(parent, name) })
-			}},
-			{Name: "New Chat", Action: func() {
-				t.startCreateInput("Chat name:", func(name string) (*Item, error) { return t.CreateChildChat(parent, name) })
-			}},
-			{Name: "New Terminal", Action: func() {
-				t.startCreateInput("Terminal name:", func(name string) (*Item, error) { return t.CreateChildTerminal(parent, name) })
-			}},
-		}
-	} else {
-		items = []warp.PopoverItem{
-			{Name: "New Folder", Action: func() { t.startCreateInput("Folder name:", t.CreateFolder) }},
-			{Name: "New Chat", Action: func() { t.startCreateInput("Chat name:", t.CreateChat) }},
-			{Name: "New Terminal", Action: func() { t.startCreateInput("Terminal name:", t.CreateTerminal) }},
-		}
-	}
-	t.popover = &warp.Popover{
-		Items:   items,
-		X:       x,
-		Y:       y,
-		OnClose: func() { t.popover = nil },
-	}
-}
-
 // --- Modal management ---
 
 // startConfirm enters delete-confirmation mode.
@@ -1761,7 +1718,7 @@ func (t *Tree) startConfirm(item *Item) {
 	t.confirmItem = item
 	t.confirmYes = func() { t.deleteItem(item) }
 
-	title := "Delete"
+	var title string
 	if item.IsFolder {
 		title = "Delete folder"
 	} else if item.IsTerminal {
@@ -1849,7 +1806,7 @@ func (t *Tree) confirmInput() {
 	if t.inputDone != nil {
 		if err := t.inputDone(t.inputValue); err != nil {
 			if stateCommitWasApplied(err) {
-				t.recordActionError(err)
+				_ = t.recordActionError(err)
 			} else {
 				t.inputError = err.Error()
 				t.updateInputModal()
@@ -1993,7 +1950,7 @@ func (t *Tree) SetTheme(id string) bool {
 		t.Theme = resolved.ID
 	}
 	if err := t.SaveState(); err != nil {
-		t.recordActionError(err)
+		_ = t.recordActionError(err)
 	} else {
 		t.lastActionError = nil
 	}
@@ -2337,6 +2294,6 @@ func (t *Tree) resetHover() {
 // autoSave persists the tree state to disk.
 func (t *Tree) autoSave() {
 	if err := t.SaveState(); err != nil {
-		t.recordActionError(err)
+		_ = t.recordActionError(err)
 	}
 }

@@ -17,12 +17,6 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// stubPanel is a minimal warp.Panel for tests.
-type stubPanel struct{}
-
-func (stubPanel) View(width, height int) string { return "" }
-func (stubPanel) Update(msg tea.Msg) tea.Cmd    { return nil }
-
 func TestKnowledgePanelLateAttachesSessionAndJobsWatchersWithoutPolling(t *testing.T) {
 	profile := "Late Knowledge"
 	sessionID := "late-knowledge__chat"

@@ -110,7 +110,9 @@ func TestRenameCleanupWarningsRemainVisibleWithoutRollback(t *testing.T) {
 			plan := app.pendingMovePlans[item]
 			delete(app.pendingMovePlans, item)
 			app.applyRenameMappings(plan)
-			app.finalizeRenamePlan(plan)
+			if err := app.finalizeRenamePlan(plan); err == nil {
+				t.Error("expected injected post-commit cleanup warning")
+			}
 		})
 
 		if err := tr.MoveItemChecked(item, target); err != nil {
@@ -462,7 +464,9 @@ func TestMoveSaveStateFailureRestoresTreeBeforeRuntimeRollback(t *testing.T) {
 	if err := os.MkdirAll(paths.SessionDir(profile, oldID), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	tr.SetActiveSessions(map[string]struct{}{oldID: {}})
+	if err := tr.SetActiveSessions(map[string]struct{}{oldID: {}}); err != nil {
+		t.Fatal(err)
+	}
 
 	app := &App{
 		tree:                  tr,

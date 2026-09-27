@@ -35,7 +35,11 @@ func main() {
 	// Request an element-tree HTTP server from Automata and wait for it to
 	// write the listening port to a temp file.
 	portFile := filepath.Join(root, fmt.Sprintf(".automata-port-%d", os.Getpid()))
-	defer os.Remove(portFile)
+	defer func() {
+		if err := os.Remove(portFile); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "remove port file: %v\n", err)
+		}
+	}()
 
 	app, err := cue.Launch(filepath.Join(root, "automata"),
 		cue.WithDir(root),
@@ -71,8 +75,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "get elements: %v\n", err)
 			os.Exit(1)
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "read elements response: %v\n", readErr)
+			os.Exit(1)
+		}
+		if closeErr != nil {
+			fmt.Fprintf(os.Stderr, "close elements response: %v\n", closeErr)
+			os.Exit(1)
+		}
 		var elems []warp.Element
 		if err := json.Unmarshal(body, &elems); err != nil {
 			fmt.Fprintf(os.Stderr, "decode elements: %v\n", err)
@@ -168,11 +180,20 @@ func main() {
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
 	title, _ := find("title-bar", "Folder name", "")
-	page.MouseDown(0, title.Bounds.X, title.Bounds.Y)
+	if err := page.MouseDown(0, title.Bounds.X, title.Bounds.Y); err != nil {
+		fmt.Fprintf(os.Stderr, "mouse down modal title: %v\n", err)
+		return
+	}
 	page.WaitStable(50 * time.Millisecond)
-	page.MouseMove(title.Bounds.X, title.Bounds.Y+5)
+	if err := page.MouseMove(title.Bounds.X, title.Bounds.Y+5); err != nil {
+		fmt.Fprintf(os.Stderr, "drag modal title: %v\n", err)
+		return
+	}
 	page.WaitStable(50 * time.Millisecond)
-	page.MouseUp(0, title.Bounds.X, title.Bounds.Y+5)
+	if err := page.MouseUp(0, title.Bounds.X, title.Bounds.Y+5); err != nil {
+		fmt.Fprintf(os.Stderr, "mouse up modal title: %v\n", err)
+		return
+	}
 	page.WaitStable(200 * time.Millisecond)
 	printScreen(page)
 	// Use the close (✕) button for cancelling the input modal, which is more
@@ -194,11 +215,20 @@ func main() {
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
 	title, _ = find("title-bar", "Delete chat", "")
-	page.MouseDown(0, title.Bounds.X, title.Bounds.Y)
+	if err := page.MouseDown(0, title.Bounds.X, title.Bounds.Y); err != nil {
+		fmt.Fprintf(os.Stderr, "mouse down modal title: %v\n", err)
+		return
+	}
 	page.WaitStable(50 * time.Millisecond)
-	page.MouseMove(title.Bounds.X, title.Bounds.Y+5)
+	if err := page.MouseMove(title.Bounds.X, title.Bounds.Y+5); err != nil {
+		fmt.Fprintf(os.Stderr, "drag modal title: %v\n", err)
+		return
+	}
 	page.WaitStable(50 * time.Millisecond)
-	page.MouseUp(0, title.Bounds.X, title.Bounds.Y+5)
+	if err := page.MouseUp(0, title.Bounds.X, title.Bounds.Y+5); err != nil {
+		fmt.Fprintf(os.Stderr, "mouse up modal title: %v\n", err)
+		return
+	}
 	page.WaitStable(200 * time.Millisecond)
 	printScreen(page)
 	// Use the cancel/esc button by action; the rendered label varies with width.
@@ -209,7 +239,10 @@ func main() {
 	fmt.Println("\n=== Step 11: Delete 'temp' chat via hover ✕ action ===")
 	el, _ := find("folder", "temp", "")
 	// Hover over the temp folder row so action icons appear.
-	page.MouseMove(el.Bounds.X+el.Bounds.W/2, el.Bounds.Y)
+	if err := page.MouseMove(el.Bounds.X+el.Bounds.W/2, el.Bounds.Y); err != nil {
+		fmt.Fprintf(os.Stderr, "hover temp chat: %v\n", err)
+		return
+	}
 	page.WaitStable(100 * time.Millisecond)
 	click("action", "delete:temp", "delete")
 	page.WaitStable(300 * time.Millisecond)

@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -271,6 +272,7 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	return atomicfile.WriteFrom(dst, in, 0o600)
+	writeErr := atomicfile.WriteFrom(dst, in, 0o600)
+	closeErr := in.Close()
+	return errors.Join(writeErr, closeErr)
 }

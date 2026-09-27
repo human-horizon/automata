@@ -11,14 +11,11 @@ import (
 func TestMigrateLegacyData(t *testing.T) {
 	// Use a temporary home to avoid touching real ~/.automata.
 	tmpHome := t.TempDir()
-	oldHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", oldHome)
+	t.Setenv("HOME", tmpHome)
 
 	// Use a temporary AI_DATA_HOME to isolate the new layout.
 	tmpAI := t.TempDir()
-	os.Setenv("AI_DATA_HOME", tmpAI)
-	defer os.Unsetenv("AI_DATA_HOME")
+	t.Setenv("AI_DATA_HOME", tmpAI)
 
 	// Create legacy data.
 	legacyDir := filepath.Join(tmpHome, ".automata")

@@ -17,7 +17,7 @@ func ValidateSessionID(sessionID string) error {
 		return fmt.Errorf("session ID %q contains a traversal component", sessionID)
 	}
 	for _, r := range sessionID {
-		if unicode.IsControl(r) || !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '.' || r == '_' || r == '-') {
+		if unicode.IsControl(r) || (!unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '.' && r != '_' && r != '-') {
 			return fmt.Errorf("session ID %q contains an unsafe character", sessionID)
 		}
 	}

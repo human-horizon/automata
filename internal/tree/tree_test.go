@@ -373,7 +373,9 @@ func TestAddChildFolder(t *testing.T) {
 	tr := New()
 	tr.AddFolder("parent")
 	parent := tr.root[0]
-	tr.addChildFolder(parent, "child")
+	if err := tr.addChildFolder(parent, "child"); err != nil {
+		t.Fatal(err)
+	}
 
 	if len(parent.Children) != 1 {
 		t.Fatalf("expected 1 child, got %d", len(parent.Children))
@@ -465,7 +467,9 @@ func TestMoveItemIntoDescendantNoop(t *testing.T) {
 	tr := New()
 	tr.AddFolder("outer")
 	outer := tr.root[0]
-	tr.addChildFolder(outer, "inner")
+	if err := tr.addChildFolder(outer, "inner"); err != nil {
+		t.Fatal(err)
+	}
 	inner := outer.Children[0]
 	tr.addChildChat(inner, "chat")
 	chat := inner.Children[0]
@@ -725,7 +729,9 @@ func TestEffectiveBoundPathAncestor(t *testing.T) {
 	tr := New()
 	tr.AddFolder("parent")
 	parent := tr.root[0]
-	tr.addChildFolder(parent, "child")
+	if err := tr.addChildFolder(parent, "child"); err != nil {
+		t.Fatal(err)
+	}
 	child := parent.Children[0]
 	parent.SetBoundPath("/tmp")
 	if got := child.EffectiveBoundPath(); got != "/tmp" {
@@ -1087,9 +1093,11 @@ func TestFolderActiveIndicator(t *testing.T) {
 	c := tree.root[1]
 	f.Children = append(f.Children, c)
 
-	tree.SetActiveSessions(map[string]struct{}{
+	if err := tree.SetActiveSessions(map[string]struct{}{
 		tree.sessionIDOf(c): {},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if !tree.HasActiveDescendant(f) {
 		t.Fatalf("expected folder to have active descendant")
@@ -1113,9 +1121,11 @@ func TestFolderActiveIndicatorNested(t *testing.T) {
 	inner.Children = append(inner.Children, c)
 	outer.Children = append(outer.Children, inner)
 
-	tree.SetActiveSessions(map[string]struct{}{
+	if err := tree.SetActiveSessions(map[string]struct{}{
 		tree.sessionIDOf(c): {},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if !tree.HasActiveDescendant(outer) {
 		t.Fatalf("expected outer folder to have active descendant")
@@ -1150,10 +1160,8 @@ func TestFolderNoActiveDescendant(t *testing.T) {
 // restored with the tree state.
 func TestActiveSessionsPersistence(t *testing.T) {
 	tmpDir := t.TempDir()
-	os.Setenv("AI_DATA_HOME", tmpDir)
-	os.Setenv("AI_PROFILE", "active-test")
-	defer os.Unsetenv("AI_DATA_HOME")
-	defer os.Unsetenv("AI_PROFILE")
+	t.Setenv("AI_DATA_HOME", tmpDir)
+	t.Setenv("AI_PROFILE", "active-test")
 
 	tree := New()
 	tree.Profile = "active-test"

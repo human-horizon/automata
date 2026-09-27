@@ -12,8 +12,6 @@ import (
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 )
 
-const legacyStateFileName = ".automata/state.json"
-
 // CommittedStateError reports a directory-sync failure after state.json was
 // atomically replaced. Callers must keep the committed in-memory mutation.
 type CommittedStateError struct {

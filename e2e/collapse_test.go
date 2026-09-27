@@ -52,11 +52,17 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	page := app.Page()
 	page.WaitStable(100 * time.Millisecond)
-	page.EnableMouse()
+	if err := page.EnableMouse(); err != nil {
+		t.Fatalf("enable mouse: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Cleanup(func() {

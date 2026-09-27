@@ -53,7 +53,6 @@ func renderMarkdownWithTheme(width int, content string, palette apptheme.Theme) 
 		if inCode {
 			if strings.HasPrefix(strings.TrimSpace(line), "```") {
 				inCode = false
-				codeLanguage = ""
 				continue
 			}
 			writeCodeLine(&rendered, width, line, styles)

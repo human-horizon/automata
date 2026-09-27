@@ -334,7 +334,7 @@ func (a *App) prepareRenamePlan(plan *renamePlan) error {
 				}
 				newPath := filepath.Join(kanban.KanbanDir(session.newDomain, a.profile), filepath.Base(task.Path))
 				if _, exists := seenTaskTargets[newPath]; exists {
-					return fmt.Errorf("Kanban task target collision: %s", newPath)
+					return fmt.Errorf("kanban task target collision: %s", newPath)
 				}
 				seenTaskTargets[newPath] = struct{}{}
 				exists, err := pathExists(newPath)
@@ -342,7 +342,7 @@ func (a *App) prepareRenamePlan(plan *renamePlan) error {
 					return fmt.Errorf("check Kanban task target %q: %w", newPath, err)
 				}
 				if exists {
-					return fmt.Errorf("Kanban task target already exists: %s", newPath)
+					return fmt.Errorf("kanban task target already exists: %s", newPath)
 				}
 				plan.taskMoves = append(plan.taskMoves, renameTaskMove{
 					oldPath:     task.Path,

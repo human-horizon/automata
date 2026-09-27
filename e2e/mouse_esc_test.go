@@ -34,7 +34,9 @@ func TestMouseESCDebug(t *testing.T) {
 
 	page := app.Page()
 
-	// Wait for initial render WITHOUT enabling mouse via page.EnableMouse().
+	// Wait for initial render WITHOUT enabling mouse via if err := page.EnableMouse(); err != nil {
+		t.Fatalf("enable mouse: %v", err)
+	}.
 	// This simulates a real terminal where Bubbletea sends the mouse sequences.
 	page.WaitStable(1 * time.Second)
 
@@ -42,7 +44,9 @@ func TestMouseESCDebug(t *testing.T) {
 	text, _ := page.Text()
 	t.Logf("Initial screen (no mouse enable):\n%s", text)
 
-	// Try clicking WITHOUT page.EnableMouse() — this simulates a real terminal
+	// Try clicking WITHOUT if err := page.EnableMouse(); err != nil {
+		t.Fatalf("enable mouse: %v", err)
+	} — this simulates a real terminal
 	// where the user clicks and the terminal sends mouse events based on
 	// Bubbletea's ESC sequences.
 	t.Log("Clicking + button at (17, 0) WITHOUT explicit mouse enable")
@@ -64,7 +68,9 @@ func TestMouseESCDebug(t *testing.T) {
 	}
 
 	// Now enable mouse and try again
-	page.EnableMouse()
+	if err := page.EnableMouse(); err != nil {
+		t.Fatalf("enable mouse: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Log("Clicking + button at (17, 0) WITH explicit mouse enable")

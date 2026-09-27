@@ -418,7 +418,9 @@ func TestStructuralMutationsRollbackOnSaveFailure(t *testing.T) {
 				tr.AddFolder("source")
 				tr.AddFolder("target")
 				source, target := tr.root[0], tr.root[1]
-				tr.addChildChat(source, "moving")
+				if err := tr.addChildChat(source, "moving"); err != nil {
+					t.Fatal(err)
+				}
 				moving := source.Children[0]
 				return tr, func() bool { return moving.parent == source && len(source.Children) == 1 && len(target.Children) == 0 }
 			},
@@ -447,8 +449,12 @@ func TestStructuralMutationsRollbackOnSaveFailure(t *testing.T) {
 				tr := New()
 				tr.AddFolder("parent")
 				parent := tr.root[0]
-				tr.addChildChat(parent, "z")
-				tr.addChildChat(parent, "a")
+				if err := tr.addChildChat(parent, "z"); err != nil {
+					t.Fatal(err)
+				}
+				if err := tr.addChildChat(parent, "a"); err != nil {
+					t.Fatal(err)
+				}
 				return tr, func() bool { return parent.Children[0].Name == "z" && parent.Children[1].Name == "a" }
 			},
 		},
@@ -690,7 +696,9 @@ func TestSetActiveSessionsKeepsCommittedSnapshotAfterDirectorySyncWarning(t *tes
 func TestTreeFooterShowsPersistenceErrors(t *testing.T) {
 	tr := New()
 	tr.NoColor = true
-	tr.recordActionError(errors.New("persistence failed"))
+	if err := tr.recordActionError(errors.New("persistence failed")); err == nil {
+		t.Fatal("recordActionError unexpectedly returned nil")
+	}
 	footer := tr.renderFooter(50)
 	if !strings.Contains(footer, "persistence failed") {
 		t.Fatalf("footer %q does not show action error", footer)

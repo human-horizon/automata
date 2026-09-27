@@ -103,10 +103,13 @@ func waitForTerminalPrompt(t *testing.T, page *cue.Page) {
 	t.Fatalf("terminal prompt did not appear")
 }
 
-func writeSessionMarker(page *cue.Page) {
+func writeSessionMarker(t *testing.T, page *cue.Page) {
+	t.Helper()
 	const marker = "/tmp/automata-e2e-session-id.txt"
 	cmd := `echo "$AUTOMATA_SESSION_ID" > ` + marker + "\n"
-	page.Type(cmd)
+	if err := page.Type(cmd); err != nil {
+		t.Fatalf("type session marker command: %v", err)
+	}
 	page.WaitStable(300 * time.Millisecond)
 	page.Press("Enter")
 	page.WaitStable(1 * time.Second)
@@ -140,7 +143,9 @@ func TestRenameChatWithF2(t *testing.T) {
 	for range "Old Chat" {
 		page.Press("Backspace")
 	}
-	page.Type("Renamed Chat")
+	if err := page.Type("Renamed Chat"); err != nil {
+		t.Fatalf("type renamed chat: %v", err)
+	}
 	page.Press("Enter")
 	page.WaitStable(300 * time.Millisecond)
 
@@ -180,7 +185,7 @@ func TestRootChatSessionID(t *testing.T) {
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
-	writeSessionMarker(page)
+	writeSessionMarker(t, page)
 
 	want := "cue-test-session__obschie-voprosy"
 	got := readSessionMarker(t)
@@ -213,7 +218,7 @@ func TestFolderChatSessionID(t *testing.T) {
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
-	writeSessionMarker(page)
+	writeSessionMarker(t, page)
 
 	want := "cue-test-session-folder__segodnya.my-chat"
 	got := readSessionMarker(t)
@@ -256,7 +261,7 @@ func TestUniqueSessionID(t *testing.T) {
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
-	writeSessionMarker(page)
+	writeSessionMarker(t, page)
 	first := readSessionMarker(t)
 
 	// Return focus to tree and click the second "My Chat".
@@ -269,7 +274,7 @@ func TestUniqueSessionID(t *testing.T) {
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
-	writeSessionMarker(page)
+	writeSessionMarker(t, page)
 	second := readSessionMarker(t)
 
 	if first == second {

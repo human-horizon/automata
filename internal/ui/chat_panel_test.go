@@ -105,20 +105,6 @@ func (p *messageRecordingPanel) Update(msg tea.Msg) tea.Cmd {
 	return nil
 }
 
-// recordingPanel captures every warp.ResizeMsg it receives so tests can
-// assert how ChatPanel resized its children.
-type recordingPanel struct {
-	sizes []warp.ResizeMsg
-}
-
-func (r *recordingPanel) View(width, height int) string { return "" }
-func (r *recordingPanel) Update(msg tea.Msg) tea.Cmd {
-	if rm, ok := msg.(warp.ResizeMsg); ok {
-		r.sizes = append(r.sizes, rm)
-	}
-	return nil
-}
-
 func assertCompleteSGRSequences(t *testing.T, value string) {
 	t.Helper()
 	for offset := 0; offset < len(value); {

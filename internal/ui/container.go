@@ -113,7 +113,6 @@ func (c *Container) planFraction(width int) float64 {
 	terminalW := width - 1 - planW
 	if terminalW < 20 {
 		terminalW = 20
-		planW = width - 1 - terminalW
 	}
 	fraction := float64(terminalW) / float64(width)
 	if fraction < 0 {

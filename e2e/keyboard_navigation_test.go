@@ -13,9 +13,15 @@ func TestKeyboardHelpOpens(t *testing.T) {
 	profile := "cue-test-keyboard-help"
 	writeSessionFixture(t, profile, nil)
 	app, page := launchAutomataForSession(t, profile)
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
-	page.Press("F1")
+	if err := page.Press("F1"); err != nil {
+		t.Fatalf("press F1: %v", err)
+	}
 	page.WaitStable(200 * time.Millisecond)
 	text, err := page.Text()
 	if err != nil {
@@ -39,7 +45,9 @@ func TestKeyboardHelpOpens(t *testing.T) {
 		t.Fatalf("Help is still inside the Tree panel: column %d\n%s", helpColumn, text)
 	}
 
-	page.Press("Escape")
+	if err := page.Press("Escape"); err != nil {
+		t.Fatalf("press Escape: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
 	text, err = page.Text()
 	if err != nil {
@@ -54,7 +62,11 @@ func TestSettingsMenuOpensAndPersistsTheme(t *testing.T) {
 	profile := "cue-test-settings-theme"
 	profileDir := writeSessionFixture(t, profile, nil)
 	app, page := launchAutomataForSession(t, profile)
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	lines, err := page.Lines()
 	if err != nil {
@@ -148,7 +160,11 @@ func TestRootMenuSortsByName(t *testing.T) {
 		{Name: "bravo"},
 	})
 	app, page := launchAutomataForSession(t, profile)
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	page.Press("F10")
 	page.WaitStable(100 * time.Millisecond)
