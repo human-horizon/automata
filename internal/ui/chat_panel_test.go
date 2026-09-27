@@ -14,7 +14,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	warp "github.com/starframe-dev/warp"
 )
 
 func TestChatPanelTabBarShowsWatcherWarning(t *testing.T) {
