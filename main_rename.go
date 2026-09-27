@@ -820,4 +820,3 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 		return a.restoreRenameRuntime(runtimeSnapshot, false)
 	}, nil
 }
-
