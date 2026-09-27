@@ -1192,8 +1192,8 @@ func (a *App) activeChatSessionID() string {
 	return ""
 }
 
-// treeStatusChangedMsg is sent by the single status watcher for any event on
-// the sessions root or a mounted session directory.
+// treeStatusChangedMsg is sent by the shared status watcher for an event in
+// one of the currently active chat session directories.
 type treeStatusChangedMsg struct {
 	generation uint64
 	watcher    *fsnotify.Watcher
@@ -1250,8 +1250,8 @@ func (a *App) resetStatusWatcher() {
 	}
 }
 
-// syncSessionWatchers adds visible session directories to the shared watcher,
-// removes stale ones, and keeps exactly one blocking reader armed.
+// syncSessionWatchers adds active chat session directories to the shared
+// watcher, removes inactive ones, and keeps exactly one blocking reader armed.
 func (a *App) syncSessionWatchers() []tea.Cmd {
 	if a.tree == nil {
 		return nil
@@ -1286,6 +1286,7 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 		}
 		delete(a.statusSessionDirs, oldDir)
 		delete(a.sessionWatchers, key)
+		a.statusReader.Invalidate(key)
 		a.tree.SetStatusBadge(key, "")
 	}
 
@@ -1414,27 +1415,22 @@ func (a *App) recoverStatusWatcher() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// recomputeTreeStatusBadges walks every chat item, reads its on-disk status.json
-// (cheap: a single tiny file, served from the mtime-cached statusReader) and
-// pushes an emoji-per-session map to the Tree so that each chat row can show a
-// 🧠/📖/✏️/🔍/⚙️/💤 indicator next to its name. Best-effort: missing files
-// are treated as idle (no badge).
+// recomputeTreeStatusBadges rebuilds badges only for chats that Automata
+// currently considers active. Stale status.json from a previous run must never
+// make an inactive Tree row look live.
 func (a *App) recomputeTreeStatusBadges() {
 	if a.tree == nil {
 		return
 	}
 	badges := map[string]string{}
-	for _, it := range a.tree.AllItems() {
-		if it == nil || it.IsFolder || it.IsTerminal {
-			continue
-		}
-		key := a.tree.SessionKeyOf(it)
-		if key == "" {
+	for key := range a.activeSessions {
+		item := a.tree.FindItemBySessionID(key)
+		if item == nil || item.IsFolder || item.IsTerminal {
 			continue
 		}
 		action := a.statusReader.Read(key)
-		if emoji := status.Emoji(action); emoji != "" {
-			badges[key] = emoji
+		if badge := status.Emoji(action); badge != "" {
+			badges[key] = badge
 		}
 	}
 	a.tree.SetStatusBadges(badges)

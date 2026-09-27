@@ -19,7 +19,7 @@ func TestEmoji(t *testing.T) {
 		"grep":     "G",
 		"find":     "F",
 		"analyze":  "A",
-		"wait":     "W",
+		"wait":     "w",
 		"job":      "J",
 		"run":      ">",
 		"idle":     "",
@@ -31,9 +31,8 @@ func TestEmoji(t *testing.T) {
 		"active": "",
 		"status": "",
 		"":       "",
-		// Anything we don't recognise still surfaces as a generic dot so
-		// a typo in status.json doesn't render as idle.
-		"weird": "•",
+		// Anything we don't recognise remains visibly distinct from idle.
+		"weird": "?",
 	}
 	for action, want := range cases {
 		if got := Emoji(action); got != want {

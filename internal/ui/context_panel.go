@@ -76,9 +76,10 @@ func (c *ContextPanel) SetProfile(profile string) {
 	if c.profile == profile {
 		return
 	}
+	oldProfile := c.profile
 	c.closeNotesWatcher()
+	c.notesReader.Invalidate(oldProfile, c.domain)
 	c.profile = profile
-	c.notesReader.Invalidate(c.profile, c.domain)
 	c.refresh()
 	c.kanbanPanel.SetProfile(profile)
 	if c.active && c.activeTab == 0 {
@@ -118,7 +119,7 @@ func (c *ContextPanel) SetDomain(domain string) {
 	c.kanbanPanel.SetDomain(domain)
 }
 
-// Refresh re-reads domain notes and kanban tasks from disk. Safe to call from a tick.
+// Refresh re-reads the current domain notes from disk on demand.
 func (c *ContextPanel) Refresh() {
 	c.refresh()
 }

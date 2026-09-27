@@ -241,8 +241,8 @@ func expandMarker(item *Item) string {
 
 // ── Status column ────────────────────────────────────────────────
 
-// statusString returns the status symbol + text for an item, or "" if the
-// item has no status. The result is used in the right-aligned status column.
+// statusString returns the right-aligned status text for an item. Inactive
+// leaves always render idle even if an old on-disk status badge is cached.
 func (t *Tree) statusString(item *Item) string {
 	if item.IsFolder {
 		if t.HasActiveDescendant(item) {
@@ -250,18 +250,17 @@ func (t *Tree) statusString(item *Item) string {
 		}
 		return ""
 	}
-	// Active session with a known status badge.
-	if !item.IsTerminal {
-		if b := t.StatusBadge(item); b != "" {
-			// b is an emoji like 🧠📖✏️🔍⚙️💤 — map to spec symbols.
-			return statusEmojiToSpec(b)
+	// Only active chat sessions may expose a live substatus.
+	if !item.IsTerminal && t.IsActiveSession(item) {
+		if badge := t.StatusBadge(item); badge != "" {
+			return statusEmojiToSpec(badge)
 		}
 	}
 	// No badge — idle.
 	return "○ idle"
 }
 
-// statusEmojiToSpec maps the old emoji badges to spec-compliant symbols.
+// statusEmojiToSpec maps compact status badge codes to display text.
 //
 // The spec requires "active" to never be shown: a session running without a
 // recorded substatus must look idle. Unknown emojis therefore map to "" so
@@ -276,9 +275,8 @@ func statusEmojiToSpec(emoji string) string {
 	return "● " + word
 }
 
-// statusEmojiToWord returns the canonical substatus word for a given status
-// glyph (the keys SetStatusBadges was given). The mapping mirrors
-// status.Emoji() in pkg/status.
+// statusEmojiToWord returns the canonical substatus word for a compact status
+// code. The mapping mirrors internal/status.Emoji.
 //
 // "active" is intentionally not handled: a session running without a
 // recorded substatus must not be labeled "active" in the tree.
@@ -289,10 +287,9 @@ func statusEmojiToWord(emoji string) string {
 	case "R":
 		return "read"
 	case "W":
-		// "W" is shared by "write" and "wait" in the emoji map; pick "write"
-		// here for the glyph. The action field on status.json is the source
-		// of truth — see status.Word() for the full set.
 		return "write"
+	case "w":
+		return "wait"
 	case "G":
 		return "grep"
 	case "F":
@@ -305,6 +302,8 @@ func statusEmojiToWord(emoji string) string {
 		return "run"
 	case "X":
 		return "stopped"
+	case "?":
+		return "unknown"
 	case "":
 		return "idle"
 	}

@@ -149,13 +149,15 @@ func (k *KnowledgePanel) SetProfile(profile string) {
 	if k.profile == profile {
 		return
 	}
+	oldProfile := k.profile
 	k.closeWatchers()
+	k.contextReader.Invalidate(oldProfile, k.sessionID)
+	k.jobsReader.Invalidate(oldProfile, k.sessionID)
 	k.profile = profile
 	k.data = nil
 	k.jobs = nil
 	k.contextError = ""
 	k.jobsError = ""
-	k.contextReader.Invalidate(k.profile, k.sessionID)
 	k.readSettings()
 	if k.active {
 		k.setupWatchers()
@@ -202,9 +204,8 @@ func (k *KnowledgePanel) SetSession(sessionID string) {
 	}
 }
 
-// closeWatchers releases both the status/plans/settings watcher and the
-// jobs/ directory watcher. Called from SetSession and on shutdown so we
-// never leak fsnotify descriptors.
+// closeWatchers releases the session, jobs and Kanban watchers. Called from
+// identity changes and shutdown so stale readers cannot retain descriptors.
 func (k *KnowledgePanel) closeWatchers() {
 	k.knowledgeGeneration++
 	k.jobsGeneration++

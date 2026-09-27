@@ -136,7 +136,7 @@ func Emoji(action string) string {
 	case "analyze":
 		return "A"
 	case "wait":
-		return "W" // also W — distinguishable by full word in tree
+		return "w"
 	case "job":
 		return "J"
 	case "run":
@@ -155,8 +155,8 @@ func Emoji(action string) string {
 	if action == "" {
 		return ""
 	}
-	// Fallback for unknown actions so a typo in status.json still surfaces.
-	return "•"
+	// Fallback for unknown actions so a typo in status.json stays visible.
+	return "?"
 }
 
 // Word returns the lowercase canonical substatus name for the tree status

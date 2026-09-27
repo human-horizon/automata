@@ -15,8 +15,8 @@ type ContainerMode int
 const dragResizeInterval = 33 * time.Millisecond
 
 const (
-	// ChatMode shows a chat terminal on the left and the ai-knowledge panel
-	// (status/plans/jobs/notes) on the right.
+	// ChatMode shows a chat terminal on the left and the session Knowledge
+	// panel (status/plans/jobs/current task) on the right.
 	ChatMode ContainerMode = iota
 	// FolderMode shows the ai-knowledge domain panel for a folder.
 	FolderMode

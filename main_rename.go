@@ -9,12 +9,15 @@ import (
 	"strings"
 
 	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/slug"
 	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/Starframe/portalis"
 )
+
+var assignRenameTask = kanban.AssignTask
 
 type renameSessionPlan struct {
 	oldID      string
@@ -246,6 +249,9 @@ func (a *App) applyRenameMappings(plan *renamePlan) {
 			}
 		}
 		a.container.RenameDomains(domainMap)
+		if cmd := a.container.Activate(); cmd != nil {
+			a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, cmd)
+		}
 	}
 }
 
@@ -395,8 +401,14 @@ func (a *App) prepareRenamePlan(plan *renamePlan) error {
 		if err := checkRenamePath(oldDir, newDir, "familiar session"); err != nil {
 			return err
 		}
-		oldJSONL := paths.FindSessionJSONL(familiar.oldID, familiar.cwd, agentDir)
-		newJSONL := paths.FindSessionJSONL(familiar.newID, familiar.cwd, agentDir)
+		oldJSONL, err := paths.FindSessionJSONLChecked(familiar.oldID, familiar.cwd, agentDir)
+		if err != nil {
+			return fmt.Errorf("inspect source familiar JSONL %s: %w", familiar.oldID, err)
+		}
+		newJSONL, err := paths.FindSessionJSONLChecked(familiar.newID, familiar.cwd, agentDir)
+		if err != nil {
+			return fmt.Errorf("inspect target familiar JSONL %s: %w", familiar.newID, err)
+		}
 		if newJSONL != "" && newJSONL != oldJSONL {
 			return fmt.Errorf("familiar JSONL target already exists: %s", newJSONL)
 		}
@@ -609,7 +621,10 @@ func moveRenameTask(move *renameTaskMove) error {
 		return err
 	}
 	move.moved = true
-	if _, err := kanban.AssignTask(move.newPath, move.newAssigned); err != nil {
+	if _, err := assignRenameTask(move.newPath, move.newAssigned); err != nil {
+		if atomicfile.IsCommitted(err) {
+			move.assignmentUpdated = true
+		}
 		return err
 	}
 	move.assignmentUpdated = true
@@ -621,7 +636,7 @@ func rollbackRenameTask(move *renameTaskMove) {
 		return
 	}
 	if move.assignmentUpdated {
-		if _, err := kanban.AssignTask(move.newPath, move.oldAssigned); err != nil {
+		if _, err := assignRenameTask(move.newPath, move.oldAssigned); err != nil {
 			log.Printf("automata: rollback Kanban task assignment %s: %v", move.newPath, err)
 		}
 	}
@@ -649,7 +664,7 @@ func rollbackRename(
 	}
 	for i := len(assignmentMoves) - 1; i >= 0; i-- {
 		move := assignmentMoves[i]
-		if _, err := kanban.AssignTask(move.path, move.old); err != nil {
+		if _, err := assignRenameTask(move.path, move.old); err != nil {
 			log.Printf("automata: rollback Kanban assignment %s: %v", move.path, err)
 		}
 	}
@@ -737,7 +752,10 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 			if task.AssignedTo != session.oldID {
 				continue
 			}
-			if _, err := kanban.AssignTask(task.Path, session.newID); err != nil {
+			if _, err := assignRenameTask(task.Path, session.newID); err != nil {
+				if atomicfile.IsCommitted(err) {
+					assignmentMoves = append(assignmentMoves, renameAssignmentMove{path: task.Path, old: session.oldID})
+				}
 				return fail(fmt.Errorf("migrate Kanban assignment %s: %w", task.Path, err))
 			}
 			assignmentMoves = append(assignmentMoves, renameAssignmentMove{path: task.Path, old: session.oldID})
@@ -749,11 +767,11 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 			continue
 		}
 		migratedJSONL, err := paths.MigrateSessionJSONL(session.oldID, session.newID, session.cwd, agentDir)
-		if err != nil {
-			return fail(fmt.Errorf("migrate session JSONL %s: %w", session.oldID, err))
-		}
 		if migratedJSONL != "" {
 			jsonlMoves = append(jsonlMoves, renameJSONLMove{oldID: session.oldID, newID: session.newID, cwd: session.cwd})
+		}
+		if err != nil {
+			return fail(fmt.Errorf("migrate session JSONL %s: %w", session.oldID, err))
 		}
 	}
 
@@ -762,11 +780,11 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 			continue
 		}
 		mapping, err := paths.RewriteFamiliarSessionIDs(a.profile, session.oldID, session.newID)
-		if err != nil {
-			return fail(fmt.Errorf("migrate familiars %s: %w", session.oldID, err))
-		}
 		if len(mapping) > 0 {
 			familiarFiles = append(familiarFiles, renameFamiliarFileMove{oldOwnerID: session.oldID, newOwnerID: session.newID})
+		}
+		if err != nil {
+			return fail(fmt.Errorf("migrate familiars %s: %w", session.oldID, err))
 		}
 	}
 	for _, familiar := range plan.familiars {
@@ -778,11 +796,11 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 			return fail(fmt.Errorf("move familiar session %s: %w", familiar.oldID, err))
 		}
 		migratedJSONL, err := paths.MigrateSessionJSONL(familiar.oldID, familiar.newID, familiar.cwd, agentDir)
-		if err != nil {
-			return fail(fmt.Errorf("migrate familiar JSONL %s: %w", familiar.oldID, err))
-		}
 		if migratedJSONL != "" {
 			jsonlMoves = append(jsonlMoves, renameJSONLMove{oldID: familiar.oldID, newID: familiar.newID, cwd: familiar.cwd})
+		}
+		if err != nil {
+			return fail(fmt.Errorf("migrate familiar JSONL %s: %w", familiar.oldID, err))
 		}
 	}
 

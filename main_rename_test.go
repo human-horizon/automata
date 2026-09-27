@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
+	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/Starframe/portalis"
@@ -613,6 +615,60 @@ func TestRenameStopsOnlySelectedSession(t *testing.T) {
 	}
 	if _, ok := app.emulatorCache[secondID]; !ok {
 		t.Fatal("sibling emulator was stopped")
+	}
+}
+
+func TestMoveRenameTaskRollsBackCommittedAssignmentWarning(t *testing.T) {
+	base := t.TempDir()
+	oldPath := filepath.Join(base, "source", "task.md")
+	newPath := filepath.Join(base, "target", "task.md")
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	contents := []byte("---\ntitle: Build\nstatus: progress\nassigned_to: profile__old\n---\nbody\n")
+	if err := os.WriteFile(oldPath, contents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	realAssign := kanban.AssignTask
+	previousAssign := assignRenameTask
+	calls := 0
+	assignRenameTask = func(path, sessionID string) (kanban.Task, error) {
+		calls++
+		task, err := realAssign(path, sessionID)
+		if err != nil {
+			return task, err
+		}
+		if calls == 1 {
+			return task, &atomicfile.CommittedError{Path: path, Err: errors.New("directory sync warning")}
+		}
+		return task, nil
+	}
+	t.Cleanup(func() { assignRenameTask = previousAssign })
+
+	move := renameTaskMove{
+		oldPath:     oldPath,
+		newPath:     newPath,
+		oldAssigned: "profile__old",
+		newAssigned: "profile__new",
+	}
+	if err := moveRenameTask(&move); err == nil || !atomicfile.IsCommitted(err) {
+		t.Fatalf("moveRenameTask error = %v, want committed warning", err)
+	}
+	if !move.assignmentUpdated {
+		t.Fatal("committed assignment was not recorded for rollback")
+	}
+
+	rollbackRenameTask(&move)
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Fatalf("target task remains after rollback: %v", err)
+	}
+	rolledBack, err := kanban.ReadTask(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolledBack.AssignedTo != "profile__old" {
+		t.Fatalf("rolled-back assignee = %q, want profile__old", rolledBack.AssignedTo)
 	}
 }
 

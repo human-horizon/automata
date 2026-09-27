@@ -96,7 +96,9 @@ func TestStatusBadgeRendersInline(t *testing.T) {
 	tr := New()
 	tr.AddChat("readme")
 	solo := tr.AllItems()[0]
-	tr.SetStatusBadges(map[string]string{tr.SessionKeyOf(solo): "R"})
+	key := tr.SessionKeyOf(solo)
+	tr.SetStatusBadges(map[string]string{key: "R"})
+	tr.SetActiveSessionsInMemory(map[string]struct{}{key: {}})
 
 	out := tr.renderItemLine(solo, 80, false, false, branchInfo{}, 0)
 	if !strings.Contains(out, "● read") {
@@ -104,6 +106,21 @@ func TestStatusBadgeRendersInline(t *testing.T) {
 	}
 	if !strings.Contains(out, "readme") {
 		t.Fatalf("expected chat name in rendered line, got %q", out)
+	}
+}
+
+func TestInactiveSessionIgnoresStaleBadge(t *testing.T) {
+	tr := New()
+	tr.AddChat("stale")
+	item := tr.AllItems()[0]
+	tr.SetStatusBadges(map[string]string{tr.SessionKeyOf(item): "R"})
+
+	out := tr.renderItemLine(item, 80, false, false, branchInfo{}, 0)
+	if strings.Contains(out, "● read") {
+		t.Fatalf("inactive session rendered stale live badge: %q", out)
+	}
+	if !strings.Contains(out, "○ idle") {
+		t.Fatalf("inactive session did not render idle: %q", out)
 	}
 }
 

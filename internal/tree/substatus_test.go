@@ -11,10 +11,12 @@ func renderWithBadge(t *testing.T, badge string) string {
 	t.Helper()
 	tr := New()
 	tr.AddChat("agent")
-	if badge != "" {
-		tr.SetStatusBadges(map[string]string{tr.SessionKeyOf(tr.AllItems()[0]): badge})
-	}
 	solo := tr.AllItems()[0]
+	key := tr.SessionKeyOf(solo)
+	tr.SetActiveSessionsInMemory(map[string]struct{}{key: {}})
+	if badge != "" {
+		tr.SetStatusBadges(map[string]string{key: badge})
+	}
 	return tr.renderItemLine(solo, 120, false, false, branchInfo{}, 0)
 }
 
@@ -23,6 +25,7 @@ func TestStatusBadgeWords(t *testing.T) {
 		"~": "thinking",
 		"R": "read",
 		"W": "write",
+		"w": "wait",
 		"G": "grep",
 		"F": "find",
 		"A": "analyze",
@@ -46,16 +49,19 @@ func TestStatusBadgeWords(t *testing.T) {
 	}
 }
 
-// TestActiveBadgeNeverShown is the regression test for the spec: a session
-// running without a recorded substatus must display as idle, NOT as
-// "● active". The emoji map no longer contains "active" so this is enforced
-// by the empty-string fallback.
-func TestActiveBadgeNeverShown(t *testing.T) {
-	out := renderWithBadge(t, "•") // unknown glyph used to map to "active"
+func TestUnknownStatusRemainsVisible(t *testing.T) {
+	out := renderWithBadge(t, "?")
+	if !strings.Contains(out, "● unknown") {
+		t.Errorf("unknown status should remain visible, got %q", out)
+	}
+}
+
+func TestActiveWithoutSubstatusRendersIdle(t *testing.T) {
+	out := renderWithBadge(t, "")
 	if strings.Contains(out, "active") {
 		t.Errorf("rendered line must not contain 'active', got %q", out)
 	}
 	if !strings.Contains(out, "idle") {
-		t.Errorf("unknown badge should fall back to idle, got %q", out)
+		t.Errorf("active session without substatus should render idle, got %q", out)
 	}
 }

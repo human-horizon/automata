@@ -796,14 +796,6 @@ func TestRouteCachedEmulatorMessageLeavesUnknownMessagesForWarp(t *testing.T) {
 	}
 }
 
-func TestKnowledgeRefreshDoesNotSchedulePeriodicWork(t *testing.T) {
-	app := &App{container: &ui.Container{}}
-	_, cmd := app.Update(ui.KnowledgeRefreshMsg{})
-	if cmd != nil {
-		t.Fatal("KnowledgeRefreshMsg unexpectedly scheduled periodic work")
-	}
-}
-
 func TestWindowResizeDoesNotSchedulePeriodicWork(t *testing.T) {
 	w := warp.New()
 	w.SetRoot(nil)
@@ -1441,6 +1433,7 @@ func TestRecomputeTreeStatusBadgesReadsAction(t *testing.T) {
 		t.Fatalf("write status: %v", err)
 	}
 
+	app.activeSessions[key] = struct{}{}
 	app.recomputeTreeStatusBadges()
 
 	if got := app.tree.StatusBadge(app.tree.AllItems()[0]); got == "" {
@@ -1448,6 +1441,24 @@ func TestRecomputeTreeStatusBadgesReadsAction(t *testing.T) {
 	}
 	if got := app.tree.StatusBadge(app.tree.AllItems()[0]); got != "~" {
 		t.Fatalf("expected ~ for action=thinking, got %q", got)
+	}
+}
+
+func TestRecomputeTreeStatusBadgesIgnoresInactiveStaleStatus(t *testing.T) {
+	app := newTestApp(t, "test")
+	item := app.tree.AllItems()[0]
+	key := app.tree.SessionKeyOf(item)
+	dir := filepath.Join(app.sessionBaseDir(), key)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"action":"thinking"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app.recomputeTreeStatusBadges()
+	if got := app.tree.StatusBadge(item); got != "" {
+		t.Fatalf("inactive stale badge = %q, want empty", got)
 	}
 }
 
@@ -1467,6 +1478,7 @@ func TestRecomputeTreeStatusBadgesIdleLeavesEmpty(t *testing.T) {
 		t.Fatalf("write status: %v", err)
 	}
 
+	app.activeSessions[key] = struct{}{}
 	app.recomputeTreeStatusBadges()
 
 	if got := app.tree.StatusBadge(app.tree.AllItems()[0]); got != "" {

@@ -480,8 +480,8 @@ func TestListDoesNotMutateDisk(t *testing.T) {
 	}
 }
 
-// TestPruneStaleSessionMarksDeadJobs verifies the new explicit cleanup path
-// is the one that flips running→exited and removes the job directory.
+// TestPruneStaleSessionMarksDeadJobs verifies the explicit cleanup path
+// flips running→exited while preserving completed job history.
 func TestPruneStaleSessionMarksDeadJobs(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("AI_DATA_HOME", dataHome)
@@ -500,8 +500,15 @@ func TestPruneStaleSessionMarksDeadJobs(t *testing.T) {
 	if err := PruneStaleSession(sessionID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
-		t.Fatalf("expected job directory to be removed, stat err=%v", err)
+	if _, err := os.Stat(jobDir); err != nil {
+		t.Fatalf("completed job directory was not preserved: %v", err)
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "exited" {
+		t.Fatalf("pruned job status = %q, want exited", record.Status)
 	}
 
 	count, err := RunningCount(sessionID)
@@ -674,8 +681,8 @@ func TestKillSessionDoesNotSignalRecycledPIDAndCleansStaleRecord(t *testing.T) {
 	if called != 0 {
 		t.Fatalf("recycled PID received a signal: %d calls", called)
 	}
-	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
-		t.Fatalf("stale recycled job was not cleaned: %v", err)
+	if _, err := os.Stat(jobDir); err != nil {
+		t.Fatalf("stale recycled job history was not preserved: %v", err)
 	}
 }
 
@@ -700,8 +707,8 @@ func TestKillSessionDoesNotSignalDeadPIDAndCleansStaleRecord(t *testing.T) {
 	if called != 0 {
 		t.Fatalf("dead PID received a signal: %d calls", called)
 	}
-	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
-		t.Fatalf("stale dead job was not cleaned: %v", err)
+	if _, err := os.Stat(jobDir); err != nil {
+		t.Fatalf("stale dead job history was not preserved: %v", err)
 	}
 }
 

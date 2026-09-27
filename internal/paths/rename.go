@@ -11,6 +11,8 @@ import (
 	"github.com/HumanHorizon/automata/internal/atomicfile"
 )
 
+var writeRenameFileAtomic = atomicfile.Write
+
 // RenameDirectory moves one Automata data directory without merging it with
 // an existing target. Missing source and target are both treated as a no-op;
 // a missing source with an existing target is an error so stale data cannot be
@@ -127,8 +129,12 @@ func MigrateSessionJSONL(oldID, newID, cwd, agentDir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("stat session JSONL %q: %w", oldPath, err)
 	}
-	if err := atomicfile.Write(oldPath, newData, info.Mode().Perm()); err != nil {
-		return "", fmt.Errorf("replace session JSONL %q: %w", oldPath, err)
+	if err := writeRenameFileAtomic(oldPath, newData, info.Mode().Perm()); err != nil {
+		wrapped := fmt.Errorf("replace session JSONL %q: %w", oldPath, err)
+		if atomicfile.IsCommitted(err) {
+			return oldPath, wrapped
+		}
+		return "", wrapped
 	}
 	return oldPath, nil
 }
@@ -251,8 +257,12 @@ func RewriteFamiliarSessionIDs(profile, oldOwnerID, newOwnerID string) (map[stri
 	if err != nil {
 		return nil, fmt.Errorf("encode familiars.json: %w", err)
 	}
-	if err := writeFileAtomic(path, append(updated, '\n'), 0o644); err != nil {
-		return nil, fmt.Errorf("write familiars.json: %w", err)
+	if err := writeRenameFileAtomic(path, append(updated, '\n'), 0o644); err != nil {
+		wrapped := fmt.Errorf("write familiars.json: %w", err)
+		if atomicfile.IsCommitted(err) {
+			return mapping, wrapped
+		}
+		return nil, wrapped
 	}
 	return mapping, nil
 }

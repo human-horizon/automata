@@ -19,7 +19,7 @@
    - `startedAt` обязателен только если `ps` доступен; ошибка `ps` → доверяем `kill(0)`;
    - окно сравнения `startedAt` с `ps` расширить до 5 секунд и нормализовать timezone через `time.Local`;
    - на macOS допускать пустое `ps`-время, если процесс жив.
-2. `internal/ai-knowledge/jobs/reader.go` — `List` не должен тихо перезаписывать `job.json` статусом `exited`, если сигнатура не совпала. Вместо этого: `startedAt` оставлен, а удаление/пометка делается только при явном `job_stop` или `job_list` через отдельную функцию `PruneStaleSession(sessionID)`, которая отмечает `exited` и удаляет соответствующую запись.
+2. `internal/ai-knowledge/jobs/reader.go` — `List` не должен тихо перезаписывать `job.json` статусом `exited`, если сигнатура не совпала. Явный `PruneStaleSession(sessionID)` только материализует `running→exited`; completed job directory сохраняется для producer-side history/retention cleanup.
 3. `internal/ai-knowledge/jobs/reader.go` — добавить `JobsCount` или аналог, чтобы правая панель могла отдельно отслеживать «есть ли вообще running-кандидаты», прежде чем падать в рендер.
 4. `internal/ai-knowledge/jobs/reader_test.go` — расширить регрессии:
    - живой PID с `startedAt`, отличающимся от `ps lstart` на 1-3 секунды;
@@ -38,7 +38,8 @@
    - Парсим `ps` в `time.Local`, приводим к UTC, сравниваем `|jobTime - psTime|`. Окно 5 секунд (clock skew на macOS в kqueue).
 2. `List` теперь никогда не мутирует `job.json` со статусом running, если `kill(0)` не подтвердил смерть.
 3. `PruneStaleSession(sessionID)`:
-   - для каждой записи со статусом running: если `pidIsSameProcess == false`, пометить `exited` и удалить каталог (по аналогии с текущим `List`).
+   - для каждой записи со статусом running: если `pidIsSameProcess == false`, пометить `exited`;
+   - каталог job не удалять: история и лимит завершённых jobs принадлежат producer extension (см. `reliable-active-jobs.md`).
 4. В `KnowledgePanel.Update`:
    - `jobsChangedMsg` → вызвать `PruneStaleSession`, затем `k.jobsReader.List`.
 5. `JobsCount(sessionID) (int, error)` — подсчёт `running` записей без чтения содержимого `job.json`.
@@ -47,7 +48,7 @@
 
 - [x] Живая job, чей `ps` отказал или вернул пустой lstart, остаётся в списке, пока `kill(0)` жив.
 - [x] Живая job с расхождением `startedAt` ≤ 5 секунд остаётся в списке.
-- [x] Мёртвый PID помечается `exited` и удаляется при следующем `PruneStaleSession`.
+- [x] Мёртвый PID помечается `exited` при следующем `PruneStaleSession`, а job directory сохраняется для retention/history.
 - [x] Reused PID с другим `lstart` (> 5 секунд) помечается `exited`.
 - [x] `List` не пишет `exited` на диск сам по себе.
 - [x] `gofmt`, `go vet ./...`, `go test ./...` зелёные.

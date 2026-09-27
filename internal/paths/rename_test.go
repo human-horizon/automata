@@ -1,10 +1,13 @@
 package paths
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 )
 
 func TestRenameDirectoryRejectsExistingTarget(t *testing.T) {
@@ -83,6 +86,83 @@ func TestMigrateSessionJSONLRejectsTargetHistory(t *testing.T) {
 
 	if _, err := MigrateSessionJSONL(oldID, newID, cwd, agentDir); err == nil {
 		t.Fatal("expected target JSONL conflict")
+	}
+}
+
+func TestMigrateSessionJSONLReturnsPathOnCommittedWriteError(t *testing.T) {
+	home := t.TempDir()
+	agentDir := filepath.Join(home, ".ai", "just", "pi")
+	cwd := "/work"
+	dir := filepath.Join(agentDir, "sessions", EncodeCwdDir(cwd))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldID, newID := "profile__old", "profile__new"
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"session","id":"profile__old"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncErr := errors.New("injected directory sync failure")
+	previousWriter := writeRenameFileAtomic
+	writeRenameFileAtomic = func(path string, data []byte, mode os.FileMode) error {
+		if err := os.WriteFile(path, data, mode); err != nil {
+			return err
+		}
+		return &atomicfile.CommittedError{Path: path, Err: syncErr}
+	}
+	t.Cleanup(func() { writeRenameFileAtomic = previousWriter })
+
+	migrated, err := MigrateSessionJSONL(oldID, newID, cwd, agentDir)
+	if migrated != path || !atomicfile.IsCommitted(err) || !errors.Is(err, syncErr) {
+		t.Fatalf("migration result = path:%q err:%v, want committed path %q", migrated, err, path)
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(data), `"id":"`+newID+`"`) {
+		t.Fatalf("committed migration did not update ID: %s", data)
+	}
+}
+
+func TestRewriteFamiliarSessionIDsReturnsMappingOnCommittedWriteError(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const (
+		profile  = "test"
+		oldOwner = "profile__old"
+		newOwner = "profile__new"
+	)
+	oldFamiliar := oldOwner + "__expert"
+	newFamiliar := newOwner + "__expert"
+	path := FamiliarsJSONLPath(profile, newOwner)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`[{"id":"expert","sessionId":"`+oldFamiliar+`"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	syncErr := errors.New("injected directory sync failure")
+	previousWriter := writeRenameFileAtomic
+	writeRenameFileAtomic = func(path string, data []byte, mode os.FileMode) error {
+		if err := os.WriteFile(path, data, mode); err != nil {
+			return err
+		}
+		return &atomicfile.CommittedError{Path: path, Err: syncErr}
+	}
+	t.Cleanup(func() { writeRenameFileAtomic = previousWriter })
+
+	mapping, err := RewriteFamiliarSessionIDs(profile, oldOwner, newOwner)
+	if mapping[oldFamiliar] != newFamiliar || !atomicfile.IsCommitted(err) || !errors.Is(err, syncErr) {
+		t.Fatalf("rewrite result = mapping:%v err:%v", mapping, err)
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(data), newFamiliar) {
+		t.Fatalf("committed familiar rewrite was not materialized: %s", data)
 	}
 }
 

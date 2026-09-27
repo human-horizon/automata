@@ -1030,8 +1030,8 @@ func (t *Tree) unbindFolderChecked(item *Item) error {
 	})
 }
 
-// revealInFinder opens the bound directory in the system file manager.
-// Silently no-ops when the path is missing.
+// revealInFinder opens the bound directory in the macOS Finder and returns
+// validation or launch errors to the caller.
 func revealInFinder(path string) error {
 	if path == "" {
 		return fmt.Errorf("bound path is empty")

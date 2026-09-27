@@ -1,21 +1,27 @@
 # Automata — контекст проекта
 
 ## Что это такое
-Терминальная рабочая область AI-агента. Слева — дерево папок/чатов/терминалов, справа — активная сессия.
+Терминальная рабочая область AI-агента. Слева — профильное дерево папок, чатов и терминалов; справа — активный ChatPanel + KnowledgePanel либо folder Context/Kanban.
 
 ## Текущие модули
-- `internal/tree` — виджет дерева с папками, чатами, терминалами, архивом, drag & drop, модалками.
-- `internal/term` — кастомный эмулятор терминала + PTY + ANSI-парсер.
-- `internal/slug` — слаг для ID сессий и префиксов профилей.
-- `internal/ui` — правый контейнер с чатом, чат+план и предпросмотром папок.
-- `e2e` — end-to-end тесты на основе cue-tty.
-- `modules/ai-knowledge` — отдельный TUI/CLI для планов, задач, памяти (интегрируется через ContextPanel).
+- `internal/tree` — дерево, persisted state, structural transactions, archive, drag & drop, status column и overlays.
+- `internal/ui` — ChatPanel, KnowledgePanel, ContextPanel, Kanban и layout/lifecycle watchers.
+- `internal/ai-knowledge` — readers/rendering для plans, status, jobs и memory/notes.
+- `internal/paths` — canonical profile/session/domain paths, safe JSONL discovery/migration и familiar registry.
+- `internal/atomicfile` — durable same-directory temp/write/fsync/rename/fsync-parent writes с committed-error semantics.
+- `internal/cache` — bounded LRU для read-side metadata.
+- `internal/status` — status.json cache и Tree substatus mapping.
+- `internal/kanban` — task YAML parsing/writes и assignment/status primitives.
+- Portalis — внешний PTY/terminal emulator; Automata задаёт scrollback budget и lifecycle.
+- `e2e` — end-to-end проверки через cue-tty.
 
-## Активная работа
-- Исправить зависание при открытии чата.
-- Обеспечить автоматический и асинхронный запуск панели планов ai-knowledge.
-- Сохранять работоспособность сохранения cwd/истории терминала.
-- Закрепить исправление отрисовки первой иконки в предпросмотре папок.
+## Текущий hardening-контракт
+- Работа ведётся напрямую в `main`; CI обязан быть зелёным на exact HEAD.
+- Destructive operations fail closed до side effects; post-commit failures явно помечаются как committed warnings.
+- Runtime/session identity, profile scope и external JSONL migration не должны угадывать namespace.
+- UI watchers event-driven, generation-bound и закрываются при deactivation; status watches ограничены active chats.
+- Periodic knowledge/familiar polling отсутствует; metadata persistence coalesced; caches и scrollback bounded.
+- Completed job history принадлежит producer-side retention policy и не удаляется Automata при stale detection.
 
 ## Последние исправления
 

@@ -300,10 +300,9 @@ func ListForProfile(profile, sessionID string) ([]Job, error) {
 	return listForProfile(profile, sessionID)
 }
 
-// PruneStaleSession scans a session's jobs/ directory and, for every record
-// whose PID is no longer the same process, marks it `exited` and removes the
-// record directory. It is the only path that mutates running→exited in
-// job.json, which makes the cleanup behaviour easy to test in isolation.
+// PruneStaleSession scans a session's jobs/ directory and marks stale running
+// records `exited`. Completed job directories are retained for producer-side
+// history/retention cleanup instead of being deleted by Automata.
 func pruneStaleSessionForProfile(profile, sessionID string) error {
 	if err := paths.ValidateSessionID(sessionID); err != nil {
 		return err
@@ -339,10 +338,6 @@ func pruneStaleSessionForProfile(profile, sessionID string) error {
 		rec.StoppedAt = now
 		if err := writeJSON(metaPath, &rec); err != nil {
 			failures = append(failures, fmt.Errorf("write stale job %s metadata: %w", rec.ID, err))
-			continue
-		}
-		if err := os.RemoveAll(jobDir); err != nil {
-			failures = append(failures, fmt.Errorf("remove stale job %s directory: %w", rec.ID, err))
 		}
 	}
 	return errors.Join(failures...)
@@ -447,13 +442,10 @@ func waitForProcessExit(pid int) bool {
 	return false
 }
 
-func materializeStaleJob(jobDir, metaPath string, rec *JobRecord) error {
+func materializeStaleJob(_ string, metaPath string, rec *JobRecord) error {
 	rec.Status = "exited"
 	rec.StoppedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := writeJSON(metaPath, rec); err != nil {
-		return err
-	}
-	return os.RemoveAll(jobDir)
+	return writeJSON(metaPath, rec)
 }
 
 // KillSession resolves the legacy session directory and fails closed when
