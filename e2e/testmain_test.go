@@ -18,12 +18,14 @@ func TestMain(m *testing.M) {
 	cleanup := func() error { return os.RemoveAll(sandbox) }
 	failSetup := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
-		_ = cleanup()
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "remove failed E2E sandbox: %v\n", cleanupErr)
+		}
 		os.Exit(1)
 	}
 
 	homeDir := filepath.Join(sandbox, "home")
-	dataDir := filepath.Join(sandbox, "data")
+	dataDir := filepath.Join(homeDir, ".ai", "automata")
 	if err := os.MkdirAll(homeDir, 0o755); err != nil {
 		failSetup("create E2E home: %v", err)
 	}
