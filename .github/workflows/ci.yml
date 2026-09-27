@@ -56,6 +56,9 @@ jobs:
           AUTOMATA_E2E_ARTIFACTS_DIR: ${{ runner.temp }}/automata-e2e-artifacts
         run: go test ./... -count=1 -p 1
 
+      - name: Verify self-building E2E path
+        run: go test ./e2e -run '^TestRootChatSessionID$' -count=1 -p 1
+
       - name: Run race tests
         run: go test -race ./internal/... . -count=1 -p 1
 
