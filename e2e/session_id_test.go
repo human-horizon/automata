@@ -199,9 +199,13 @@ func TestRootChatSessionID(t *testing.T) {
 	}()
 
 	// Select the only chat and open it.
-	page.Press("Down")
+	if err := page.Press("Down"); err != nil {
+		t.Fatalf("move selection down: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
-	page.Press("Enter")
+	if err := page.Press("Enter"); err != nil {
+		t.Fatalf("open selected chat: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
@@ -234,11 +238,17 @@ func TestFolderChatSessionID(t *testing.T) {
 	}()
 
 	// Select "My Chat" inside "Сегодня" (first and only child).
-	page.Press("Down")
+	if err := page.Press("Down"); err != nil {
+		t.Fatalf("move selection to folder chat: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
-	page.Press("Down")
+	if err := page.Press("Down"); err != nil {
+		t.Fatalf("move selection to nested chat: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
-	page.Press("Enter")
+	if err := page.Press("Enter"); err != nil {
+		t.Fatalf("open folder chat: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
@@ -281,11 +291,17 @@ func TestUniqueSessionID(t *testing.T) {
 	// Flat list: Сегодня(0), My Chat in Сегодня(1), Проекты(2), My Chat in Проекты(3).
 
 	// Open first "My Chat" (Сегодня is row 0, My Chat is row 1).
-	page.Press("Down")
+	if err := page.Press("Down"); err != nil {
+		t.Fatalf("move selection to first folder: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
-	page.Press("Down")
+	if err := page.Press("Down"); err != nil {
+		t.Fatalf("move selection to first duplicate chat: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
-	page.Press("Enter")
+	if err := page.Press("Enter"); err != nil {
+		t.Fatalf("open first duplicate chat: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)
@@ -294,11 +310,17 @@ func TestUniqueSessionID(t *testing.T) {
 
 	// Return focus to tree and click the second "My Chat".
 	// Flat list rows: header(0), Сегодня(1), My Chat(2), Проекты(3), My Chat(4).
-	page.Press("F6")
+	if err := page.Press("F6"); err != nil {
+		t.Fatalf("focus tree before second chat: %v", err)
+	}
 	page.WaitStable(200 * time.Millisecond)
-	page.MouseClick(4, 4)
+	if err := page.MouseClick(4, 4); err != nil {
+		t.Fatalf("select second duplicate chat: %v", err)
+	}
 	page.WaitStable(200 * time.Millisecond)
-	page.Press("Enter")
+	if err := page.Press("Enter"); err != nil {
+		t.Fatalf("open second duplicate chat: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	waitForTerminalPrompt(t, page)

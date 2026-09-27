@@ -50,7 +50,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "launch automata: %v\n", err)
 		os.Exit(1)
 	}
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close automata: %v\n", err)
+		}
+	}()
 
 	page := app.Page()
 	page.WaitStable(1 * time.Second)
@@ -154,7 +158,7 @@ func main() {
 	printScreen(page)
 	must("type session command", page.Type(`echo "$AUTOMATA_SESSION_ID"`))
 	page.WaitStable(300 * time.Millisecond)
-	page.Press("Enter")
+	must("execute session command", page.Press("Enter"))
 	page.WaitStable(1 * time.Second)
 	printScreen(page)
 
@@ -167,7 +171,7 @@ func main() {
 	click("action", "rename:notes", "rename")
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
-	page.Type("todo")
+	must("type renamed chat name", page.Type("todo"))
 	page.WaitStable(100 * time.Millisecond)
 	printScreen(page)
 	click("button", "[Create]", "create")
@@ -212,7 +216,7 @@ func main() {
 	// Re-create a chat so we can open its delete confirmation.
 	click("button", "+Chat", "add-chat")
 	page.WaitStable(300 * time.Millisecond)
-	page.Type("temp")
+	must("type temporary chat name", page.Type("temp"))
 	page.WaitStable(100 * time.Millisecond)
 	click("button", "[Create]", "create")
 	page.WaitStable(800 * time.Millisecond)
