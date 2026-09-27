@@ -49,10 +49,14 @@ func TestMouseESCDebug(t *testing.T) {
 	// Try clicking without EnableMouse; the terminal should rely only on
 	// Bubble Tea's emitted mouse-mode escape sequences.
 	t.Log("Clicking + button at (17, 0) WITHOUT explicit mouse enable")
-	page.MouseClick(17, 0)
+	if err := page.MouseClick(17, 0); err != nil {
+		t.Fatalf("click add button without explicit mouse enable: %v", err)
+	}
 	page.WaitStable(200 * time.Millisecond)
 	// Click "+ Chat" popover item (second item, at x=18, y=2).
-	page.MouseClick(18, 2)
+	if err := page.MouseClick(18, 2); err != nil {
+		t.Fatalf("click chat option without explicit mouse enable: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	text, _ = page.Text()
@@ -73,10 +77,14 @@ func TestMouseESCDebug(t *testing.T) {
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Log("Clicking + button at (17, 0) WITH explicit mouse enable")
-	page.MouseClick(17, 0)
+	if err := page.MouseClick(17, 0); err != nil {
+		t.Fatalf("click add button with explicit mouse enable: %v", err)
+	}
 	page.WaitStable(200 * time.Millisecond)
 	// Click "+ Chat" popover item (second item, at x=18, y=2).
-	page.MouseClick(18, 2)
+	if err := page.MouseClick(18, 2); err != nil {
+		t.Fatalf("click chat option with explicit mouse enable: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	text, _ = page.Text()

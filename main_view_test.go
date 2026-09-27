@@ -1876,7 +1876,9 @@ func TestSyncSessionWatchersReturnsCmdsOnlyForNewWatchers(t *testing.T) {
 
 	app.setupStatusWatcher()
 	t.Cleanup(func() {
-		app.statusWatcher.Close()
+		if err := app.statusWatcher.Close(); err != nil {
+			t.Errorf("close status watcher: %v", err)
+		}
 	})
 
 	first := app.syncSessionWatchers()

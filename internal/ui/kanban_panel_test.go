@@ -815,8 +815,7 @@ func TestKanbanPanelDrainReloadsOnFileChange(t *testing.T) {
 	domain := "drain-domain"
 
 	tmpDir := t.TempDir()
-	os.Setenv("AI_DATA_HOME", tmpDir)
-	defer os.Unsetenv("AI_DATA_HOME")
+	t.Setenv("AI_DATA_HOME", tmpDir)
 
 	dir := kanban.KanbanDir(domain, profile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -863,8 +862,7 @@ func TestKanbanPanelCloseWatcherReleases(t *testing.T) {
 	profile := "kanban-close-test"
 
 	tmpDir := t.TempDir()
-	os.Setenv("AI_DATA_HOME", tmpDir)
-	defer os.Unsetenv("AI_DATA_HOME")
+	t.Setenv("AI_DATA_HOME", tmpDir)
 
 	// Two domains so we can switch between them.
 	for _, domain := range []string{"domain-a", "domain-b"} {
@@ -902,8 +900,7 @@ func TestKanbanWatchCmdReactsToFsnotifyEvent(t *testing.T) {
 	domain := "watch-cmd-domain"
 
 	tmpDir := t.TempDir()
-	os.Setenv("AI_DATA_HOME", tmpDir)
-	defer os.Unsetenv("AI_DATA_HOME")
+	t.Setenv("AI_DATA_HOME", tmpDir)
 
 	dir := kanban.KanbanDir(domain, profile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -1074,8 +1071,7 @@ func TestKanbanDoneCardRendersNoTransitionButtons(t *testing.T) {
 	domain := "done-no-back"
 
 	tmpDir := t.TempDir()
-	os.Setenv("AI_DATA_HOME", tmpDir)
-	defer os.Unsetenv("AI_DATA_HOME")
+	t.Setenv("AI_DATA_HOME", tmpDir)
 
 	dir := kanban.KanbanDir(domain, profile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

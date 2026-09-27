@@ -93,6 +93,13 @@ func main() {
 		return warp.FindElement(elems, role, name, action)
 	}
 
+	must := func(action string, err error) {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", action, err)
+			os.Exit(1)
+		}
+	}
+
 	click := func(role, name, action string) {
 		var el warp.Element
 		var ok bool
@@ -108,7 +115,7 @@ func main() {
 			os.Exit(1)
 		}
 		x, y := el.Bounds.Center()
-		page.MouseClick(x, y)
+		must("mouse click", page.MouseClick(x, y))
 	}
 
 	fmt.Println("=== Step 1: Initial render ===")
@@ -118,7 +125,7 @@ func main() {
 	click("button", "+Folder", "add-folder")
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
-	page.Type("Work")
+	must("type folder name", page.Type("Work"))
 	page.WaitStable(100 * time.Millisecond)
 	printScreen(page)
 	click("button", "[Create]", "create")
@@ -134,7 +141,7 @@ func main() {
 	click("button", "+Chat", "add-chat")
 	page.WaitStable(300 * time.Millisecond)
 	printScreen(page)
-	page.Type("notes")
+	must("type chat name", page.Type("notes"))
 	page.WaitStable(100 * time.Millisecond)
 	printScreen(page)
 	click("button", "[Create]", "create")
@@ -145,7 +152,7 @@ func main() {
 	click("chat", "notes", "")
 	page.WaitStable(1 * time.Second)
 	printScreen(page)
-	page.Type(`echo "$AUTOMATA_SESSION_ID"`)
+	must("type session command", page.Type(`echo "$AUTOMATA_SESSION_ID"`))
 	page.WaitStable(300 * time.Millisecond)
 	page.Press("Enter")
 	page.WaitStable(1 * time.Second)

@@ -140,19 +140,29 @@ func TestRenameChatWithF2(t *testing.T) {
 		}
 	}()
 
-	page.Press("F6")
+	if err := page.Press("F6"); err != nil {
+		t.Fatalf("focus tree: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
-	page.Press("Down")
+	if err := page.Press("Down"); err != nil {
+		t.Fatalf("select chat: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
-	page.Press("F2")
+	if err := page.Press("F2"); err != nil {
+		t.Fatalf("open rename: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
 	for range "Old Chat" {
-		page.Press("Backspace")
+		if err := page.Press("Backspace"); err != nil {
+			t.Fatalf("erase old chat name: %v", err)
+		}
 	}
 	if err := page.Type("Renamed Chat"); err != nil {
 		t.Fatalf("type renamed chat: %v", err)
 	}
-	page.Press("Enter")
+	if err := page.Press("Enter"); err != nil {
+		t.Fatalf("confirm rename: %v", err)
+	}
 	page.WaitStable(300 * time.Millisecond)
 
 	text, err := page.Text()
@@ -182,7 +192,11 @@ func TestRootChatSessionID(t *testing.T) {
 	})
 
 	app, page := launchAutomataForSession(t, "cue-test-session")
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	// Select the only chat and open it.
 	page.Press("Down")
@@ -213,7 +227,11 @@ func TestFolderChatSessionID(t *testing.T) {
 	})
 
 	app, page := launchAutomataForSession(t, "cue-test-session-folder")
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	// Select "My Chat" inside "Сегодня" (first and only child).
 	page.Press("Down")
@@ -254,7 +272,11 @@ func TestUniqueSessionID(t *testing.T) {
 	})
 
 	app, page := launchAutomataForSession(t, "cue-test-session-unique")
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	// Flat list: Сегодня(0), My Chat in Сегодня(1), Проекты(2), My Chat in Проекты(3).
 
