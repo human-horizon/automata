@@ -137,8 +137,8 @@ func (c *ContextPanel) refresh() {
 
 // setupNotesWatcher attaches an fsnotify.Watcher to the active domain
 // directory so CREATE/WRITE/REMOVE/RENAME on notes.json (or any future
-// file we add to the domain dir) are reflected in the panel without a
-// tick. A missing domain dir is created on the fly; setup failures remain
+// file we add to the domain dir) are reflected in the panel without
+// polling. A missing domain dir is created on the fly; setup failures remain
 // visible in the toolbar until a later attach succeeds.
 func (c *ContextPanel) setupNotesWatcher() {
 	if !c.active || c.activeTab != 0 || c.domain == "" {

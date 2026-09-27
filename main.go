@@ -1277,7 +1277,7 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 		}
 		dir := paths.SessionDir(a.profile, key)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			log.Printf("automata: cannot create active session directory %s: %v", key, err)
+			a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable for %s: create session directory: %w", key, err))
 			continue
 		}
 		desired[key] = filepath.Clean(dir)

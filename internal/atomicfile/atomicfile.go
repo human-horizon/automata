@@ -75,7 +75,7 @@ func writeWithOperations(path string, data []byte, mode os.FileMode, ops operati
 	return writeFromWithOperations(path, bytes.NewReader(data), mode, ops)
 }
 
-func writeFromWithOperations(path string, source io.Reader, mode os.FileMode, ops operations) error {
+func writeFromWithOperations(path string, source io.Reader, mode os.FileMode, ops operations) (retErr error) {
 	dir := filepath.Dir(path)
 	temporary, err := ops.createTemp(dir, ".atomicfile-*.tmp")
 	if err != nil {
@@ -85,11 +85,19 @@ func writeFromWithOperations(path string, source io.Reader, mode os.FileMode, op
 	committed := false
 	closed := false
 	defer func() {
+		var cleanupErrs []error
 		if !closed {
-			_ = temporary.Close()
+			if err := temporary.Close(); err != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("close temporary file %s during cleanup: %w", temporaryPath, err))
+			}
 		}
 		if !committed {
-			_ = ops.remove(temporaryPath)
+			if err := ops.remove(temporaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("remove temporary file %s during cleanup: %w", temporaryPath, err))
+			}
+		}
+		if cleanupErr := errors.Join(cleanupErrs...); cleanupErr != nil {
+			retErr = errors.Join(retErr, cleanupErr)
 		}
 	}()
 

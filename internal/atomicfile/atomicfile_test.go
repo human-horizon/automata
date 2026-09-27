@@ -118,6 +118,40 @@ func TestWritePrecommitFailuresPreserveTargetAndRemoveTemporaryFile(t *testing.T
 	}
 }
 
+func TestWriteReportsTemporaryCleanupFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := errors.New("injected write failure")
+	cleanupErr := errors.New("injected cleanup failure")
+	ops := defaultOperations
+	ops.createTemp = func(tempDir, pattern string) (temporaryFile, error) {
+		file, err := os.CreateTemp(tempDir, pattern)
+		if err != nil {
+			return nil, err
+		}
+		return &failingTemporary{File: file, stage: "write", err: writeErr}, nil
+	}
+	ops.remove = func(string) error { return cleanupErr }
+
+	err := writeWithOperations(path, []byte("new"), 0o644, ops)
+	if !errors.Is(err, writeErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("write error = %v, want primary and cleanup failures", err)
+	}
+	if IsCommitted(err) {
+		t.Fatalf("cleanup failure unexpectedly marked write committed: %v", err)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "old" {
+		t.Fatalf("cleanup failure changed target: %q", got)
+	}
+}
+
 func TestWriteDirectorySyncFailureReturnsCommittedError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
