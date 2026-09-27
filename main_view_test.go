@@ -1368,7 +1368,6 @@ func TestRestoreSessionsNeverCreatesAnEmulatorForGhostActiveID(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	tr := tree.New()
 	tr.Profile = "Getic"
-	tr.SetProfile("Getic")
 	tr.AddChat("real")
 	const ghostID = "getic__ghost"
 	tr.SetActiveSessionsInMemory(map[string]struct{}{ghostID: {}})
