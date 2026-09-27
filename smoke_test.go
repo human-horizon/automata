@@ -83,7 +83,10 @@ func TestSmokeStatusBadges(t *testing.T) {
 	}
 
 	for _, k := range keys {
-		a := reader.Read(k)
+		a, err := reader.Read(k)
+		if err != nil {
+			t.Fatalf("read status %s: %v", k, err)
+		}
 		glyph := status.Emoji(a)
 		word := status.Word(a)
 		t.Logf("  %-40s action=%-9s emoji=%-3q word=%q", k, a, glyph, word)
@@ -107,12 +110,18 @@ func TestSmokeStatusBadges(t *testing.T) {
 	// Invariant 2: cached reader picks up mtime changes without restart.
 	alphaKey := keys[0]
 	alphaPath := filepath.Join(sessions, alphaKey, "status.json")
-	before := reader.Read(alphaKey)
+	before, err := reader.Read(alphaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(20 * time.Millisecond)
 	if err := os.WriteFile(alphaPath, []byte(`{"action":"run","description":"pnpm build"}`), 0o644); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
-	after := reader.Read(alphaKey)
+	after, err := reader.Read(alphaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if before == after {
 		t.Errorf("cached reader did not pick up mtime change (before=%q after=%q)", before, after)
 	}
@@ -122,7 +131,10 @@ func TestSmokeStatusBadges(t *testing.T) {
 	if err := os.Remove(betaPath); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	got := reader.Read(keys[1])
+	got, err := reader.Read(keys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got != "" {
 		t.Errorf("missing status.json should be treated as idle (action=\"\"), got %q", got)
 	}
