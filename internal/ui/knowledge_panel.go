@@ -83,8 +83,8 @@ type KnowledgePanel struct {
 	plansHeaderY   int
 	jobsHeaderY    int
 
-	data         *akcontext.Data
-	jobs         []akjobs.Job
+	data                *akcontext.Data
+	jobs                []akjobs.Job
 	contextError        string
 	jobsError           string
 	knowledgeWatchError string

@@ -76,10 +76,10 @@ var (
 
 // KanbanPanel renders a full kanban board using warp layout.
 type KanbanPanel struct {
-	profile     string
-	domain      string
-	palette     apptheme.Theme
-	tasks       []kanban.Task
+	profile      string
+	domain       string
+	palette      apptheme.Theme
+	tasks        []kanban.Task
 	readWarning  string
 	watchWarning string
 	tab          *warp.Tab

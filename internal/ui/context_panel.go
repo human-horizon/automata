@@ -35,9 +35,9 @@ type ContextPanel struct {
 	notesReader  *memory.CachedReader
 	kanbanPanel  *KanbanPanel
 
-	expandedNotes  map[string]bool
-	activeNoteKey  string
-	noteHits       []noteHit
+	expandedNotes   map[string]bool
+	activeNoteKey   string
+	noteHits        []noteHit
 	notesClipboard  notesClipboard
 	notesStatus     string
 	notesWatchError string
