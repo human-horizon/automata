@@ -153,10 +153,8 @@ func TestCheckFamiliarsDetectsNew(t *testing.T) {
 		{ID: "expert", SessionID: "test__expert", Created: "2024-01-01"},
 	})
 
-	// Temporarily override HOME so familiarStatePath resolves inside tempDir.
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tempDir)
-	defer os.Setenv("HOME", origHome)
+	// Override HOME so familiarStatePath resolves inside tempDir.
+	t.Setenv("HOME", tempDir)
 
 	cp := &ChatPanel{
 		sessionID: sessionID,
@@ -367,9 +365,7 @@ func TestCheckFamiliarsDetectsRemoved(t *testing.T) {
 	tempDir := t.TempDir()
 	sessionID := writeFamiliarsJSON(t, tempDir, "", []FamiliarState{})
 
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tempDir)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tempDir)
 
 	cp := &ChatPanel{
 		sessionID: sessionID,

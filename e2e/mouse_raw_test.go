@@ -31,7 +31,11 @@ func TestMouseRawDebug(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	page := app.Page()
 
@@ -91,7 +95,9 @@ func TestMouseRawDebug(t *testing.T) {
 	// Now test WITH page.EnableMouse()
 	t.Log("")
 	t.Log("=== Testing mouse click WITH EnableMouse() ===")
-	page.EnableMouse()
+	if err := page.EnableMouse(); err != nil {
+		t.Fatalf("enable mouse: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	page.MouseClick(17, 0)

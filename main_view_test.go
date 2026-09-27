@@ -1408,7 +1408,9 @@ func TestAppCloseStopsWatchersAndEmulators(t *testing.T) {
 		key + "__expert": portalis.NewEmulator(key+"__expert", "expert", "/bin/sh", nil),
 	}
 	app.activeSessions = map[string]struct{}{key: {}}
-	app.tree.SetActiveSessions(app.activeSessions)
+	if err := app.tree.SetActiveSessions(app.activeSessions); err != nil {
+		t.Fatal(err)
+	}
 
 	app.Close()
 
@@ -1541,7 +1543,9 @@ func TestSetupStatusWatcherCreatesMissingBase(t *testing.T) {
 	if _, err := os.Stat(base); err != nil {
 		t.Fatalf("expected base dir to be created, got %v", err)
 	}
-	app.statusWatcher.Close()
+	if err := app.statusWatcher.Close(); err != nil {
+		t.Errorf("close status watcher: %v", err)
+	}
 }
 
 // TestSetupStatusWatcherAttachesActiveSessions confirms all active chats are
@@ -1570,7 +1574,9 @@ func TestSetupStatusWatcherAttachesActiveSessions(t *testing.T) {
 	app.setupStatusWatcher()
 	_ = app.syncSessionWatchers()
 	t.Cleanup(func() {
-		app.statusWatcher.Close()
+		if err := app.statusWatcher.Close(); err != nil {
+			t.Errorf("close status watcher: %v", err)
+		}
 	})
 
 	if app.statusWatcher == nil {
@@ -1599,7 +1605,9 @@ func TestSyncSessionWatchersPrunesRemovedTreeSession(t *testing.T) {
 	app.setupStatusWatcher()
 	_ = app.syncSessionWatchers()
 	t.Cleanup(func() {
-		app.statusWatcher.Close()
+		if err := app.statusWatcher.Close(); err != nil {
+			t.Errorf("close status watcher: %v", err)
+		}
 	})
 	if _, ok := app.sessionWatchers[key]; !ok {
 		t.Fatal("expected watcher after setup")
@@ -1739,7 +1747,9 @@ func TestOpenDebugLogAppendsWithoutTruncating(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := file.WriteString("after\n"); err != nil {
-		file.Close()
+		if closeErr := file.Close(); closeErr != nil {
+			t.Errorf("close debug log after write failure: %v", closeErr)
+		}
 		t.Fatal(err)
 	}
 	if err := file.Close(); err != nil {

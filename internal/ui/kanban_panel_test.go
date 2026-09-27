@@ -788,8 +788,7 @@ func TestKanbanPanelSetupWatcherAttaches(t *testing.T) {
 	domain := "watch-domain"
 
 	tmpDir := t.TempDir()
-	os.Setenv("AI_DATA_HOME", tmpDir)
-	defer os.Unsetenv("AI_DATA_HOME")
+	t.Setenv("AI_DATA_HOME", tmpDir)
 
 	dir := kanban.KanbanDir(domain, profile)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

@@ -78,7 +78,9 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	}
 
 	// Open the seeded chat (first item is at row 1).
-	page.MouseClick(4, 1)
+	if err := page.MouseClick(4, 1); err != nil {
+		t.Fatalf("open seeded chat: %v", err)
+	}
 	if err := page.WaitFor("AUTOMATA_CHAT_RESIZE_MARKER", 5*time.Second); err != nil {
 		text, _ := page.Text()
 		t.Fatalf("fake chat process did not start: %v\n%s", err, text)
@@ -102,7 +104,9 @@ func TestChatResizesOnTreeCollapse(t *testing.T) {
 	t.Logf("rendered chat BEFORE collapse: left=%d border=%d width=%d cells", beforeLeftEdge, beforeBorderCol, beforeWidth)
 
 	// Click the collapse affordance on the expanded Tree border.
-	page.MouseClick(29, 0)
+	if err := page.MouseClick(29, 0); err != nil {
+		t.Fatalf("collapse tree: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
 
 	if err := page.WaitFor("[× auto]", 2*time.Second); err != nil {

@@ -111,7 +111,9 @@ func writeSessionMarker(t *testing.T, page *cue.Page) {
 		t.Fatalf("type session marker command: %v", err)
 	}
 	page.WaitStable(300 * time.Millisecond)
-	page.Press("Enter")
+	if err := page.Press("Enter"); err != nil {
+		t.Fatalf("execute session marker command: %v", err)
+	}
 	page.WaitStable(1 * time.Second)
 }
 
@@ -132,7 +134,11 @@ func TestRenameChatWithF2(t *testing.T) {
 	})
 
 	app, page := launchAutomataForSession(t, profile)
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	page.Press("F6")
 	page.WaitStable(100 * time.Millisecond)

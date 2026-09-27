@@ -164,7 +164,7 @@ func (t *Tree) LoadState() error {
 	t.stateLoadErr = nil
 	t.lastActionError = nil
 	if len(discardedActive) > 0 {
-		t.recordActionError(fmt.Errorf("discarded active session IDs not present in Tree: %s", strings.Join(discardedActive, ", ")))
+		t.RecordActionWarning(fmt.Errorf("discarded active session IDs not present in Tree: %s", strings.Join(discardedActive, ", ")))
 	}
 	return nil
 }

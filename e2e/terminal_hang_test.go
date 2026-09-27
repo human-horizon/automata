@@ -42,10 +42,16 @@ func TestTerminalDoesNotHang(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	page := app.Page()
-	page.EnableMouse()
+	if err := page.EnableMouse(); err != nil {
+		t.Fatalf("enable mouse: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Cleanup(func() {
@@ -65,7 +71,9 @@ func TestTerminalDoesNotHang(t *testing.T) {
 	page.WaitStable(200 * time.Millisecond)
 
 	// Type terminal name and confirm.
-	page.Type("hangtest")
+	if err := page.Type("hangtest"); err != nil {
+		t.Fatalf("type terminal name: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
 	page.Press("Enter")
 	page.WaitStable(500 * time.Millisecond)
@@ -89,7 +97,9 @@ func TestTerminalDoesNotHang(t *testing.T) {
 	}
 
 	// Try typing a command in the terminal panel.
-	page.Type("echo ok")
+	if err := page.Type("echo ok"); err != nil {
+		t.Fatalf("type terminal command: %v", err)
+	}
 	page.WaitStable(200 * time.Millisecond)
 	page.Press("Enter")
 	page.WaitStable(1 * time.Second)
@@ -125,10 +135,16 @@ func TestTerminalRestoresCWD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	page := app.Page()
-	page.EnableMouse()
+	if err := page.EnableMouse(); err != nil {
+		t.Fatalf("enable mouse: %v", err)
+	}
 	page.WaitStable(500 * time.Millisecond)
 
 	t.Cleanup(func() {
@@ -146,7 +162,9 @@ func TestTerminalRestoresCWD(t *testing.T) {
 	page.WaitStable(200 * time.Millisecond)
 	page.MouseClick(18, 3)
 	page.WaitStable(200 * time.Millisecond)
-	page.Type("cwdtest")
+	if err := page.Type("cwdtest"); err != nil {
+		t.Fatalf("type terminal name: %v", err)
+	}
 	page.WaitStable(100 * time.Millisecond)
 	page.Press("Enter")
 	page.WaitStable(500 * time.Millisecond)
@@ -156,7 +174,9 @@ func TestTerminalRestoresCWD(t *testing.T) {
 	page.WaitStable(2 * time.Second)
 
 	// Change directory and hit Enter.
-	page.Type("cd /tmp")
+	if err := page.Type("cd /tmp"); err != nil {
+		t.Fatalf("type cd command: %v", err)
+	}
 	page.WaitStable(200 * time.Millisecond)
 	page.Press("Enter")
 	page.WaitStable(1 * time.Second)

@@ -471,7 +471,9 @@ func TestMoveItemIntoDescendantNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := outer.Children[0]
-	tr.addChildChat(inner, "chat")
+	if err := tr.addChildChat(inner, "chat"); err != nil {
+		t.Fatal(err)
+	}
 	chat := inner.Children[0]
 
 	tr.moveItem(outer, inner)
@@ -742,7 +744,9 @@ func TestEffectiveBoundPathAncestor(t *testing.T) {
 		t.Fatalf("child's own path should win, got %q", got)
 	}
 	// Chat in child should also see the child's bound path.
-	tr.addChildChat(child, "chat1")
+	if err := tr.addChildChat(child, "chat1"); err != nil {
+		t.Fatal(err)
+	}
 	if len(child.Children) == 0 {
 		t.Fatal("chat was not added to child")
 	}
@@ -774,7 +778,9 @@ func TestMoveSelectedOutFromNestedFolder(t *testing.T) {
 	tr := New()
 	tr.AddFolder("outer")
 	outer := tr.root[0]
-	tr.addChildFolder(outer, "inner")
+	if err := tr.addChildFolder(outer, "inner"); err != nil {
+		t.Fatal(err)
+	}
 	inner := outer.Children[0]
 	tr.AddChat("rootChat")
 
@@ -827,9 +833,13 @@ func TestMoveSelectedOutRunsMigrationBeforeMutation(t *testing.T) {
 	tr := New()
 	tr.AddFolder("outer")
 	outer := tr.root[0]
-	tr.addChildFolder(outer, "inner")
+	if err := tr.addChildFolder(outer, "inner"); err != nil {
+		t.Fatal(err)
+	}
 	inner := outer.Children[0]
-	tr.addChildChat(inner, "chat")
+	if err := tr.addChildChat(inner, "chat"); err != nil {
+		t.Fatal(err)
+	}
 	chat := inner.Children[0]
 	tr.rebuildFlat()
 	tr.reselectItem(chat)
@@ -855,9 +865,13 @@ func TestMoveSelectedOutSaveFailureRestoresTargetTreeBeforeRollback(t *testing.T
 	tr := New()
 	tr.AddFolder("outer")
 	outer := tr.root[0]
-	tr.addChildFolder(outer, "inner")
+	if err := tr.addChildFolder(outer, "inner"); err != nil {
+		t.Fatal(err)
+	}
 	inner := outer.Children[0]
-	tr.addChildChat(inner, "chat")
+	if err := tr.addChildChat(inner, "chat"); err != nil {
+		t.Fatal(err)
+	}
 	chat := inner.Children[0]
 	tr.rebuildFlat()
 	tr.reselectItem(chat)
@@ -1142,9 +1156,11 @@ func TestFolderNoActiveDescendant(t *testing.T) {
 	tree.AddChat("chat")
 	f := tree.Folder("folder")
 
-	tree.SetActiveSessions(map[string]struct{}{
+	if err := tree.SetActiveSessions(map[string]struct{}{
 		tree.sessionIDOf(tree.root[1]): {},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if tree.HasActiveDescendant(f) {
 		t.Fatalf("expected empty folder to have no active descendant")
@@ -1172,7 +1188,9 @@ func TestActiveSessionsPersistence(t *testing.T) {
 		"active-test__chat-one": {},
 		"active-test__chat-two": {},
 	}
-	tree.SetActiveSessions(sessions)
+	if err := tree.SetActiveSessions(sessions); err != nil {
+		t.Fatal(err)
+	}
 
 	// Load into a fresh tree and verify active sessions are restored.
 	fresh := New()

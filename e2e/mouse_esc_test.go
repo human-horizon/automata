@@ -30,7 +30,11 @@ func TestMouseESCDebug(t *testing.T) {
 	if err != nil {
 		t.Fatalf("launch automata: %v", err)
 	}
-	defer app.Close()
+	defer func() {
+		if err := app.Close(); err != nil {
+			t.Errorf("close automata: %v", err)
+		}
+	}()
 
 	page := app.Page()
 

@@ -389,10 +389,8 @@ func TestContextPanelRendersNotes(t *testing.T) {
 
 	// Set up a temporary data home so we don't touch real notes.
 	tmpDir := t.TempDir()
-	os.Setenv("AI_DATA_HOME", tmpDir)
-	os.Setenv("AI_PROFILE", profile)
-	defer os.Unsetenv("AI_DATA_HOME")
-	defer os.Unsetenv("AI_PROFILE")
+	t.Setenv("AI_DATA_HOME", tmpDir)
+	t.Setenv("AI_PROFILE", profile)
 
 	domainDir := filepath.Join(tmpDir, "profiles", "ctx-test-profile", "domains", domain)
 	if err := os.MkdirAll(domainDir, 0755); err != nil {
