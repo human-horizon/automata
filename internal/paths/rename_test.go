@@ -29,6 +29,31 @@ func TestRenameDirectoryRejectsExistingTarget(t *testing.T) {
 	}
 }
 
+func TestRenameDirectoryReportsCommittedSyncFailure(t *testing.T) {
+	base := t.TempDir()
+	oldPath := filepath.Join(base, "old")
+	newPath := filepath.Join(base, "new")
+	if err := os.MkdirAll(oldPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	syncErr := errors.New("injected parent sync failure")
+	previousSync := syncRenameParent
+	syncRenameParent = func(string) error { return syncErr }
+	t.Cleanup(func() { syncRenameParent = previousSync })
+
+	err := RenameDirectory(oldPath, newPath)
+	if !atomicfile.IsCommitted(err) || !errors.Is(err, syncErr) {
+		t.Fatalf("rename error = %v, want committed sync failure", err)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("committed target missing: %v", err)
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("committed source still exists: %v", err)
+	}
+}
+
 func TestMigrateSessionJSONLPreservesHistory(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/scrollback"
 	"github.com/HumanHorizon/automata/internal/slug"
@@ -1133,6 +1134,8 @@ func (a *App) cleanupExternallyRemovedFamiliar(familiarID string, em *portalis.E
 // closeFamiliar cleans up after the user confirms closing a familiar. An
 // uncommitted runtime preflight failure leaves host data and the tab intact;
 // committed cleanup warnings are returned after every host cleanup is tried.
+var removeFamiliarRegistry = paths.RemoveFamiliar
+
 func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 	ownerSessionID := a.activeChatSessionID()
 	if err := paths.ValidateFamiliarSessionID(ownerSessionID, familiarID); err != nil {
@@ -1165,8 +1168,15 @@ func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 			}
 		}
 	}
-	if err := paths.RemoveFamiliar(a.profile, ownerSessionID, familiarID); err != nil {
-		cleanupFailures = append(cleanupFailures, fmt.Errorf("remove familiar %q from registry: %w", familiarID, err))
+	if err := removeFamiliarRegistry(a.profile, ownerSessionID, familiarID); err != nil {
+		registryErr := fmt.Errorf("remove familiar %q from registry: %w", familiarID, err)
+		if !atomicfile.IsCommitted(err) {
+			// Runtime cleanup may already be committed, but the registry still
+			// owns this familiar. Keep the tab visible so the user can retry
+			// instead of letting the watcher resurrect it behind their back.
+			return errors.Join(append(cleanupFailures, registryErr)...)
+		}
+		cleanupFailures = append(cleanupFailures, registryErr)
 	}
 
 	if err := errors.Join(cleanupFailures...); err != nil {

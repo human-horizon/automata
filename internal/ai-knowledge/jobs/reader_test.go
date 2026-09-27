@@ -1303,21 +1303,34 @@ func TestCleanupStaleUsesExplicitProfileScope(t *testing.T) {
 	jobA := writeProfileStaleJob(t, profileA, "chat-a")
 	jobB := writeProfileStaleJob(t, profileB, "chat-b")
 
+	readStatus := func(jobDir string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(jobDir, "job.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record JobRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			t.Fatal(err)
+		}
+		return record.Status
+	}
+
 	if err := CleanupStaleForProfile(profileA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(jobA); !os.IsNotExist(err) {
-		t.Fatalf("explicit profile cleanup left profile A job: %v", err)
+	if got := readStatus(jobA); got != "exited" {
+		t.Fatalf("profile A stale status = %q, want exited", got)
 	}
-	if _, err := os.Stat(jobB); err != nil {
-		t.Fatalf("explicit profile cleanup touched profile B unexpectedly: %v", err)
+	if got := readStatus(jobB); got != "running" {
+		t.Fatalf("explicit profile cleanup changed profile B status to %q", got)
 	}
 
 	if err := CleanupStale(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(jobB); !os.IsNotExist(err) {
-		t.Fatalf("all-profile cleanup left profile B job: %v", err)
+	if got := readStatus(jobB); got != "exited" {
+		t.Fatalf("all-profile cleanup status = %q, want exited", got)
 	}
 }
 

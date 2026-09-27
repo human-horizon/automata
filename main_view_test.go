@@ -1091,6 +1091,62 @@ func TestCleanupExternallyRemovedFamiliarPreflightFailurePreservesRuntime(t *tes
 	}
 }
 
+func TestCloseFamiliarRegistryPrecommitFailureRemainsRetryable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
+	const (
+		profile = "close-familiar-retry"
+		mainSID = "close-familiar-retry__chat"
+		famSID  = "close-familiar-retry__chat__expert"
+		cwd     = "/tmp"
+	)
+	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
+	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	panel := ui.NewChatPanel(mainEm, mainSID, profile)
+	registryPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registryBefore := []byte(`[{"id":"expert","sessionId":"` + famSID + `"}]`)
+	if err := os.WriteFile(registryPath, registryBefore, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := tree.New()
+	tr.Profile = profile
+	app := &App{
+		tree:                  tr,
+		container:             ui.NewContainer(panel),
+		profile:               profile,
+		piAgentDir:            filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:        map[string]struct{}{famSID: {}},
+		runningSessions:       map[string]struct{}{famSID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{famSID: familiarEm},
+		familiarEmulatorCache: map[string]*portalis.Emulator{famSID: familiarEm},
+	}
+	registryErr := errors.New("injected registry precommit failure")
+	previousRemove := removeFamiliarRegistry
+	removeFamiliarRegistry = func(string, string, string) error { return registryErr }
+	t.Cleanup(func() { removeFamiliarRegistry = previousRemove })
+
+	err := app.closeFamiliar(famSID, familiarEm)
+	if !errors.Is(err, registryErr) {
+		t.Fatalf("close familiar error = %v, want registry failure", err)
+	}
+	var committed *ui.CommittedCleanupError
+	if errors.As(err, &committed) {
+		t.Fatalf("precommit registry failure was mislabeled committed: %v", err)
+	}
+	gotRegistry, readErr := os.ReadFile(registryPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(gotRegistry) != string(registryBefore) {
+		t.Fatalf("registry changed after precommit failure: %s", gotRegistry)
+	}
+}
+
 func TestCloseFamiliarCompletesHostCleanupAfterCommittedPersistenceFailure(t *testing.T) {
 	dataHome := t.TempDir()
 	home := t.TempDir()
@@ -1923,7 +1979,7 @@ func TestStatusWatcherUpdatesOnlyChangedBadgeAndFiltersFiles(t *testing.T) {
 	for _, item := range items {
 		want := "~"
 		if item.Name == "second" {
-			want = "W"
+			want = ""
 		}
 		if got := app.tree.StatusBadge(item); got != want {
 			t.Errorf("%s badge = %q, want %q", item.Name, got, want)
@@ -1945,7 +2001,7 @@ func TestStatusWatcherUpdatesOnlyChangedBadgeAndFiltersFiles(t *testing.T) {
 	for _, item := range items {
 		want := "~"
 		if item.Name == "second" {
-			want = "W"
+			want = ""
 		}
 		if got := app.tree.StatusBadge(item); got != want {
 			t.Errorf("unrelated file changed %s badge to %q, want %q", item.Name, got, want)

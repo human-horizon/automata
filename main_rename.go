@@ -601,6 +601,9 @@ func moveRenameDirectory(oldPath, newPath string, moves *[]renameDirectoryMove) 
 		return nil
 	}
 	if err := paths.RenameDirectory(oldPath, newPath); err != nil {
+		if atomicfile.IsCommitted(err) {
+			*moves = append(*moves, renameDirectoryMove{oldPath: oldPath, newPath: newPath})
+		}
 		return err
 	}
 	*moves = append(*moves, renameDirectoryMove{oldPath: oldPath, newPath: newPath})
@@ -617,7 +620,10 @@ func moveRenameTask(move *renameTaskMove) error {
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return err
 	}
-	if err := os.Rename(move.oldPath, move.newPath); err != nil {
+	if err := paths.RenameFile(move.oldPath, move.newPath); err != nil {
+		if atomicfile.IsCommitted(err) {
+			move.moved = true
+		}
 		return err
 	}
 	move.moved = true
@@ -640,7 +646,7 @@ func rollbackRenameTask(move *renameTaskMove) {
 			log.Printf("automata: rollback Kanban task assignment %s: %v", move.newPath, err)
 		}
 	}
-	if err := os.Rename(move.newPath, move.oldPath); err != nil {
+	if err := paths.RenameFile(move.newPath, move.oldPath); err != nil {
 		log.Printf("automata: rollback Kanban task %s -> %s: %v", move.newPath, move.oldPath, err)
 	}
 	if move.createdTargetDir {

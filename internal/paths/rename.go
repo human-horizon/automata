@@ -3,6 +3,7 @@ package paths
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +12,42 @@ import (
 	"github.com/HumanHorizon/automata/internal/atomicfile"
 )
 
-var writeRenameFileAtomic = atomicfile.Write
+var (
+	writeRenameFileAtomic = atomicfile.Write
+	renamePath            = os.Rename
+	syncRenameParent      = syncDirectory
+)
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
+func durableRename(oldPath, newPath string) error {
+	if err := renamePath(oldPath, newPath); err != nil {
+		return err
+	}
+	oldParent := filepath.Dir(oldPath)
+	newParent := filepath.Dir(newPath)
+	var syncErrors []error
+	if err := syncRenameParent(oldParent); err != nil {
+		syncErrors = append(syncErrors, fmt.Errorf("sync source parent %q: %w", oldParent, err))
+	}
+	if newParent != oldParent {
+		if err := syncRenameParent(newParent); err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("sync target parent %q: %w", newParent, err))
+		}
+	}
+	if err := errors.Join(syncErrors...); err != nil {
+		return &atomicfile.CommittedError{Path: newPath, Err: err}
+	}
+	return nil
+}
 
 // RenameDirectory moves one Automata data directory without merging it with
 // an existing target. Missing source and target are both treated as a no-op;
@@ -48,7 +84,34 @@ func RenameDirectory(oldPath, newPath string) error {
 	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
 		return fmt.Errorf("create target parent %q: %w", filepath.Dir(newPath), err)
 	}
-	if err := os.Rename(oldPath, newPath); err != nil {
+	if err := durableRename(oldPath, newPath); err != nil {
+		return fmt.Errorf("rename %q to %q: %w", oldPath, newPath, err)
+	}
+	return nil
+}
+
+// RenameFile moves one file without overwriting an existing target and fsyncs
+// both parent directories after the rename.
+func RenameFile(oldPath, newPath string) error {
+	if oldPath == newPath {
+		return nil
+	}
+	oldInfo, oldErr := os.Stat(oldPath)
+	newInfo, newErr := os.Stat(newPath)
+	switch {
+	case oldErr == nil && !oldInfo.Mode().IsRegular():
+		return fmt.Errorf("source %q is not a regular file", oldPath)
+	case oldErr != nil:
+		return fmt.Errorf("stat source %q: %w", oldPath, oldErr)
+	case newErr == nil:
+		return fmt.Errorf("target %q already exists (%s)", newPath, newInfo.Mode().Type())
+	case newErr != nil && !os.IsNotExist(newErr):
+		return fmt.Errorf("stat target %q: %w", newPath, newErr)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+		return fmt.Errorf("create target parent %q: %w", filepath.Dir(newPath), err)
+	}
+	if err := durableRename(oldPath, newPath); err != nil {
 		return fmt.Errorf("rename %q to %q: %w", oldPath, newPath, err)
 	}
 	return nil

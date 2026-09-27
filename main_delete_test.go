@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"log"
 	"os"
@@ -161,8 +162,18 @@ func TestCleanupDeletedTreeItemStopsRuntimeAndRemovesGhostState(t *testing.T) {
 	if app.currentSessionID != "" {
 		t.Fatalf("current session remained after delete: %q", app.currentSessionID)
 	}
-	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
-		t.Fatalf("stale job remained after delete: %v", err)
+	jobData, err := os.ReadFile(filepath.Join(jobDir, "job.json"))
+	if err != nil {
+		t.Fatalf("completed job history was not retained after delete: %v", err)
+	}
+	var jobState struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(jobData, &jobState); err != nil {
+		t.Fatal(err)
+	}
+	if jobState.Status != "exited" {
+		t.Fatalf("stale job status = %q, want exited", jobState.Status)
 	}
 	if got := tr.ActiveSessionIDs(); len(got) != 0 {
 		t.Fatalf("tree retained ghost active sessions: %v", got)

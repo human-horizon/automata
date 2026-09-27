@@ -12,6 +12,31 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+func TestFileManagerCommandByPlatform(t *testing.T) {
+	tests := []struct {
+		goos string
+		want string
+	}{
+		{goos: "darwin", want: "open"},
+		{goos: "linux", want: "xdg-open"},
+		{goos: "windows", want: "explorer.exe"},
+	}
+	for _, test := range tests {
+		t.Run(test.goos, func(t *testing.T) {
+			cmd, err := fileManagerCommand(test.goos, "/tmp/example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cmd.Args[0]; got != test.want {
+				t.Fatalf("command = %q, want %q", got, test.want)
+			}
+		})
+	}
+	if _, err := fileManagerCommand("plan9", "/tmp/example"); err == nil {
+		t.Fatal("unsupported OS did not return an error")
+	}
+}
+
 func TestNew(t *testing.T) {
 	tr := New()
 	if tr == nil {

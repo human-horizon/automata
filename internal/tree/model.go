@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1030,9 +1031,22 @@ func (t *Tree) unbindFolderChecked(item *Item) error {
 	})
 }
 
-// revealInFinder opens the bound directory in the macOS Finder and returns
-// validation or launch errors to the caller.
-func revealInFinder(path string) error {
+func fileManagerCommand(goos, path string) (*exec.Cmd, error) {
+	switch goos {
+	case "darwin":
+		return exec.Command("open", path), nil
+	case "linux":
+		return exec.Command("xdg-open", path), nil
+	case "windows":
+		return exec.Command("explorer.exe", path), nil
+	default:
+		return nil, fmt.Errorf("file-manager reveal is unsupported on %s", goos)
+	}
+}
+
+// revealInFileManager opens the bound directory in the platform file manager
+// and returns validation or launch errors to the caller.
+func revealInFileManager(path string) error {
 	if path == "" {
 		return fmt.Errorf("bound path is empty")
 	}
@@ -1043,8 +1057,12 @@ func revealInFinder(path string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("bound path %q is not a directory", path)
 	}
-	if err := childproc.StartAndReap(exec.Command("open", path)); err != nil {
-		return fmt.Errorf("reveal %q in Finder: %w", path, err)
+	command, err := fileManagerCommand(runtime.GOOS, path)
+	if err != nil {
+		return err
+	}
+	if err := childproc.StartAndReap(command); err != nil {
+		return fmt.Errorf("reveal %q in file manager: %w", path, err)
 	}
 	return nil
 }
@@ -1548,8 +1566,8 @@ func (t *Tree) buildContextMenuItems(sel *Item) []warp.PopoverItem {
 		// Bind/Reveal/Unbind only make sense for anchored folders.
 		if sel.BoundPath != "" {
 			items = append(items, []warp.PopoverItem{
-				{Name: "Reveal in Finder", Action: func() {
-					if err := revealInFinder(sel.BoundPath); err != nil {
+				{Name: "Reveal in File Manager", Action: func() {
+					if err := revealInFileManager(sel.BoundPath); err != nil {
 						t.recordActionError(err)
 					}
 				}},
