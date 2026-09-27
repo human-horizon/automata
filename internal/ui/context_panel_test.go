@@ -70,6 +70,15 @@ func confirmNotesPaste(t *testing.T, cp *ContextPanel) {
 }
 
 // TestContextPanelEmptyDomain verifies the placeholder for a missing domain.
+func TestContextPanelToolbarShowsWatcherWarning(t *testing.T) {
+	panel := NewContextPanel("test")
+	panel.notesWatchError = "watcher unavailable"
+	got := stripAnsiFn(panel.renderNotesToolbar(120))
+	if !strings.Contains(got, "Live update: watcher unavailable") {
+		t.Fatalf("notes toolbar = %q", got)
+	}
+}
+
 func TestContextPanelEmptyDomain(t *testing.T) {
 	cp := NewContextPanel("")
 	cp.SetDomain("")

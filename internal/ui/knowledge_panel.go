@@ -85,8 +85,11 @@ type KnowledgePanel struct {
 
 	data         *akcontext.Data
 	jobs         []akjobs.Job
-	contextError string
-	jobsError    string
+	contextError        string
+	jobsError           string
+	knowledgeWatchError string
+	jobsWatchError      string
+	kanbanWatchError    string
 
 	// Cached readers prevent re-reading unchanged files across watcher events.
 	contextReader *akcontext.CachedReader
@@ -282,10 +285,12 @@ func (k *KnowledgePanel) attachKnowledgeWatcherIfMissing() {
 	if info, err := os.Stat(sessionDir); err != nil || !info.IsDir() {
 		watchPath = paths.SessionsDir(k.profile)
 		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+			k.knowledgeWatchError = fmt.Sprintf("create session watcher path: %v", err)
 			return
 		}
 	}
 	if k.knowledgeWatcher != nil && k.knowledgeWatcherPath == watchPath {
+		k.knowledgeWatchError = ""
 		return
 	}
 	if k.knowledgeWatcher != nil {
@@ -294,14 +299,17 @@ func (k *KnowledgePanel) attachKnowledgeWatcherIfMissing() {
 	}
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
+		k.knowledgeWatchError = fmt.Sprintf("create session watcher: %v", err)
 		return
 	}
 	if err := w.Add(watchPath); err != nil {
 		_ = w.Close()
+		k.knowledgeWatchError = fmt.Sprintf("watch session data: %v", err)
 		return
 	}
 	k.knowledgeWatcher = w
 	k.knowledgeWatcherPath = watchPath
+	k.knowledgeWatchError = ""
 }
 
 // readSettings loads and validates known settings without treating malformed
@@ -661,7 +669,14 @@ func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
 	jobsDir := filepath.Join(sessionDir, "jobs")
 	watchRoot := jobsDir
 	if info, err := os.Stat(jobsDir); err != nil || !info.IsDir() {
+		if err != nil && !os.IsNotExist(err) {
+			k.jobsWatchError = fmt.Sprintf("inspect jobs directory: %v", err)
+			return
+		}
 		if _, err := os.Stat(sessionDir); err != nil {
+			if !os.IsNotExist(err) {
+				k.jobsWatchError = fmt.Sprintf("inspect session directory for jobs: %v", err)
+			}
 			return
 		}
 		watchRoot = sessionDir
@@ -671,24 +686,29 @@ func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
 		k.resetJobsWatcher()
 		w, err := fsnotify.NewWatcher()
 		if err != nil {
+			k.jobsWatchError = fmt.Sprintf("create jobs watcher: %v", err)
 			return
 		}
 		k.jobsWatcher = w
 		k.jobsWatcherPath = watchRoot
 		k.jobsWatchedPaths = make(map[string]struct{})
 	}
-	k.syncJobsWatcherPaths(jobsDir, watchRoot)
+	if err := k.syncJobsWatcherPaths(jobsDir, watchRoot); err != nil {
+		k.jobsWatchError = err.Error()
+	} else {
+		k.jobsWatchError = ""
+	}
 }
 
-func (k *KnowledgePanel) syncJobsWatcherPaths(jobsDir, watchRoot string) {
+func (k *KnowledgePanel) syncJobsWatcherPaths(jobsDir, watchRoot string) error {
 	if k.jobsWatcher == nil {
-		return
+		return nil
 	}
 	desired := map[string]struct{}{watchRoot: {}}
 	if watchRoot == jobsDir {
 		entries, err := os.ReadDir(jobsDir)
 		if err != nil {
-			return
+			return fmt.Errorf("read jobs directory: %w", err)
 		}
 		for _, entry := range entries {
 			if entry.IsDir() {
@@ -696,11 +716,14 @@ func (k *KnowledgePanel) syncJobsWatcherPaths(jobsDir, watchRoot string) {
 			}
 		}
 	}
+	var failures []error
 	for path := range k.jobsWatchedPaths {
 		if _, keep := desired[path]; keep {
 			continue
 		}
-		_ = k.jobsWatcher.Remove(path)
+		if err := k.jobsWatcher.Remove(path); err != nil && !errors.Is(err, fsnotify.ErrNonExistentWatch) {
+			failures = append(failures, fmt.Errorf("remove jobs watch %s: %w", path, err))
+		}
 		delete(k.jobsWatchedPaths, path)
 	}
 	for path := range desired {
@@ -708,10 +731,12 @@ func (k *KnowledgePanel) syncJobsWatcherPaths(jobsDir, watchRoot string) {
 			continue
 		}
 		if err := k.jobsWatcher.Add(path); err != nil {
+			failures = append(failures, fmt.Errorf("add jobs watch %s: %w", path, err))
 			continue
 		}
 		k.jobsWatchedPaths[path] = struct{}{}
 	}
+	return errors.Join(failures...)
 }
 
 func (k *KnowledgePanel) attachKanbanWatcherIfMissing() {
@@ -723,23 +748,28 @@ func (k *KnowledgePanel) attachKanbanWatcherIfMissing() {
 	if info, err := os.Stat(kanbanDir); err != nil || !info.IsDir() {
 		watchPath = filepath.Dir(kanbanDir)
 		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+			k.kanbanWatchError = fmt.Sprintf("create Kanban watcher path: %v", err)
 			return
 		}
 	}
 	if k.kanbanWatcher != nil && k.kanbanWatcherPath == watchPath {
+		k.kanbanWatchError = ""
 		return
 	}
 	k.resetKanbanWatcher()
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
+		k.kanbanWatchError = fmt.Sprintf("create Kanban watcher: %v", err)
 		return
 	}
 	if err := w.Add(watchPath); err != nil {
 		_ = w.Close()
+		k.kanbanWatchError = fmt.Sprintf("watch Kanban: %v", err)
 		return
 	}
 	k.kanbanWatcher = w
 	k.kanbanWatcherPath = watchPath
+	k.kanbanWatchError = ""
 }
 
 // watchKnowledgeCmd blocks on the session-level fsnotify watcher and
@@ -1014,6 +1044,15 @@ func (k *KnowledgePanel) View(width, height int) string {
 	}
 	if k.jobsError != "" {
 		diagnostics = append(diagnostics, "Jobs read warning: "+k.jobsError)
+	}
+	if k.knowledgeWatchError != "" {
+		diagnostics = append(diagnostics, "Session live-update warning: "+k.knowledgeWatchError)
+	}
+	if k.jobsWatchError != "" {
+		diagnostics = append(diagnostics, "Jobs live-update warning: "+k.jobsWatchError)
+	}
+	if k.kanbanWatchError != "" {
+		diagnostics = append(diagnostics, "Kanban live-update warning: "+k.kanbanWatchError)
 	}
 	warning := ""
 	if len(diagnostics) > 0 {

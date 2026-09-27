@@ -80,8 +80,9 @@ type KanbanPanel struct {
 	domain      string
 	palette     apptheme.Theme
 	tasks       []kanban.Task
-	readWarning string
-	tab         *warp.Tab
+	readWarning  string
+	watchWarning string
+	tab          *warp.Tab
 
 	btnPanel  *kanbanBtnPanel
 	colPanels []*kanbanColPanel
@@ -203,6 +204,7 @@ func (k *KanbanPanel) setupWatcher() {
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		watchPath = filepath.Dir(dir)
 		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+			k.watchWarning = fmt.Sprintf("create live-update path: %v", err)
 			return
 		}
 	}
@@ -212,15 +214,18 @@ func (k *KanbanPanel) setupWatcher() {
 	k.closeWatcher()
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
+		k.watchWarning = fmt.Sprintf("create live-update watcher: %v", err)
 		return
 	}
 	if err := w.Add(watchPath); err != nil {
 		_ = w.Close()
+		k.watchWarning = fmt.Sprintf("watch Kanban: %v", err)
 		return
 	}
 	k.watcher = w
 	k.watcherPath = watchPath
 	k.watchErrors = w.Errors
+	k.watchWarning = ""
 }
 
 // closeWatcher stops and releases the file watcher if one is attached.
@@ -632,12 +637,15 @@ func (k *KanbanPanel) View(width, height int) string {
 	topPad := strings.Repeat(" ", width)
 	btnLine := k.btnPanel.View(width, 1)
 	boardTopPad := strings.Repeat(" ", width)
-	warnings := make([]string, 0, 2)
+	warnings := make([]string, 0, 4)
 	if k.actionWarning != "" {
 		warnings = append(warnings, "⚠ "+k.actionWarning)
 	}
 	if k.readWarning != "" {
 		warnings = append(warnings, "⚠ Не все Kanban-задачи загружены: "+k.readWarning)
+	}
+	if k.watchWarning != "" {
+		warnings = append(warnings, "⚠ Kanban live update unavailable: "+k.watchWarning)
 	}
 	if k.assignmentErr != "" {
 		warnings = append(warnings, "Ошибка Kanban-действия: "+k.assignmentErr)

@@ -548,6 +548,19 @@ func TestKnowledgePanelCurrentTaskRefreshIsEventDriven(t *testing.T) {
 	}
 }
 
+func TestKnowledgePanelRendersLiveUpdateWarnings(t *testing.T) {
+	k := NewKnowledgePanel()
+	k.knowledgeWatchError = "session watcher unavailable"
+	k.jobsWatchError = "jobs watcher unavailable"
+	k.kanbanWatchError = "kanban watcher unavailable"
+	view := strip(k.View(160, 8))
+	for _, want := range []string{"Session live-update warning", "Jobs live-update warning", "Kanban live-update warning"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("Knowledge view missing %q: %q", want, view)
+		}
+	}
+}
+
 // TestKnowledgePanelEmpty ensures an uninitialised panel renders without crashing.
 func TestKnowledgePanelEmpty(t *testing.T) {
 	k := NewKnowledgePanel()

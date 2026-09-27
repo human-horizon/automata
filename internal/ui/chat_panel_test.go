@@ -17,6 +17,16 @@ import (
 	warp "github.com/starframe-dev/warp"
 )
 
+func TestChatPanelTabBarShowsWatcherWarning(t *testing.T) {
+	cp := &ChatPanel{
+		familiarWatchError: "watcher unavailable",
+		known:              make(map[string]bool),
+	}
+	if got := cp.tabBarWarning(); !strings.Contains(got, "live-update: watcher unavailable") {
+		t.Fatalf("tab warning = %q", got)
+	}
+}
+
 func TestChatPanelRendersLifecycleActionWarning(t *testing.T) {
 	panel := NewChatPanel(portalis.NewEmulator("session", "Main", "/bin/sh", nil), "session", "")
 	panel.SetActionWarning("cleanup failed\nrestart skipped")

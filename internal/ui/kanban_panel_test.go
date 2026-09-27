@@ -62,6 +62,15 @@ func newTransitionFixture(t *testing.T, profile, domain, status, assignedTo stri
 	return panel, taskPath, statusPath, taskBefore, statusBefore
 }
 
+func TestKanbanPanelShowsWatcherWarning(t *testing.T) {
+	panel := NewKanbanPanel("test")
+	panel.watchWarning = "watcher unavailable"
+	view := stripAnsiFn(panel.View(120, 8))
+	if !strings.Contains(view, "Kanban live update unavailable") {
+		t.Fatalf("Kanban view missing watcher warning: %q", view)
+	}
+}
+
 func TestKanbanPanelShowsPartialReadWarningAndValidTasks(t *testing.T) {
 	profile := "Partial Read"
 	domain := "partial-read"

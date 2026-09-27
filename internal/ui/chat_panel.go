@@ -80,8 +80,8 @@ type chatSession struct {
 }
 
 // ChatPanel manages multiple terminal sessions (main + familiars) with a tab
-// bar at the bottom. It polls the active profile's canonical session directory
-// for familiars.json and creates TermPanel tabs (Portalis Emulator) for them.
+// bar at the bottom. A generation-bound fsnotify watcher tracks familiars.json
+// and creates TermPanel tabs (Portalis Emulator) for owned familiar sessions.
 type ChatPanel struct {
 	sessions  []*chatSession
 	activeIdx int
@@ -95,6 +95,7 @@ type ChatPanel struct {
 	familiarSessions     map[string]string
 	removalPending       map[string]bool
 	familiarError        string
+	familiarWatchError   string
 	familiarCleanupError string
 	actionWarning        string
 	active               bool
@@ -363,7 +364,8 @@ func (cp *ChatPanel) setupFamiliarWatcher() {
 	if info, err := os.Stat(watchPath); err != nil || !info.IsDir() {
 		watchPath = paths.SessionsDir(cp.profile)
 		if err := os.MkdirAll(watchPath, 0o755); err != nil {
-			log.Printf("automata: cannot create familiar watcher parent %s: %v", watchPath, err)
+			cp.familiarWatchError = fmt.Sprintf("create watcher parent %s: %v", watchPath, err)
+			log.Printf("automata: familiar live-update unavailable: %s", cp.familiarWatchError)
 			return
 		}
 	}
@@ -373,16 +375,19 @@ func (cp *ChatPanel) setupFamiliarWatcher() {
 	cp.closeFamiliarWatcher()
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Printf("automata: cannot create familiar watcher: %v", err)
+		cp.familiarWatchError = fmt.Sprintf("create watcher: %v", err)
+		log.Printf("automata: familiar live-update unavailable: %s", cp.familiarWatchError)
 		return
 	}
 	if err := watcher.Add(watchPath); err != nil {
 		_ = watcher.Close()
-		log.Printf("automata: cannot watch familiar registry parent %s: %v", watchPath, err)
+		cp.familiarWatchError = fmt.Sprintf("watch %s: %v", watchPath, err)
+		log.Printf("automata: familiar live-update unavailable: %s", cp.familiarWatchError)
 		return
 	}
 	cp.familiarWatcher = watcher
 	cp.familiarWatcherPath = watchPath
+	cp.familiarWatchError = ""
 }
 
 func (cp *ChatPanel) closeFamiliarWatcher() {
@@ -841,6 +846,9 @@ func (cp *ChatPanel) tabBarWarning() string {
 	}
 	if cp.familiarError != "" {
 		warnings = append(warnings, "registry: "+cp.familiarError)
+	}
+	if cp.familiarWatchError != "" {
+		warnings = append(warnings, "live-update: "+cp.familiarWatchError)
 	}
 	if cp.familiarCleanupError != "" {
 		warnings = append(warnings, "cleanup: "+cp.familiarCleanupError)

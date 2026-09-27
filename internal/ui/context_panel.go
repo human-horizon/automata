@@ -38,8 +38,9 @@ type ContextPanel struct {
 	expandedNotes  map[string]bool
 	activeNoteKey  string
 	noteHits       []noteHit
-	notesClipboard notesClipboard
-	notesStatus    string
+	notesClipboard  notesClipboard
+	notesStatus     string
+	notesWatchError string
 
 	pendingNotesPasteAction   notesClipboardAction
 	notesPasteModal           *warp.Modal
@@ -142,9 +143,8 @@ func (c *ContextPanel) refresh() {
 // setupNotesWatcher attaches an fsnotify.Watcher to the active domain
 // directory so CREATE/WRITE/REMOVE/RENAME on notes.json (or any future
 // file we add to the domain dir) are reflected in the panel without a
-// tick. Best-effort: a missing domain dir is created on the fly; any
-// other error is logged and ignored — the panel just keeps its previous
-// data until the next manual refresh.
+// tick. A missing domain dir is created on the fly; setup failures remain
+// visible in the toolbar until a later attach succeeds.
 func (c *ContextPanel) setupNotesWatcher() {
 	if !c.active || c.activeTab != 0 || c.domain == "" {
 		return
@@ -157,21 +157,22 @@ func (c *ContextPanel) setupNotesWatcher() {
 		c.closeNotesWatcher()
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "context_panel: cannot create %s: %v\n", dir, err)
+		c.notesWatchError = fmt.Sprintf("create notes watcher path: %v", err)
 		return
 	}
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "context_panel: cannot create notes watcher: %v\n", err)
+		c.notesWatchError = fmt.Sprintf("create notes watcher: %v", err)
 		return
 	}
 	if err := w.Add(dir); err != nil {
-		fmt.Fprintf(os.Stderr, "context_panel: cannot watch %s: %v\n", dir, err)
 		_ = w.Close()
+		c.notesWatchError = fmt.Sprintf("watch notes: %v", err)
 		return
 	}
 	c.notesWatcher = w
 	c.notesWatcherPath = dir
+	c.notesWatchError = ""
 }
 
 // closeNotesWatcher releases the domain notes watcher if one is attached.
@@ -784,10 +785,19 @@ func (c *ContextPanel) renderNotesToolbar(width int) string {
 	}
 
 	line := builder.String()
-	if c.notesStatus != "" {
+	statusText := c.notesStatus
+	if c.notesWatchError != "" {
+		watchStatus := "✗ Live update: " + c.notesWatchError
+		if statusText == "" {
+			statusText = watchStatus
+		} else {
+			statusText += "; " + watchStatus
+		}
+	}
+	if statusText != "" {
 		available := width - lipgloss.Width(line) - 1
 		if available > 0 {
-			status := truncatePanelText(c.notesStatus, available)
+			status := truncatePanelText(statusText, available)
 			if status != "" {
 				line += " " + styles.toolbarStatus.Render(status)
 			}

@@ -1227,6 +1227,16 @@ type treeMetadataSaveMsg struct {
 
 const metadataSaveDelay = 250 * time.Millisecond
 
+func (a *App) recordInfrastructureWarning(err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("automata: %v", err)
+	if a.tree != nil {
+		a.tree.RecordActionWarning(err)
+	}
+}
+
 // setupStatusWatcher creates one shared watcher object. Only currently active
 // chat directories are added by syncSessionWatchers; the sessions root itself
 // is deliberately not watched because kqueue opens descriptors for every entry.
@@ -1234,12 +1244,12 @@ func (a *App) setupStatusWatcher() {
 	a.resetStatusWatcher()
 	base := a.sessionBaseDir()
 	if err := os.MkdirAll(base, 0o755); err != nil {
-		log.Printf("automata: cannot create %s: %v", base, err)
+		a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable: create %s: %w", base, err))
 		return
 	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Printf("automata: cannot create status watcher: %v", err)
+		a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable: create watcher: %w", err))
 		return
 	}
 	a.statusWatcher = watcher
@@ -1292,7 +1302,9 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 			continue
 		}
 		if a.statusWatcher != nil {
-			_ = a.statusWatcher.Remove(oldDir)
+			if err := a.statusWatcher.Remove(oldDir); err != nil && !errors.Is(err, fsnotify.ErrNonExistentWatch) {
+				a.recordInfrastructureWarning(fmt.Errorf("status live-update cleanup for %s: %w", key, err))
+			}
 		}
 		delete(a.statusSessionDirs, oldDir)
 		delete(a.sessionWatchers, key)
@@ -1310,7 +1322,7 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 			continue
 		}
 		if err := a.statusWatcher.Add(dir); err != nil {
-			log.Printf("automata: cannot watch session %s: %v", key, err)
+			a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable for %s: %w", key, err))
 			continue
 		}
 		a.sessionWatchers[key] = a.statusWatcher
