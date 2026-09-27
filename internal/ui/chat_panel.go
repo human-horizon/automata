@@ -269,13 +269,6 @@ func (s *chatSession) Em() *portalis.Emulator {
 	return s.em
 }
 
-// Panel returns the warp.Panel wrapping the emulator. Exposed for tests
-// that need to inspect the wrapped panel's internal state after Clear
-// (e.g. TestClearReplacesPanelEmulator).
-func (s *chatSession) Panel() warp.Panel {
-	return s.panel
-}
-
 // SetEm replaces the emulator reference and updates the wrapped panel.
 // Used by clearSessionCmd to point the active chatSession at a freshly
 // restarted PTY so the UI no longer renders the stopped emulator.

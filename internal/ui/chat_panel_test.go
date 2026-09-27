@@ -672,6 +672,22 @@ func TestFamiliarSessionIDsEmptyForMainOnly(t *testing.T) {
 	}
 }
 
+func TestChatSessionSetEmUpdatesTermPanel(t *testing.T) {
+	original := portalis.NewEmulator("old", "old", "/bin/sh", nil)
+	replacement := portalis.NewEmulator("new", "new", "/bin/sh", nil)
+	panel := NewTermPanel(original)
+	session := &chatSession{em: original, panel: panel}
+
+	session.SetEm(replacement)
+
+	if session.em != replacement {
+		t.Fatal("chatSession emulator was not replaced")
+	}
+	if panel.em != replacement {
+		t.Fatal("wrapped TermPanel emulator was not replaced")
+	}
+}
+
 func TestSessionsExporter(t *testing.T) {
 	cp := &ChatPanel{
 		sessions: []*chatSession{

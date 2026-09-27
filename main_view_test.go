@@ -1337,25 +1337,7 @@ func TestClearReplacesPanelEmulator(t *testing.T) {
 		t.Fatalf("cp.sessions[0].em = %p, want new emulator %p", got, newEm)
 	}
 
-	// 8. TermPanel wrapped by chatSession points at the new emulator too.
-	//    Read the unexported TermPanel.em via unsafe because reflect's
-	//    Value.Interface() refuses unexported fields. We only use this in
-	//    tests; the production API stays narrow.
-	panel := cp.Sessions()[0].Panel()
-	if panel == nil {
-		t.Fatal("chatSession.Panel() returned nil")
-	}
-	panelVal := reflect.ValueOf(panel).Elem()
-	emField := panelVal.FieldByName("em")
-	if !emField.IsValid() {
-		t.Fatal("TermPanel.em field not found via reflection")
-	}
-	panelEm := *(**portalis.Emulator)(unsafe.Pointer(emField.UnsafeAddr()))
-	if panelEm != newEm {
-		t.Fatalf("TermPanel.em = %p, want new emulator %p", panelEm, newEm)
-	}
-
-	// 9. View() after a ResizeMsg must not panic and must render from the
+	// 8. View() after a ResizeMsg must not panic and must render from the
 	//    new emulator (deterministic: both old and new are empty since we
 	//    never spawned a PTY, but the call exercises the render path).
 	cp.Update(warp.ResizeMsg{Width: 80, Height: 24})
