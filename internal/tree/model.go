@@ -89,12 +89,6 @@ type ItemSelectedMsg struct {
 	Item *Item
 }
 
-// ChatSelectedMsg is emitted when a chat or terminal (non-folder) item is selected.
-// Deprecated: kept for compatibility; use ItemSelectedMsg.
-type ChatSelectedMsg struct {
-	Item *Item
-}
-
 // StopSessionMsg is emitted when the user clicks the stop button on an active
 // chat or terminal item.
 type StopSessionMsg struct {
@@ -210,10 +204,6 @@ type Tree struct {
 	profile     string
 	onItemMoved func(item *Item, oldSessionID, newSessionID string)
 
-	// onRename runs before the tree item is changed. Returning an error keeps
-	// the old name and leaves the input modal open.
-	onRename func(item *Item, newName string) error
-
 	// onBeforeRename runs before the tree item is changed and returns an
 	// external migration rollback used when Tree.SaveState fails.
 	onBeforeRename func(item *Item, newName string) (func() error, error)
@@ -231,9 +221,8 @@ type Tree struct {
 	activeSessions map[string]struct{}
 
 	// statusBadges maps sessionKey → single-emoji status indicator shown next
-	// to chat names in the tree. Empty string means no badge. Driven from
-	// outside by SetStatusBadges (typically populated by polling status.json
-	// every couple of seconds).
+	// to chat names in the tree. Empty string means no badge. The application
+	// updates this map from active-session filesystem events.
 	statusBadges map[string]string
 
 	// NoColor disables all ANSI color output. When true, the tree renders in
@@ -244,7 +233,7 @@ type Tree struct {
 	// Theme is the persisted identifier of the active visual theme.
 	Theme string
 
-	// Profile name for state isolation (e.g. "ai" → ~/.automata/ai/state.json)
+	// Profile name for state isolation under ~/.ai/automata/profiles/<slug>/.
 	Profile string
 
 	// saveMu serializes atomic state snapshots and replacements.
@@ -1226,10 +1215,6 @@ func (t *Tree) renameItem(item *Item, name string) error {
 		if err != nil {
 			return err
 		}
-	} else if t.onRename != nil {
-		if err := t.onRename(item, name); err != nil {
-			return err
-		}
 	}
 
 	item.Name = name
@@ -1825,14 +1810,6 @@ func (t *Tree) HelpOpen() bool {
 	return t.helpMode
 }
 
-// startInput enters input mode with a compatibility callback.
-func (t *Tree) startInput(prompt string, done func(name string)) {
-	t.startCheckedInput(prompt, func(name string) error {
-		done(name)
-		return nil
-	})
-}
-
 func (t *Tree) startCheckedInput(prompt string, done func(name string) error) {
 	t.inputMode = true
 	t.inputPrompt = prompt
@@ -2044,13 +2021,6 @@ func (t *Tree) SetOnBeforeItemMoved(fn func(*Item, *Item) (func() error, error))
 // stable across renames within the same parent.
 func (t *Tree) SetOnItemMoved(fn func(*Item, string, string)) {
 	t.onItemMoved = fn
-}
-
-// SetOnRename registers a legacy callback that performs external data
-// migration before the tree item name changes. New callers should use
-// SetOnBeforeRename and SetOnRenameCommitted for transactional persistence.
-func (t *Tree) SetOnRename(fn func(*Item, string) error) {
-	t.onRename = fn
 }
 
 // SetOnBeforeRename registers a reversible external migration hook. The
@@ -2304,8 +2274,8 @@ func (t *Tree) SessionKeyOf(item *Item) string { return t.sessionKey(item) }
 func (t *Tree) Root() []*Item { return t.root }
 
 // AllItems returns every item in the tree, recursively. Order is depth-first
-// pre-order; useful when an external caller (e.g. main.go status polling)
-// needs to walk the whole tree without caring about the on-screen layout.
+// pre-order; useful when an external caller needs the complete tree without
+// depending on the on-screen flat layout.
 func (t *Tree) AllItems() []*Item {
 	var out []*Item
 	visited := make(map[*Item]struct{})

@@ -882,20 +882,8 @@ func (a *App) createFamiliarEmulator(sessionID string) (*portalis.Emulator, []st
 	return em, env
 }
 
-// spawnParallelChatEmulator builds a fresh pi-agent for the parallel-chat
-// split. The agent is launched with `--no-session` (ephemeral, never
-// persisted) and receives the lower chat's session file path as its first
-// user message through stdin. The agent can then read status.json / plans /
-// the .jsonl transcript of the main session and answer progress questions
-// without disturbing the chat below.
-//
-// Returns (nil, nil) if just-pi is not on PATH and PI_CMD is empty —
-// in that case the ChatPanel keeps its placeholder panel so the user still sees
-// something instead of a silent broken split. Otherwise it returns the
-// TermPanel plus the tea.Cmd returned by em.Listen(), which MUST be
-// chained through bubbletea's command pipeline — without it just-pi's
-// PTY output never reaches the screen and the panel renders blank.
-// something instead of a silent broken split.
+// routeCachedEmulatorMessage keeps PTY messages attached to the emulator that
+// owns the session, including background chats that are no longer visible.
 func (a *App) routeCachedEmulatorMessage(msg tea.Msg) (tea.Cmd, bool) {
 	sessionID, ok := ptyMessageSessionID(msg)
 	if !ok {

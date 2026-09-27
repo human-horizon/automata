@@ -536,8 +536,8 @@ func (cp *ChatPanel) checkFamiliars() []tea.Cmd {
 			cp.familiarCleanupError = ""
 		}
 		// Skip if we're already tracking a session for this familiar, or
-		// cp.known already has it (avoids duplicate spawns from racing
-		// poll + PtyExitMsg + poll cycles during startup).
+		// cp.known already has it. This keeps watcher and PTY-exit events
+		// idempotent when they arrive close together.
 		if cp.known[f.ID] || liveSessionIDs[f.SessionID] {
 			continue
 		}

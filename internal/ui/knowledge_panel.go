@@ -585,9 +585,8 @@ func (k *KnowledgePanel) isCurrentKanbanWatcher(generation uint64, watcher *fsno
 	return k.active && watcher != nil && watcher == k.kanbanWatcher && generation == k.kanbanGeneration
 }
 
-// attachJobsWatcherIfMissing ensures the per-session jobs/ subdirectory has
-// an active fsnotify watcher. Until jobs/ exists, the session directory is
-// watched so its creation is handled by the next event.
+// resetKnowledgeWatcher closes the session-data watcher and invalidates its
+// outstanding generation-bound command.
 func (k *KnowledgePanel) resetKnowledgeWatcher() {
 	k.knowledgeGeneration++
 	k.knowledgeWatchPending = false
@@ -661,6 +660,9 @@ func (k *KnowledgePanel) refreshJobsData() {
 	k.jobsError = knowledgeReadError(errors.Join(diagnostics...))
 }
 
+// attachJobsWatcherIfMissing ensures the current session's jobs tree has the
+// watches needed to observe nested job.json updates. Until jobs/ exists, the
+// session directory is watched so directory creation is observed.
 func (k *KnowledgePanel) attachJobsWatcherIfMissing() {
 	if !k.active || k.sessionID == "" {
 		return

@@ -281,11 +281,11 @@ func TestRenameRejectsSlugConflict(t *testing.T) {
 	}
 }
 
-func TestRenameCallbackRunsBeforeTreeMutation(t *testing.T) {
+func TestRenamePreflightRunsBeforeTreeMutation(t *testing.T) {
 	tr := New()
 	tr.AddChat("old")
 	called := false
-	tr.SetOnRename(func(item *Item, newName string) error {
+	tr.SetOnBeforeRename(func(item *Item, newName string) (func() error, error) {
 		called = true
 		if item.Name != "old" {
 			t.Errorf("callback saw mutated name %q", item.Name)
@@ -293,7 +293,7 @@ func TestRenameCallbackRunsBeforeTreeMutation(t *testing.T) {
 		if newName != "new" {
 			t.Errorf("callback saw name %q", newName)
 		}
-		return nil
+		return nil, nil
 	})
 
 	if err := tr.renameItem(tr.root[0], "new"); err != nil {
@@ -307,8 +307,8 @@ func TestRenameCallbackRunsBeforeTreeMutation(t *testing.T) {
 func TestRenameErrorKeepsModalOpen(t *testing.T) {
 	tr := New()
 	tr.AddChat("old")
-	tr.SetOnRename(func(*Item, string) error {
-		return fmt.Errorf("migration failed")
+	tr.SetOnBeforeRename(func(*Item, string) (func() error, error) {
+		return nil, fmt.Errorf("migration failed")
 	})
 	tr.startRename(tr.root[0])
 	tr.inputValue = "new"
@@ -334,11 +334,12 @@ func TestF2StartsRenameForSelectedItem(t *testing.T) {
 func TestInputMode(t *testing.T) {
 	tr := New()
 	called := false
-	tr.startInput("Test:", func(name string) {
+	tr.startCheckedInput("Test:", func(name string) error {
 		called = true
 		if name != "hello" {
 			t.Errorf("expected 'hello', got %q", name)
 		}
+		return nil
 	})
 
 	if !tr.inputMode {

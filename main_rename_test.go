@@ -37,50 +37,40 @@ func newRenameWarningTestApp(t *testing.T, profile string) (*App, *tree.Tree) {
 	return app, tr
 }
 
-func TestRenameCleanupWarningsRemainVisibleWithoutRollback(t *testing.T) {
-	t.Run("legacy direct callback", func(t *testing.T) {
-		app, tr := newRenameWarningTestApp(t, "direct-warning")
-		app.tree.AddChat("old")
-		item := tr.Root()[0]
-		tr.SetOnRename(app.renameTreeItem)
-
-		if err := tr.RenameItem(item, "new"); err != nil {
-			t.Fatalf("RenameItem: %v", err)
+func bindTransactionalRenameForTest(app *App, tr *tree.Tree) {
+	app.pendingRenamePlans = make(map[*tree.Item]*renamePlan)
+	tr.SetOnBeforeRename(func(item *tree.Item, newName string) (func() error, error) {
+		plan, err := buildRenamePlan(item, newName, app.profile)
+		if err != nil {
+			return nil, err
 		}
-		if item.Name != "new" {
-			t.Fatalf("committed rename was rolled back: %q", item.Name)
+		rollback, err := app.applyRenamePlan(plan)
+		if err != nil {
+			return nil, err
 		}
-		if warning := tr.LastActionError(); warning == nil || !strings.Contains(warning.Error(), "runtime cleanup is incomplete") {
-			t.Fatalf("post-commit cleanup warning = %v", warning)
-		}
+		app.pendingRenamePlans[item] = plan
+		return func() error {
+			delete(app.pendingRenamePlans, item)
+			return rollback()
+		}, nil
 	})
+	tr.SetOnRenameCommitted(func(item *tree.Item, _, _ string) {
+		plan := app.pendingRenamePlans[item]
+		delete(app.pendingRenamePlans, item)
+		if plan == nil {
+			return
+		}
+		app.applyRenameMappings(plan)
+		_ = app.finalizeRenamePlan(plan)
+	})
+}
 
+func TestRenameCleanupWarningsRemainVisibleWithoutRollback(t *testing.T) {
 	t.Run("committed rename callback", func(t *testing.T) {
 		app, tr := newRenameWarningTestApp(t, "callback-warning")
 		tr.AddChat("old")
 		item := tr.Root()[0]
-		app.pendingRenamePlans = make(map[*tree.Item]*renamePlan)
-		tr.SetOnBeforeRename(func(item *tree.Item, newName string) (func() error, error) {
-			plan, err := buildRenamePlan(item, newName, app.profile)
-			if err != nil {
-				return nil, err
-			}
-			rollback, err := app.applyRenamePlan(plan)
-			if err != nil {
-				return nil, err
-			}
-			app.pendingRenamePlans[item] = plan
-			return func() error {
-				delete(app.pendingRenamePlans, item)
-				return rollback()
-			}, nil
-		})
-		tr.SetOnRenameCommitted(func(item *tree.Item, _, _ string) {
-			plan := app.pendingRenamePlans[item]
-			delete(app.pendingRenamePlans, item)
-			app.applyRenameMappings(plan)
-			app.finalizeRenamePlan(plan)
-		})
+		bindTransactionalRenameForTest(app, tr)
 
 		if err := tr.RenameItem(item, "new"); err != nil {
 			t.Fatalf("RenameItem: %v", err)
@@ -224,9 +214,9 @@ func TestRenameFolderMigratesContextsAndJSONL(t *testing.T) {
 	app.activeSessions[oldTerminalID] = struct{}{}
 	app.activeSessions[oldFamiliarID] = struct{}{}
 
-	app.tree.SetOnRename(app.renameTreeItem)
+	bindTransactionalRenameForTest(app, app.tree)
 	if err := app.tree.RenameItem(folder, "new-folder"); err != nil {
-		t.Fatalf("renameTreeItem: %v", err)
+		t.Fatalf("RenameItem: %v", err)
 	}
 
 	newChatID := app.tree.SessionKeyOf(chat)
@@ -546,7 +536,7 @@ func TestRenameRejectsConflictWithoutMutation(t *testing.T) {
 	app.tree.AddChat("Alpha")
 	app.tree.AddChat("Beta")
 	beta := app.tree.Root()[1]
-	app.tree.SetOnRename(app.renameTreeItem)
+	bindTransactionalRenameForTest(app, app.tree)
 
 	if err := app.tree.RenameItem(beta, " alpha "); err == nil {
 		t.Fatal("expected rename conflict")
@@ -573,7 +563,7 @@ func TestRenameRejectsExistingSessionTarget(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(app.sessionBaseDir(), targetID), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	app.tree.SetOnRename(app.renameTreeItem)
+	bindTransactionalRenameForTest(app, app.tree)
 
 	if err := app.tree.RenameItem(item, "target"); err == nil {
 		t.Fatal("expected existing session target error")
@@ -605,7 +595,7 @@ func TestRenameStopsOnlySelectedSession(t *testing.T) {
 	secondID := app.tree.SessionKeyOf(second)
 	app.emulatorCache[firstID] = portalis.NewEmulator(firstID, first.Name, "", nil)
 	app.emulatorCache[secondID] = portalis.NewEmulator(secondID, second.Name, "", nil)
-	app.tree.SetOnRename(app.renameTreeItem)
+	bindTransactionalRenameForTest(app, app.tree)
 
 	if err := app.tree.RenameItem(first, "renamed"); err != nil {
 		t.Fatalf("rename: %v", err)
@@ -891,7 +881,7 @@ func TestRenameRootChatKeepsProfileDomain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app.tree.SetOnRename(app.renameTreeItem)
+	bindTransactionalRenameForTest(app, app.tree)
 	if err := app.tree.RenameItem(chat, "new"); err != nil {
 		t.Fatalf("rename root chat: %v", err)
 	}

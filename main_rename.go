@@ -821,15 +821,3 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	}, nil
 }
 
-func (a *App) renameTreeItem(item *tree.Item, newName string) error {
-	plan, err := buildRenamePlan(item, newName, a.profile)
-	if err != nil {
-		return err
-	}
-	if _, err := a.applyRenamePlan(plan); err != nil {
-		return err
-	}
-	a.applyRenameMappings(plan)
-	a.finalizeRenamePlan(plan)
-	return nil
-}

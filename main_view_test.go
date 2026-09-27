@@ -1542,9 +1542,8 @@ func TestRecomputeTreeStatusBadgesIdleLeavesEmpty(t *testing.T) {
 	}
 }
 
-// TestSetupStatusWatcherCreatesMissingBase proves the watcher setup
-// recovers when sessionBaseDir() doesn't exist yet: it must MkdirAll the
-// base and still attach a parent watcher.
+// TestSetupStatusWatcherCreatesMissingBase proves watcher setup materializes
+// the sessions container without registering a broad watch on every chat.
 func TestSetupStatusWatcherCreatesMissingBase(t *testing.T) {
 	app := newTestApp(t, "")
 	base := app.sessionBaseDir()
@@ -1563,10 +1562,9 @@ func TestSetupStatusWatcherCreatesMissingBase(t *testing.T) {
 	app.statusWatcher.Close()
 }
 
-// TestSetupStatusWatcherAttachesPerSession creates two chat items, points
-// the Tree at one of them, and confirms setupStatusWatcher opens a parent
-// watcher plus one watcher per existing session directory.
-func TestSetupStatusWatcherAttachesPerSession(t *testing.T) {
+// TestSetupStatusWatcherAttachesActiveSessions confirms all active chats are
+// registered on the one shared watcher.
+func TestSetupStatusWatcherAttachesActiveSessions(t *testing.T) {
 	app := newTestApp(t, "")
 	keys := make([]string, 0, 2)
 	for _, it := range app.tree.AllItems() {
@@ -1607,10 +1605,9 @@ func TestSetupStatusWatcherAttachesPerSession(t *testing.T) {
 	}
 }
 
-// TestSyncSessionWatchersPrunesHidden removes a chat from the Tree and
-// confirms the matching per-session watcher is closed and dropped from
-// the map, so file descriptors don't leak.
-func TestSyncSessionWatchersPrunesHidden(t *testing.T) {
+// TestSyncSessionWatchersPrunesRemovedTreeSession removes a chat from the
+// Tree and confirms its watch registration is dropped.
+func TestSyncSessionWatchersPrunesRemovedTreeSession(t *testing.T) {
 	app := newTestApp(t, "")
 	it := app.tree.AllItems()[0]
 	key := app.tree.SessionKeyOf(it)
