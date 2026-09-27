@@ -235,7 +235,9 @@ func newApp(profile, piAgentDir string) (a *App) {
 		delete(a.pendingMovePlans, item)
 		if plan != nil {
 			a.applyRenameMappings(plan)
-			_ = a.finalizeRenamePlan(plan)
+			if err := a.finalizeRenamePlan(plan); err != nil {
+				a.recordInfrastructureWarning(fmt.Errorf("finalize committed move: %w", err))
+			}
 		}
 	})
 
@@ -264,7 +266,9 @@ func newApp(profile, piAgentDir string) (a *App) {
 			return
 		}
 		a.applyRenameMappings(plan)
-		_ = a.finalizeRenamePlan(plan)
+		if err := a.finalizeRenamePlan(plan); err != nil {
+			a.recordInfrastructureWarning(fmt.Errorf("finalize committed rename: %w", err))
+		}
 	})
 
 	t.SetOnStopSession(func(item *tree.Item) {
