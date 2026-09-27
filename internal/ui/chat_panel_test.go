@@ -687,8 +687,8 @@ func TestSessionsExporter(t *testing.T) {
 	if all[0].Em() != nil {
 		t.Fatal("Main em should be nil")
 	}
-	if all[1].FamiliarID() != "f1" {
-		t.Fatalf("expected f1, got %q", all[1].FamiliarID())
+	if all[1].familiarID != "f1" {
+		t.Fatalf("expected f1, got %q", all[1].familiarID)
 	}
 }
 

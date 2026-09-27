@@ -135,7 +135,7 @@ type KnowledgePanel struct {
 	kanbanWatchPending    bool
 }
 
-// NewKnowledgePanel creates an empty panel; data loads on the first Refresh.
+// NewKnowledgePanel creates an empty panel; activation/session changes load data.
 func NewKnowledgePanel() *KnowledgePanel {
 	return &KnowledgePanel{
 		palette:       apptheme.Default(),

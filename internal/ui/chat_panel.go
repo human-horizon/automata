@@ -289,12 +289,6 @@ func (s *chatSession) SetEm(em *portalis.Emulator) {
 	}
 }
 
-// FamiliarID returns the familiar session id for this chat session,
-// or an empty string for the Main tab.
-func (s *chatSession) FamiliarID() string {
-	return s.familiarID
-}
-
 // FamiliarSessionIDs returns the familiar session IDs of all non-Main tabs.
 // Order matches cp.sessions. Used by clearSessionCmd to know which
 // familiar emulators to stop and which JSONL files to delete.

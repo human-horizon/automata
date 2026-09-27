@@ -338,19 +338,6 @@ func (c *Container) SetProfile(profile string) {
 	}
 }
 
-// PlanWidth returns the fixed knowledge panel width in characters.
-func (c *Container) PlanWidth() int {
-	if c.planWidth <= 0 {
-		return 40
-	}
-	return c.planWidth
-}
-
-// SetPlanWidth sets the fixed knowledge panel width.
-func (c *Container) SetPlanWidth(w int) {
-	c.planWidth = w
-}
-
 // View renders the container content by delegating to the innerTab.
 // Does NOT call Update on innerTab — that happens in the normal Update path
 // so commands (like Listen for PTY output) are not lost.

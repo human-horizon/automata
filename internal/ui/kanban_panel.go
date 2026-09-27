@@ -435,11 +435,6 @@ func (k *KanbanPanel) isCurrentWatcher(generation uint64, watcher *fsnotify.Watc
 	return k.active && watcher != nil && watcher == k.watcher && generation == k.generation
 }
 
-// drainWatcher is no longer used — the blocking watchKanbanCmd handles all
-// change detection. Kept as a stub so external callers that referenced it
-// still compile.
-func (k *KanbanPanel) drainWatcher() {}
-
 func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	// If picker is open, handle picker clicks
 	if k.pendingTask != nil {
@@ -449,8 +444,8 @@ func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 				// Check if click is on a chat item
 				idx := k.pickerHitTest(msg.Y)
 				if idx >= 0 && idx < len(k.chats) {
-					// Assign task to selected chat — сразу в PROGRESS, or queue it
-					// when that chat already has a task in progress.
+					// Assign immediately when the chat is free; otherwise queue the
+					// task behind its existing in-progress work.
 					chat := k.chats[idx]
 					hasProgress := false
 					for _, t := range k.tasks {
@@ -605,8 +600,10 @@ func (k *KanbanPanel) pickerHitTest(y int) int {
 
 // View implements warp.Panel. Layout:
 //
-//	y=0             : button row (1 line, with horizontal padding)
-//	y=1..height-1   : column area (no borders between columns or above them)
+//	y=0   : blank top padding
+//	y=1   : button row
+//	y=2   : blank board padding
+//	y=3+  : column area
 //
 // We render the columns manually instead of using warp.FlexColumn / FlexRow
 // because those layouts always draw horizontal ─ borders between rows and

@@ -110,15 +110,15 @@ func TestPlanFractionIsBoundedForTinyWidths(t *testing.T) {
 func TestContainerViewRecomputesInnerSplitWhenViewportChanges(t *testing.T) {
 	container := NewContainer(voidPanel{})
 	defer container.Close()
-	container.SetPlanWidth(40)
+	container.planWidth = 40
 
 	container.View(130, 24)
 	before := container.findBorderX()
 	container.View(159, 24)
 	after := container.findBorderX()
-	want := 159 - 1 - container.PlanWidth()
+	want := 159 - 1 - container.planWidth
 	if after < want-1 || after > want || after <= before {
-		t.Fatalf("inner split border after viewport growth = %d, before = %d, want %d±1 with fixed plan width %d", after, before, want, container.PlanWidth())
+		t.Fatalf("inner split border after viewport growth = %d, before = %d, want %d±1 with fixed plan width %d", after, before, want, container.planWidth)
 	}
 }
 

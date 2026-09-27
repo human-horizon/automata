@@ -120,11 +120,6 @@ func (c *ContextPanel) SetDomain(domain string) {
 	c.kanbanPanel.SetDomain(domain)
 }
 
-// Refresh re-reads the current domain notes from disk on demand.
-func (c *ContextPanel) Refresh() {
-	c.refresh()
-}
-
 func (c *ContextPanel) refresh() {
 	if c.domain == "" {
 		c.data = nil
