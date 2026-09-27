@@ -578,4 +578,3 @@ func TestKnowledgePanelUpdateWindowSize(t *testing.T) {
 		t.Fatalf("size not updated: w=%d h=%d", k.width, k.height)
 	}
 }
-

@@ -196,4 +196,3 @@ func TestContainerReleaseInvalidatesPendingDragResize(t *testing.T) {
 		t.Fatalf("stale timer changed terminal width to %d, want final %d", chat.width, finalWidth)
 	}
 }
-
