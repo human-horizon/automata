@@ -125,7 +125,6 @@ func (t *Tree) LoadState() error {
 	}
 
 	root := fromStateItems(state.Items)
-	t.SetProfile(t.Profile)
 	validSessions := make(map[string]struct{})
 	var collectSessions func([]*Item)
 	collectSessions = func(items []*Item) {
