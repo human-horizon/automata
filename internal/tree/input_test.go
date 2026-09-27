@@ -206,17 +206,17 @@ func TestFindBracketPair(t *testing.T) {
 	}
 }
 
-func TestModalDragInput(t *testing.T) {
+func TestModalInputEscape(t *testing.T) {
 	tr := New()
 	tr.width = 80
 	tr.height = 24
-	tr.startInput("Folder name", func(string) {})
+	tr.startCheckedInput("Folder name", func(string) error { return nil })
 
 	// Mouse handling for modals is now in warp.
 	// Tree handles keyboard input only.
 	// Test that Esc closes the modal.
 	if !tr.inputMode {
-		t.Fatal("input mode should be active after startInput")
+		t.Fatal("input mode should be active after opening input")
 	}
 
 	tr.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
@@ -225,20 +225,12 @@ func TestModalDragInput(t *testing.T) {
 	}
 }
 
-// TestModalDragInputDoesNotStartOnInputLine verifies that clicking on the input
-// text (box[3] = startY+3) does NOT start drag.
-// Mouse handling for modals is now in warp — this test is no longer relevant.
-func TestModalDragInputDoesNotStartOnInputLine(t *testing.T) {
-	// Mouse handling for modals is now in warp. Tree handles keyboard only.
-	// This test is kept as a no-op to avoid breaking test references.
-}
-
 func TestModalInputButtons(t *testing.T) {
 	tr := New()
 	tr.width = 80
 	tr.height = 24
 	var called string
-	tr.startInput("Folder name", func(name string) { called = name })
+	tr.startCheckedInput("Folder name", func(name string) error { called = name; return nil })
 	tr.inputValue = "Work"
 
 	// Mouse handling for modals is now in warp.
@@ -253,7 +245,7 @@ func TestModalInputButtons(t *testing.T) {
 
 	// Test keyboard Esc to cancel.
 	called = ""
-	tr.startInput("Folder name", func(name string) { called = name })
+	tr.startCheckedInput("Folder name", func(name string) error { called = name; return nil })
 	tr.inputValue = "Test"
 	tr.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
 	if called != "" {
@@ -264,16 +256,16 @@ func TestModalInputButtons(t *testing.T) {
 	}
 }
 
-func TestModalDragInputNarrowPanel(t *testing.T) {
+func TestModalInputNarrowPanel(t *testing.T) {
 	tr := New()
 	tr.width = 23
 	tr.height = 24
-	tr.startInput("Folder name", func(string) {})
+	tr.startCheckedInput("Folder name", func(string) error { return nil })
 
 	// Mouse handling for modals is now in warp.
 	// Test that keyboard still works in narrow panel.
 	if !tr.inputMode {
-		t.Fatal("input mode should be active after startInput")
+		t.Fatal("input mode should be active after opening input")
 	}
 
 	tr.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
@@ -342,12 +334,12 @@ func TestModalCloseButton(t *testing.T) {
 	tr := New()
 	tr.width = 80
 	tr.height = 24
-	tr.startInput("Folder name", func(string) {})
+	tr.startCheckedInput("Folder name", func(string) error { return nil })
 
 	// Mouse handling for modals is now in warp.
 	// Test keyboard Esc to close.
 	if !tr.inputMode {
-		t.Fatal("input mode should be active after startInput")
+		t.Fatal("input mode should be active after opening input")
 	}
 
 	// Esc should close the modal.
@@ -357,7 +349,7 @@ func TestModalCloseButton(t *testing.T) {
 	}
 
 	// Re-open and test Enter to confirm.
-	tr.startInput("Folder name", func(string) {})
+	tr.startCheckedInput("Folder name", func(string) error { return nil })
 	tr.inputValue = "Test"
 	tr.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
 	if tr.inputMode {
@@ -369,7 +361,7 @@ func TestModalInputCursorAndSpaces(t *testing.T) {
 	tr := New()
 	tr.width = 80
 	tr.height = 24
-	tr.startInput("Terminal name", func(string) {})
+	tr.startCheckedInput("Terminal name", func(string) error { return nil })
 
 	// Type "ab cd" with cursor movement.
 	tr.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})

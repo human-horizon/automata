@@ -140,8 +140,8 @@ type Tree struct {
 	actionIcon string
 
 	// Last processed motion timestamp. Used to throttle the all-motion
-	// event flood (~one event per cursor pixel) down to ~30 FPS so the
-	// update loop stays light even while the user is hovering.
+	// event flood (~one event per cursor pixel) to the bounded cadence
+	// configured by motionThrottle.
 	lastMotionAt time.Time
 
 	// Drag & drop
@@ -201,7 +201,6 @@ type Tree struct {
 	// the bare session ID (no profile prefix) of the item before and after the
 	// move. They are equal when the move did not change the session identity
 	// (e.g. re-ordering siblings within the same parent).
-	profile     string
 	onItemMoved func(item *Item, oldSessionID, newSessionID string)
 
 	// onBeforeRename runs before the tree item is changed and returns an
@@ -2040,13 +2039,6 @@ func (t *Tree) SetOnRenameCommitted(fn func(*Item, string, string)) {
 // the normal atomic state writer.
 func (t *Tree) SetSaveStateFunc(fn func() error) {
 	t.saveStateOverride = fn
-}
-
-// SetProfile attaches a profile slug used to compute stable session IDs in
-// the on-item-moved callback. Not required for moves that stay within the
-// same parent.
-func (t *Tree) SetProfile(profile string) {
-	t.profile = profile
 }
 
 // sessionIDOf returns the bare session ID for an item (no profile prefix).

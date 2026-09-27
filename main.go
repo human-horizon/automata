@@ -212,7 +212,6 @@ func newApp(profile, piAgentDir string) (a *App) {
 	// Profile + cross-parent move handling reuses the complete rename
 	// migration. External data is moved before the tree mutates; the returned
 	// rollback is used if the atomic tree snapshot cannot be committed.
-	t.SetProfile(profile)
 	t.SetOnBeforeItemMoved(func(item, newParent *tree.Item) (func() error, error) {
 		plan, err := buildMovePlan(item, newParent, a.profile)
 		if err != nil {
