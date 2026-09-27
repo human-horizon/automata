@@ -30,6 +30,30 @@ func projectRoot() string {
 	return root
 }
 
+func buildAutomataBinary(root string) (string, func(), error) {
+	if binary := os.Getenv("AUTOMATA_BIN"); binary != "" {
+		return binary, func() {}, nil
+	}
+	dir, err := os.MkdirTemp("", "automata-manual-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() {
+		if err := os.RemoveAll(dir); err != nil {
+			fmt.Fprintf(os.Stderr, "remove manual build dir: %v\n", err)
+		}
+	}
+	binary := filepath.Join(dir, "automata")
+	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false", "-o", binary, ".")
+	cmd.Dir = root
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("build Automata: %w\n%s", err, output)
+	}
+	return binary, cleanup, nil
+}
+
 func main() {
 	root := projectRoot()
 	binary, cleanupBinary, err := buildAutomataBinary(root)
