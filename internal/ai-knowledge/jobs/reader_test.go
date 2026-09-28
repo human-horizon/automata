@@ -188,7 +188,7 @@ func TestListKeepsLiveJobWithoutStartedAt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	listed, err := List(sessionID)
+	listed, err := ListForProfile("test", sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestListDoesNotMutateDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	listed, err := List(sessionID)
+	listed, err := ListForProfile("test", sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
