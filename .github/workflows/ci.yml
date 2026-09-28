@@ -46,6 +46,9 @@ jobs:
           version: v2.14.0
           args: --timeout=5m ./...
 
+      - name: Check known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
       - name: Build test binary
         shell: bash
         run: go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/automata-test" .
