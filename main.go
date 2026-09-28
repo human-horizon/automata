@@ -441,14 +441,7 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// Use fixed tree width to compute split fraction.
-		treeW := a.tree.TreeWidth()
-		if treeW > 0 && msg.Width > 0 {
-			frac := float64(treeW) / float64(msg.Width)
-			a.sm.tab.SetSplitFraction(a.tree, frac)
-		}
-		_, cmd := a.warp.Update(msg)
-		return a, cmd
+		return a, a.handleWindowSizeMsg(msg)
 
 	case tea.KeyMsg:
 		return a, a.handleKeyMsg(msg)
@@ -457,122 +450,28 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 		return a, a.handleMouseMsg(msg)
 
 	case clearSessionErrorMsg:
-		if msg.err != nil {
-			log.Printf("clearSession %q: %v", msg.sessionID, msg.err)
-			if msg.panel != nil {
-				msg.panel.SetActionWarning(msg.err.Error())
-			}
-		}
-		return a, nil
+		return a, a.handleClearSessionErrorMsg(msg)
 
 	case treeMetadataSaveMsg:
-		if msg.generation != a.metadataSaveGeneration || !a.metadataSavePending {
-			return a, nil
-		}
-		a.metadataSavePending = false
-		if !a.metadataSaveDirty {
-			return a, nil
-		}
-		_ = a.flushPendingTreeMetadata()
-		return a, nil
+		return a, a.handleTreeMetadataSaveMsg(msg)
 
 	case statusWatcherClosedMsg:
-		if a.isCurrentStatusWatcher(msg.generation, msg.watcher) {
-			return a, a.recoverStatusWatcher()
-		}
-		return a, nil
+		return a, a.handleStatusWatcherClosedMsg(msg)
 
 	case statusWatcherErrorMsg:
-		if !a.isCurrentStatusWatcher(msg.generation, msg.watcher) {
-			return a, nil
-		}
-		if msg.err != nil {
-			log.Printf("automata: status watcher failed: %v", msg.err)
-		}
-		return a, a.recoverStatusWatcher()
+		return a, a.handleStatusWatcherErrorMsg(msg)
 
 	case treeStatusChangedMsg:
-		if !a.isCurrentStatusWatcher(msg.generation, msg.watcher) {
-			return a, nil
-		}
-		a.statusWatchPending = false
-		changedPath := filepath.Clean(msg.path)
-		if sessionID, ok := a.statusSessionDirs[filepath.Dir(changedPath)]; ok {
-			name := filepath.Base(changedPath)
-			if name == "status.json" {
-				a.statusReader.Invalidate(sessionID)
-				a.refreshStatusBadge(sessionID)
-			}
-		}
-		return a, a.watchTreeStatusCmd()
+		return a, a.handleTreeStatusChangedMsg(msg)
 
 	case tree.TreeCollapsedMsg:
-		// Sync the warp node's collapse state when the tree panel
-		// is expanded by clicking on the collapsed panel.
-		a.sm.tab.ToggleSplitCollapse(a.tree)
-		// Broadcast resize so leaf panels (chat + knowledge) get their
-		// new allocated widths. Without this the chat terminal keeps the
-		// pre-collapse width when the tree is re-expanded.
-		var cmds []tea.Cmd
-		cmds = append(cmds, func() tea.Msg { return a.sm.tab.BroadcastResize() })
-		// Forward to warp so it re-renders with updated collapse state
-		// and broadcasts to all panels.
-		_, warpCmd := a.warp.Update(msg)
-		if warpCmd != nil {
-			cmds = append(cmds, warpCmd)
-		}
-		return a, tea.Batch(cmds...)
+		return a, a.handleTreeCollapsedMsg(msg)
 
 	case tree.ItemSelectedMsg:
-		if a.container != nil {
-			var cmds []tea.Cmd
-			active := a.container.Active()
-			if tp, ok := active.(*ui.TermPanel); ok && tp != nil {
-				cmd := tp.Start()
-				if cmd != nil {
-					cmds = append(cmds, cmd)
-				}
-				a.sm.tab.SetFocus(tp)
-			} else if cp, ok := active.(*ui.ChatPanel); ok && cp != nil {
-				// ChatPanel handles its own emulator lifecycle.
-				if em := cp.ActiveEmulator(); em != nil {
-					cmd := em.Start()
-					if cmd != nil {
-						cmds = append(cmds, cmd)
-					}
-				}
-				a.container.SetFocus(cp)
-				a.sm.tab.SetFocus(a.container)
-			}
-			w, h := a.warp.Width(), a.warp.Height()
-			if w > 0 && h > 0 {
-				_, warpCmd := a.warp.Update(warp.ResizeMsg{Width: w, Height: h})
-				if warpCmd != nil {
-					cmds = append(cmds, warpCmd)
-				}
-			}
-			if cmd := a.container.Activate(); cmd != nil {
-				cmds = append(cmds, cmd)
-			}
-			return a, tea.Batch(cmds...)
-		}
-		_, cmd := a.warp.Update(msg)
-		return a, cmd
+		return a, a.handleItemSelectedMsg(msg)
 
 	case tree.FolderSelectedMsg:
-		if a.container != nil {
-			a.container.SetFolder(msg.Item)
-			cmds := []tea.Cmd{a.container.Activate()}
-			w, h := a.warp.Width(), a.warp.Height()
-			if w > 0 && h > 0 {
-				_, warpCmd := a.warp.Update(warp.ResizeMsg{Width: w, Height: h})
-				if warpCmd != nil {
-					cmds = append(cmds, warpCmd)
-				}
-			}
-			return a, tea.Batch(cmds...)
-		}
-		return a, nil
+		return a, a.handleFolderSelectedMsg(msg)
 
 	default:
 		_, cmd := a.warp.Update(msg)
