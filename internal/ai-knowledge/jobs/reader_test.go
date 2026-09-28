@@ -998,3 +998,253 @@ func TestKillSessionPreflightRejectsMalformedMetadataBeforeSignalOrMutation(t *t
 				record := JobRecord{ID: "job_invalid", Command: "sleep", PID: os.Getpid(), Status: "running", StartedAt: startedAt}
 				if test.mutate != nil {
 					test.mutate(&record)
+				}
+				invalidData, err = json.Marshal(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if invalidData != nil {
+				if err := os.WriteFile(filepath.Join(invalidDir, "job.json"), invalidData, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			previousSignal := processSignal
+			previousPS := psRunnerOverride
+			previousProbe := processProbeFn
+			t.Cleanup(func() {
+				processSignal = previousSignal
+				psRunnerOverride = previousPS
+				processProbeFn = previousProbe
+			})
+			signals := 0
+			processSignal = func(int, syscall.Signal) error {
+				signals++
+				return nil
+			}
+			psRunnerOverride = matchingPSRunner()
+			processProbeFn = func(int) bool { return false }
+
+			if err := KillSessionForProfile("test", sessionID); err == nil {
+				t.Fatal("malformed job metadata unexpectedly allowed kill")
+			}
+			if signals != 0 {
+				t.Fatalf("processSignal called %d times, want 0", signals)
+			}
+			var got JobRecord
+			if err := readJSON(validMeta, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != "running" {
+				t.Fatalf("valid job status changed before complete preflight: %q", got.Status)
+			}
+			if _, err := os.Stat(invalidDir); err != nil {
+				t.Fatalf("malformed job directory was mutated: %v", err)
+			}
+			if invalidData != nil {
+				gotData, err := os.ReadFile(filepath.Join(invalidDir, "job.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(gotData) != string(invalidData) {
+					t.Fatalf("malformed metadata changed: want %q got %q", invalidData, gotData)
+				}
+			}
+		})
+	}
+}
+
+func TestKillSessionSkipsStructurallyValidNonRunningJob(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "test__terminal-job"
+	jobDir := filepath.Join(sessionDirForProfile("test", sessionID), "jobs", "job_exited")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	data, err := json.Marshal(JobRecord{ID: "job_exited", Command: "sleep", PID: os.Getpid(), Status: "exited", StartedAt: startedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(jobDir, "job.json")
+	if err := os.WriteFile(metaPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+	})
+	signals := 0
+	processSignal = func(int, syscall.Signal) error {
+		signals++
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+
+	if err := KillSessionForProfile("test", sessionID); err != nil {
+		t.Fatalf("KillSessionForProfile: %v", err)
+	}
+	if signals != 0 {
+		t.Fatalf("processSignal called %d times for a non-running job", signals)
+	}
+	got, err := os.ReadFile(metaPath)
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("valid non-running record changed: data=%q err=%v", got, err)
+	}
+}
+
+func TestJobSessionAPIsRejectUnsafeIDs(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	for _, test := range []struct {
+		name      string
+		sessionID string
+	}{
+		{name: "empty", sessionID: ""},
+		{name: "traversal", sessionID: "../outside"},
+		{name: "separator", sessionID: `test\\outside`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sessionID := test.sessionID
+			if _, err := ListForProfile("test", sessionID); err == nil {
+				t.Fatal("ListForProfile accepted unsafe session ID")
+			}
+			if _, err := RunningCountForProfile("test", sessionID); err == nil {
+				t.Fatal("RunningCountForProfile accepted unsafe session ID")
+			}
+			if err := PruneStaleSessionForProfile("test", sessionID); err == nil {
+				t.Fatal("PruneStaleSessionForProfile accepted unsafe session ID")
+			}
+			if _, err := PrepareKillSessionForProfile("test", sessionID); err == nil {
+				t.Fatal("PrepareKillSessionForProfile accepted unsafe session ID")
+			}
+		})
+	}
+}
+
+func writeProfileStaleJob(t *testing.T, profile, sessionID string) string {
+	t.Helper()
+	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", "job_stale")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(`{"id":"job_stale","pid":2147483647,"status":"running"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return jobDir
+}
+
+func TestCleanupStaleUsesExplicitProfileScope(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "wrong-profile")
+	profileA := "Profile A"
+	profileB := "Profile B"
+	jobA := writeProfileStaleJob(t, profileA, "chat-a")
+	jobB := writeProfileStaleJob(t, profileB, "chat-b")
+
+	readStatus := func(jobDir string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(jobDir, "job.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record JobRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			t.Fatal(err)
+		}
+		return record.Status
+	}
+
+	if err := CleanupStaleForProfile(profileA); err != nil {
+		t.Fatal(err)
+	}
+	if got := readStatus(jobA); got != "exited" {
+		t.Fatalf("profile A stale status = %q, want exited", got)
+	}
+	if got := readStatus(jobB); got != "running" {
+		t.Fatalf("explicit profile cleanup changed profile B status to %q", got)
+	}
+
+	if err := CleanupStale(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readStatus(jobB); got != "exited" {
+		t.Fatalf("all-profile cleanup status = %q, want exited", got)
+	}
+}
+
+func TestCachedReaderInvalidateRemovesOneSession(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	calls := 0
+	reader := newCachedReader(func(string) ([]Job, error) {
+		calls++
+		return []Job{{ID: "job"}}, nil
+	})
+	const profile = "invalidate-profile"
+	const sessionID = "invalidate-profile__chat"
+	for range 2 {
+		if _, err := reader.ListForProfile(profile, sessionID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("list calls before invalidation = %d, want 1", calls)
+	}
+	reader.Invalidate(profile, sessionID)
+	if _, err := reader.ListForProfile(profile, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("list calls after invalidation = %d, want 2", calls)
+	}
+}
+
+func TestCachedReaderBoundsEntriesAndSkipsOversizedMetadata(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	reader := NewCachedReader()
+	for index := range 500 {
+		sessionID := fmt.Sprintf("bounded-jobs__chat-%d", index)
+		if _, err := reader.ListForProfile("bounded-jobs", sessionID); err != nil {
+			t.Fatalf("list session %d: %v", index, err)
+		}
+	}
+	if got := reader.cache.Len(); got > cache.ReaderCacheCapacity {
+		t.Fatalf("cache entries = %d, exceeds capacity %d", got, cache.ReaderCacheCapacity)
+	}
+
+	const profile = "oversized-jobs"
+	const sessionID = "oversized-jobs__session"
+	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", "large-job")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"id":"large-job","status":"exited","payload":"` + strings.Repeat("x", int(cache.MaxSourceMetadataBytes)+1) + `"}`
+	if err := os.WriteFile(filepath.Join(jobDir, "job.json"), []byte(payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ListForProfile(profile, sessionID); err != nil {
+		t.Fatalf("list oversized source: %v", err)
+	}
+	if _, cached := reader.cache.Get(profile + "\x00" + sessionID); cached {
+		t.Fatal("oversized job metadata was cached")
+	}
+}
+
+// matchingPSRunner returns the current process start time in the format
+// emitted by macOS ps.
+func matchingPSRunner() psRunner {
+	return func(int) (string, error) {
+		return time.Now().Local().Format("Mon Jan 2 15:04:05 2006"), nil
+	}
+}
+
+// errFakePS is returned by the stubbed ps runner in tests to simulate a
+// missing or broken `ps` binary.
+var errFakePS = errString("ps unavailable")
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
