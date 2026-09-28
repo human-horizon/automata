@@ -406,16 +406,28 @@ const (
 	processExitProbeInterval = 20 * time.Millisecond
 )
 
-func waitForProcessExit(pid int) bool {
-	for attempt := 0; attempt < processExitProbeAttempts; attempt++ {
-		if !processProbeFn(pid) {
-			return true
+type signaledKillCandidate struct {
+	record   JobRecord
+	metaPath string
+}
+
+func waitForSignaledProcesses(candidates []signaledKillCandidate) (exited, running []signaledKillCandidate) {
+	running = append([]signaledKillCandidate(nil), candidates...)
+	for attempt := 0; attempt < processExitProbeAttempts && len(running) > 0; attempt++ {
+		next := make([]signaledKillCandidate, 0, len(running))
+		for _, candidate := range running {
+			if !processProbeFn(candidate.record.PID) {
+				exited = append(exited, candidate)
+				continue
+			}
+			next = append(next, candidate)
 		}
-		if attempt+1 < processExitProbeAttempts {
+		running = next
+		if len(running) > 0 && attempt+1 < processExitProbeAttempts {
 			time.Sleep(processExitProbeInterval)
 		}
 	}
-	return false
+	return exited, running
 }
 
 func materializeStaleJob(_ string, metaPath string, rec *JobRecord) error {
@@ -535,6 +547,7 @@ func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
 	}
 	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
 	var failures []error
+	signaled := make([]signaledKillCandidate, 0, len(p.candidates))
 	for _, candidate := range p.candidates {
 		rec := candidate.record
 		jobDir := filepath.Join(jobsDir, candidate.jobDirName)
@@ -566,16 +579,21 @@ func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
 			failures = append(failures, fmt.Errorf("signal job %s: %w", rec.ID, err))
 			continue
 		}
-		if !waitForProcessExit(rec.PID) {
-			failures = append(failures, fmt.Errorf("job %s is still running after SIGTERM", rec.ID))
-			continue
-		}
+		signaled = append(signaled, signaledKillCandidate{record: rec, metaPath: metaPath})
+	}
 
+	exited, running := waitForSignaledProcesses(signaled)
+	stoppedAt := time.Now().UTC().Format(time.RFC3339)
+	for _, candidate := range exited {
+		rec := candidate.record
 		rec.Status = "exited"
-		rec.StoppedAt = time.Now().UTC().Format(time.RFC3339)
-		if err := writeJSON(metaPath, &rec); err != nil {
+		rec.StoppedAt = stoppedAt
+		if err := writeJSON(candidate.metaPath, &rec); err != nil {
 			failures = append(failures, fmt.Errorf("write stopped job %s: %w", rec.ID, err))
 		}
+	}
+	for _, candidate := range running {
+		failures = append(failures, fmt.Errorf("job %s is still running after SIGTERM", candidate.record.ID))
 	}
 	return errors.Join(failures...)
 }
