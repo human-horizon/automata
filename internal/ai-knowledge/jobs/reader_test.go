@@ -155,24 +155,6 @@ func TestRunningCountForEmptyExplicitProfileUsesDefault(t *testing.T) {
 	}
 }
 
-func writeScopedJobRecord(t *testing.T, profile, sessionID, jobID string, pid int, startedAt string) (string, string) {
-	t.Helper()
-	jobDir := filepath.Join(paths.SessionDir(profile, sessionID), "jobs", jobID)
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	metaPath := filepath.Join(jobDir, "job.json")
-	record := `{"id":"` + jobID + `","pid":` + strconv.Itoa(pid) + `,"status":"running"`
-	if startedAt != "" {
-		record += `,"startedAt":"` + startedAt + `"`
-	}
-	record += "}"
-	if err := os.WriteFile(metaPath, []byte(record), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return jobDir, metaPath
-}
-
 func TestListKeepsLiveJobWithoutStartedAt(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("AI_DATA_HOME", dataHome)
