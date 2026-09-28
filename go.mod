@@ -12,7 +12,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/muesli/termenv v0.16.0
 	github.com/starframe-dev/cue-tty v0.0.0-20260916174230-275667058500
-	github.com/starframe-dev/warp v0.0.0-20260917181841-4857cf8c3dda
+	github.com/starframe-dev/warp v0.1.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
