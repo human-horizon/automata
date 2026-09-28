@@ -26,100 +26,16 @@ func (t *Tree) IsModalOpen() bool {
 }
 
 func (t *Tree) handleKey(msg tea.KeyMsg) tea.Cmd {
-	// Modal mode takes priority.
 	if t.modalActive {
-		switch msg.Type {
-		case tea.KeyEnter:
-			if t.helpMode {
-				t.closeModal()
-			} else if t.confirmMode {
-				if t.confirmYes != nil {
-					t.confirmYes()
-				}
-				t.closeModal()
-			} else if t.inputMode {
-				t.confirmInput()
-			}
-			return nil
-		case tea.KeyF1:
-			if t.helpMode {
-				t.closeModal()
-			}
-			return nil
-		case tea.KeyEsc:
-			t.closeModal()
-			return nil
-		case tea.KeyBackspace:
-			if t.inputMode {
-				t.deleteInputBefore()
-				t.updateInputModal()
-			}
-			return nil
-		case tea.KeyDelete:
-			if t.inputMode {
-				t.deleteInputAfter()
-				t.updateInputModal()
-			}
-			return nil
-		case tea.KeyLeft:
-			if t.inputMode {
-				t.inputCursor--
-				t.inputCursorClamp()
-				t.updateInputModal()
-			}
-			return nil
-		case tea.KeyRight:
-			if t.inputMode {
-				t.inputCursor++
-				t.inputCursorClamp()
-				t.updateInputModal()
-			}
-			return nil
-		case tea.KeyHome:
-			if t.inputMode {
-				t.inputCursor = 0
-				t.updateInputModal()
-			}
-			return nil
-		case tea.KeyEnd:
-			if t.inputMode {
-				t.inputCursor = len(t.inputRunes())
-				t.updateInputModal()
-			}
-			return nil
-		case tea.KeySpace:
-			if t.inputMode {
-				t.insertInput([]rune{' '})
-				t.updateInputModal()
-			}
-			return nil
-		case tea.KeyRunes:
-			if t.inputMode {
-				t.insertInput(msg.Runes)
-				t.updateInputModal()
-			} else if t.confirmMode {
-				if len(msg.Runes) == 1 {
-					switch msg.Runes[0] {
-					case 'y', 'Y':
-						if t.confirmYes != nil {
-							t.confirmYes()
-						}
-						t.closeModal()
-					case 'n', 'N':
-						t.closeModal()
-					}
-				}
-			}
-			return nil
-		}
-		return nil
+		return t.handleModalKey(msg)
 	}
-
-	// Popover (context menu) keyboard handling.
 	if t.popover != nil {
 		if t.popover.HandleKey(msg) {
 			t.popover = nil
 		}
+		return nil
+	}
+	if t.handleNavigationKey(msg.Type) {
 		return nil
 	}
 
@@ -136,6 +52,93 @@ func (t *Tree) handleKey(msg tea.KeyMsg) tea.Cmd {
 		} else {
 			t.showRootMenu(0, 1)
 		}
+	case tea.KeyEnter:
+		return t.selectCurrentItem()
+	case tea.KeyEsc:
+		t.resetHover()
+		t.selected = -1
+	}
+	return nil
+}
+
+func (t *Tree) handleModalKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEnter:
+		switch {
+		case t.helpMode:
+			t.closeModal()
+		case t.confirmMode:
+			if t.confirmYes != nil {
+				t.confirmYes()
+			}
+			t.closeModal()
+		case t.inputMode:
+			t.confirmInput()
+		}
+		return nil
+	case tea.KeyF1:
+		if t.helpMode {
+			t.closeModal()
+		}
+		return nil
+	case tea.KeyEsc:
+		t.closeModal()
+		return nil
+	}
+
+	if t.inputMode {
+		t.handleInputModalKey(msg)
+		return nil
+	}
+	if t.confirmMode {
+		t.handleConfirmModalKey(msg)
+	}
+	return nil
+}
+
+func (t *Tree) handleInputModalKey(msg tea.KeyMsg) {
+	switch msg.Type {
+	case tea.KeyBackspace:
+		t.deleteInputBefore()
+	case tea.KeyDelete:
+		t.deleteInputAfter()
+	case tea.KeyLeft:
+		t.inputCursor--
+		t.inputCursorClamp()
+	case tea.KeyRight:
+		t.inputCursor++
+		t.inputCursorClamp()
+	case tea.KeyHome:
+		t.inputCursor = 0
+	case tea.KeyEnd:
+		t.inputCursor = len(t.inputRunes())
+	case tea.KeySpace:
+		t.insertInput([]rune{' '})
+	case tea.KeyRunes:
+		t.insertInput(msg.Runes)
+	default:
+		return
+	}
+	t.updateInputModal()
+}
+
+func (t *Tree) handleConfirmModalKey(msg tea.KeyMsg) {
+	if msg.Type != tea.KeyRunes || len(msg.Runes) != 1 {
+		return
+	}
+	switch msg.Runes[0] {
+	case 'y', 'Y':
+		if t.confirmYes != nil {
+			t.confirmYes()
+		}
+		t.closeModal()
+	case 'n', 'N':
+		t.closeModal()
+	}
+}
+
+func (t *Tree) handleNavigationKey(key tea.KeyType) bool {
+	switch key {
 	case tea.KeyUp:
 		t.SelectPrev()
 	case tea.KeyDown:
@@ -152,31 +155,33 @@ func (t *Tree) handleKey(msg tea.KeyMsg) tea.Cmd {
 		t.NavigateLeft()
 	case tea.KeyRight:
 		t.NavigateRight()
-	case tea.KeyEnter:
-		if t.selected >= 0 && t.selected < len(t.flat) {
-			sel := t.flat[t.selected]
-			if sel.IsFolder {
-				t.ToggleFolder(sel)
-				if t.onSelectFolder != nil {
-					t.onSelectFolder(sel)
-				}
-				return func() tea.Msg {
-					return FolderSelectedMsg{Item: sel}
-				}
-			}
-			if t.onSelectChat != nil {
-				t.onSelectChat(sel)
-				return func() tea.Msg {
-					return ItemSelectedMsg{Item: sel}
-				}
-			}
-		}
-	case tea.KeyEsc:
-		t.resetHover()
-		t.selected = -1
+	default:
+		return false
 	}
+	return true
+}
 
-	return nil
+func (t *Tree) selectCurrentItem() tea.Cmd {
+	if t.selected < 0 || t.selected >= len(t.flat) {
+		return nil
+	}
+	sel := t.flat[t.selected]
+	if sel.IsFolder {
+		t.ToggleFolder(sel)
+		if t.onSelectFolder != nil {
+			t.onSelectFolder(sel)
+		}
+		return func() tea.Msg {
+			return FolderSelectedMsg{Item: sel}
+		}
+	}
+	if t.onSelectChat == nil {
+		return nil
+	}
+	t.onSelectChat(sel)
+	return func() tea.Msg {
+		return ItemSelectedMsg{Item: sel}
+	}
 }
 
 func (t *Tree) handleMouse(msg tea.MouseMsg) tea.Cmd {
