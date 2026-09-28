@@ -96,13 +96,13 @@ type TreeCollapsedMsg struct {
 
 // Tree is the tree widget. It implements warp.Panel.
 type Tree struct {
-	root     []*Item
-	selected int // Index in the visible flat list
-	scroll   int // Scroll offset
+	root       []*Item
+	selected   int // Index in the visible flat list
+	scroll     int // Scroll offset
 	flat       []*Item
 	branchInfo []branchInfo
 	height     int // Last known view height
-	width    int // Last known view width
+	width      int // Last known view width
 
 	// Context menu (popover)
 	popover *warp.Popover
