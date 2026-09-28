@@ -491,25 +491,17 @@ func (t *Tree) actionAt(x, y int) (action string) {
 		return ""
 	}
 
-	// Compute branch info and max label width for the render call.
-	bi := computeBranchInfo(t.flat)
-	maxW := 0
-	for i, f := range t.flat {
-		p := branchPrefix(f, bi[i])
-		e := expandMarker(f)
-		lw := lipgloss.Width(p + e + " " + f.Name)
-		if lw > maxW {
-			maxW = lw
-		}
+	bi := t.branchInfo
+	if len(bi) != len(t.flat) {
+		bi = computeBranchInfo(t.flat)
+		t.branchInfo = bi
+	}
+	itemBi := branchInfo{}
+	if idx < len(bi) {
+		itemBi = bi[idx]
 	}
 
-	// Use the branch info for the specific item.
-	itemBi := bi[idx]
-	if idx >= len(bi) {
-		itemBi = branchInfo{}
-	}
-
-	rendered := stripANSI(t.renderItemLine(item, t.width, isSelected, isHover, itemBi, maxW))
+	rendered := stripANSI(t.renderItemLine(item, t.width, isSelected, isHover, itemBi, 0))
 	if x < 0 || x >= lipgloss.Width(rendered) {
 		return ""
 	}
