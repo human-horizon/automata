@@ -82,8 +82,11 @@ func (t *Tree) View(width, height int) string {
 		needsScrollbar := len(t.flat) > contentHeight
 		thumbSize, thumbPos := computeThumb(t.scroll, contentHeight, len(t.flat))
 
-		// Precompute branch info for all visible items.
-		branchInfo := computeBranchInfo(t.flat)
+		branchInfo := t.branchInfo
+		if len(branchInfo) != len(t.flat) {
+			branchInfo = computeBranchInfo(t.flat)
+			t.branchInfo = branchInfo
+		}
 
 		for i := start; i < end; i++ {
 			// Render archive separator line before the item it belongs to.
