@@ -185,79 +185,87 @@ func (t *Tree) selectCurrentItem() tea.Cmd {
 }
 
 func (t *Tree) handleMouse(msg tea.MouseMsg) tea.Cmd {
-	// Modal takes priority.
 	if t.modalActive {
 		if t.modal != nil {
 			t.modal.EnsureDimensions(t.width, t.height)
-			if t.modal.HandleMouse(msg) {
-				return nil
-			}
+			t.modal.HandleMouse(msg)
 		}
 		return nil
 	}
-
 	if t.inputMode || t.confirmMode {
 		return nil
 	}
-
 	if t.Collapsed {
-		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			t.Collapsed = false
-			return func() tea.Msg {
-				return TreeCollapsedMsg{Collapsed: false}
-			}
-		}
+		return t.handleCollapsedMouse(msg)
+	}
+
+	// Popover takes priority when it consumes the event. Clicks outside it
+	// intentionally continue to the underlying tree.
+	if t.popover != nil && t.popover.HandleMouse(msg) {
 		return nil
 	}
-
-	// Popover takes priority over the underlying tree and toolbar.
-	if t.popover != nil {
-		if t.popover.HandleMouse(msg) {
-			return nil
-		}
-	}
-
-	// Header is row 0.
 	if msg.Y == 0 {
-		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			return t.handleToolbarClick(msg)
-		}
-		return nil
+		return t.handleHeaderMouse(msg)
 	}
-
-	// Footer buttons.
 	if msg.Y == t.height-treeFooterHeight {
-		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			switch {
-			case msg.X < 6:
-				if t.onOpenHelp != nil {
-					t.onOpenHelp()
-				} else {
-					t.OpenHelp()
-				}
-			case msg.X >= 8 && msg.X < 16:
-				if t.onOpenSettings != nil {
-					t.onOpenSettings()
-				} else {
-					t.showSettingsMenu(int(msg.X), int(msg.Y))
-				}
-			}
-		}
-		return nil
+		return t.handleFooterMouse(msg)
 	}
-
-	// Right-click opens context menu.
 	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonRight {
-		idx := t.flatIndexAt(int(msg.Y))
-		if idx >= 0 && idx < len(t.flat) {
-			t.selected = idx
-			t.showContextMenu(int(msg.X), int(msg.Y))
-		} else {
-			t.showRootMenu(int(msg.X), int(msg.Y))
-		}
+		return t.handleRightPress(msg)
+	}
+	return t.handleTreeMouseAction(msg)
+}
+
+func (t *Tree) handleCollapsedMouse(msg tea.MouseMsg) tea.Cmd {
+	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		return nil
 	}
+	t.Collapsed = false
+	return func() tea.Msg {
+		return TreeCollapsedMsg{Collapsed: false}
+	}
+}
 
+func (t *Tree) handleHeaderMouse(msg tea.MouseMsg) tea.Cmd {
+	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		return t.handleToolbarClick(msg)
+	}
+	return nil
+}
+
+func (t *Tree) handleFooterMouse(msg tea.MouseMsg) tea.Cmd {
+	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return nil
+	}
+	switch {
+	case msg.X < 6:
+		if t.onOpenHelp != nil {
+			t.onOpenHelp()
+		} else {
+			t.OpenHelp()
+		}
+	case msg.X >= 8 && msg.X < 16:
+		if t.onOpenSettings != nil {
+			t.onOpenSettings()
+		} else {
+			t.showSettingsMenu(int(msg.X), int(msg.Y))
+		}
+	}
+	return nil
+}
+
+func (t *Tree) handleRightPress(msg tea.MouseMsg) tea.Cmd {
+	idx := t.flatIndexAt(int(msg.Y))
+	if idx >= 0 && idx < len(t.flat) {
+		t.selected = idx
+		t.showContextMenu(int(msg.X), int(msg.Y))
+	} else {
+		t.showRootMenu(int(msg.X), int(msg.Y))
+	}
+	return nil
+}
+
+func (t *Tree) handleTreeMouseAction(msg tea.MouseMsg) tea.Cmd {
 	switch msg.Action {
 	case tea.MouseActionPress:
 		switch msg.Button {
@@ -266,15 +274,12 @@ func (t *Tree) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		case tea.MouseButtonWheelUp:
 			t.scroll--
 			t.clampScroll(t.contentHeight())
-			return nil
 		case tea.MouseButtonWheelDown:
 			t.scroll++
 			t.clampScroll(t.contentHeight())
-			return nil
 		}
 	case tea.MouseActionMotion:
 		t.handleMouseMotion(msg)
-		return nil
 	case tea.MouseActionRelease:
 		if t.dragMode {
 			return t.handleDragDrop(msg)
@@ -282,7 +287,6 @@ func (t *Tree) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		if t.dragItem != nil {
 			return t.handleLeftRelease(msg)
 		}
-		return nil
 	}
 	return nil
 }
