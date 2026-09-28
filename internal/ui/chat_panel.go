@@ -947,119 +947,131 @@ func (cp *ChatPanel) renderTabBar(width int) string {
 
 // Update handles messages for the ChatPanel.
 func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
-	// Familiar-close confirmation modal swallows keys. While pending,
-	// Y/N/Esc close/cancel the prompt and nothing else is forwarded to the
-	// underlying session. Mouse events are routed to the modal so its
-	// buttons and ✕ work too.
-	if cp.pendingCloseFamiliar != "" {
-		switch msg := msg.(type) {
-		case tea.KeyMsg:
-			switch msg.String() {
-			case "y", "Y":
-				id := cp.pendingCloseFamiliar
-				cp.pendingCloseFamiliar = ""
-				cp.closeFamiliarModal = nil
-				cp.closeFamiliarByID(id) // synchronous cleanup
-				return cp.armFamiliarWatcher()
-			case "n", "N", "esc":
-				cp.pendingCloseFamiliar = ""
-				cp.closeFamiliarModal = nil
-				return cp.armFamiliarWatcher()
-			}
-			return cp.armFamiliarWatcher() // swallow other keys while modal is up
-		case tea.MouseMsg:
-			if cp.closeFamiliarModal != nil && cp.closeFamiliarModal.HandleMouse(msg) {
-				return cp.armFamiliarWatcher()
-			}
-			// An unconsumed click is outside the modal. Dismiss the
-			// confirmation without forwarding the event to the tab bar or
-			// the active terminal.
-			if msg.Action == tea.MouseActionPress {
-				cp.pendingCloseFamiliar = ""
-				cp.closeFamiliarModal = nil
-			}
-			return cp.armFamiliarWatcher()
-		}
+	if cmd, handled := cp.handlePendingCloseMessage(msg); handled {
+		return cmd
 	}
 
 	var forwardCmd tea.Cmd
 	switch msg := msg.(type) {
 	case familiarRegistryChangedMsg:
-		if cp.isCurrentFamiliarWatcher(msg.generation, msg.watcher) {
-			cp.familiarWatchPending = false
-			ownerDir := filepath.Dir(cp.familiarStatePath())
-			registryChanged := filepath.Clean(msg.path) == filepath.Clean(cp.familiarStatePath())
-			ownerCreated := filepath.Clean(cp.familiarWatcherPath) == filepath.Clean(paths.SessionsDir(cp.profile)) &&
-				filepath.Clean(msg.path) == filepath.Clean(ownerDir)
-			if registryChanged || ownerCreated {
-				cp.setupFamiliarWatcher()
-				forwardCmd = tea.Batch(cp.checkFamiliars()...)
-			}
-		}
-
+		forwardCmd = cp.handleFamiliarRegistryChanged(msg)
 	case familiarWatcherErrorMsg:
-		if cp.isCurrentFamiliarWatcher(msg.generation, msg.watcher) {
-			cp.familiarWatchPending = false
-			if msg.err != nil {
-				log.Printf("automata: familiar watcher for %q failed: %v", cp.sessionID, msg.err)
-			}
-			cp.closeFamiliarWatcher()
-			cp.setupFamiliarWatcher()
-			forwardCmd = tea.Batch(cp.checkFamiliars()...)
-		}
-
+		forwardCmd = cp.handleFamiliarWatcherError(msg)
 	case familiarDetectedMsg:
 		if cp.active && msg.generation == cp.familiarGeneration {
 			forwardCmd = cp.addFamiliar(msg.id, msg.familiarID)
 		}
-
 	case familiarRemovedMsg:
 		if cp.active && msg.generation == cp.familiarGeneration {
 			cp.handleExternalFamiliarRemoval(msg)
 		}
-
 	case tea.MouseMsg:
 		forwardCmd = cp.handleMouse(msg)
-
 	case tea.KeyMsg:
-		// Forward keystrokes to the active session's panel.
-		if cp.activeIdx >= 0 && cp.activeIdx < len(cp.sessions) {
-			forwardCmd = cp.sessions[cp.activeIdx].panel.Update(msg)
-		}
-
+		forwardCmd = cp.updateActiveSession(msg)
 	case warp.ResizeMsg:
-		cp.width = msg.Width
-		cp.height = msg.Height
-		forwardCmd = cp.resizeActivePanel()
-
+		forwardCmd = cp.resize(msg.Width, msg.Height)
 	case tea.WindowSizeMsg:
-		cp.width = msg.Width
-		cp.height = msg.Height
-		forwardCmd = cp.resizeActivePanel()
-
+		forwardCmd = cp.resize(msg.Width, msg.Height)
 	case portalis.PtyExitMsg:
-		// A failed familiar process is retried immediately from its registry
-		// entry; no timer is needed to resurrect the tab.
-		if cp.removeDeadFamiliar(msg.SessionID) {
-			if cp.active {
-				forwardCmd = tea.Batch(cp.checkFamiliars()...)
-			}
-		} else {
-			forwardCmd = cp.routeBySessionID(msg)
-		}
-
+		forwardCmd = cp.handlePtyExit(msg)
 	default:
-		// Route messages with a SessionID to the correct session.
-		forwardCmd = cp.routeBySessionID(msg)
-		if forwardCmd == nil {
-			// Fallback: forward to active session only.
-			if cp.activeIdx >= 0 && cp.activeIdx < len(cp.sessions) {
-				forwardCmd = cp.sessions[cp.activeIdx].panel.Update(msg)
-			}
-		}
+		forwardCmd = cp.routeOrUpdateActive(msg)
 	}
-
 	return tea.Batch(forwardCmd, cp.armFamiliarWatcher())
+}
+
+func (cp *ChatPanel) handlePendingCloseMessage(msg tea.Msg) (tea.Cmd, bool) {
+	if cp.pendingCloseFamiliar == "" {
+		return nil, false
+	}
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "y", "Y":
+			id := cp.pendingCloseFamiliar
+			cp.pendingCloseFamiliar = ""
+			cp.closeFamiliarModal = nil
+			cp.closeFamiliarByID(id)
+		case "n", "N", "esc":
+			cp.pendingCloseFamiliar = ""
+			cp.closeFamiliarModal = nil
+		}
+		return cp.armFamiliarWatcher(), true
+	case tea.MouseMsg:
+		if cp.closeFamiliarModal != nil && cp.closeFamiliarModal.HandleMouse(msg) {
+			return cp.armFamiliarWatcher(), true
+		}
+		// An unconsumed click is outside the modal. Dismiss the
+		// confirmation without forwarding the event to the tab bar or
+		// active terminal.
+		if msg.Action == tea.MouseActionPress {
+			cp.pendingCloseFamiliar = ""
+			cp.closeFamiliarModal = nil
+		}
+		return cp.armFamiliarWatcher(), true
+	default:
+		return nil, false
+	}
+}
+
+func (cp *ChatPanel) handleFamiliarRegistryChanged(msg familiarRegistryChangedMsg) tea.Cmd {
+	if !cp.isCurrentFamiliarWatcher(msg.generation, msg.watcher) {
+		return nil
+	}
+	cp.familiarWatchPending = false
+	ownerDir := filepath.Dir(cp.familiarStatePath())
+	registryChanged := filepath.Clean(msg.path) == filepath.Clean(cp.familiarStatePath())
+	ownerCreated := filepath.Clean(cp.familiarWatcherPath) == filepath.Clean(paths.SessionsDir(cp.profile)) &&
+		filepath.Clean(msg.path) == filepath.Clean(ownerDir)
+	if !registryChanged && !ownerCreated {
+		return nil
+	}
+	cp.setupFamiliarWatcher()
+	return tea.Batch(cp.checkFamiliars()...)
+}
+
+func (cp *ChatPanel) handleFamiliarWatcherError(msg familiarWatcherErrorMsg) tea.Cmd {
+	if !cp.isCurrentFamiliarWatcher(msg.generation, msg.watcher) {
+		return nil
+	}
+	cp.familiarWatchPending = false
+	if msg.err != nil {
+		log.Printf("automata: familiar watcher for %q failed: %v", cp.sessionID, msg.err)
+	}
+	cp.closeFamiliarWatcher()
+	cp.setupFamiliarWatcher()
+	return tea.Batch(cp.checkFamiliars()...)
+}
+
+func (cp *ChatPanel) updateActiveSession(msg tea.Msg) tea.Cmd {
+	if cp.activeIdx < 0 || cp.activeIdx >= len(cp.sessions) {
+		return nil
+	}
+	return cp.sessions[cp.activeIdx].panel.Update(msg)
+}
+
+func (cp *ChatPanel) resize(width, height int) tea.Cmd {
+	cp.width = width
+	cp.height = height
+	return cp.resizeActivePanel()
+}
+
+func (cp *ChatPanel) handlePtyExit(msg portalis.PtyExitMsg) tea.Cmd {
+	if cp.removeDeadFamiliar(msg.SessionID) {
+		if cp.active {
+			return tea.Batch(cp.checkFamiliars()...)
+		}
+		return nil
+	}
+	return cp.routeBySessionID(msg)
+}
+
+func (cp *ChatPanel) routeOrUpdateActive(msg tea.Msg) tea.Cmd {
+	if cmd := cp.routeBySessionID(msg); cmd != nil {
+		return cmd
+	}
+	return cp.updateActiveSession(msg)
 }
 
 func (cp *ChatPanel) isCurrentFamiliarWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
@@ -1095,89 +1107,80 @@ func (cp *ChatPanel) handleMouse(msg tea.Msg) tea.Cmd {
 	if !ok {
 		return nil
 	}
-
-	// Forward wheel/motion/release events to the active session.
-	if m.Button == tea.MouseButtonWheelUp || m.Button == tea.MouseButtonWheelDown ||
-		m.Action == tea.MouseActionMotion || m.Action == tea.MouseActionRelease {
-		if cp.activeIdx >= 0 && cp.activeIdx < len(cp.sessions) {
-			return cp.sessions[cp.activeIdx].panel.Update(msg)
-		}
-		return nil
+	if cp.shouldForwardMouse(m) {
+		return cp.updateActiveSession(msg)
 	}
-
-	// Only handle left-click for tab switching.
 	if m.Action != tea.MouseActionPress || m.Button != tea.MouseButtonLeft {
 		return nil
 	}
-
-	// Check if click is on the tab bar (last row).
 	if int(m.Y) != cp.height-1 {
-		// Forward to the active session.
-		if cp.activeIdx >= 0 && cp.activeIdx < len(cp.sessions) {
-			return cp.sessions[cp.activeIdx].panel.Update(msg)
-		}
-		return nil
+		return cp.updateActiveSession(msg)
 	}
+	return cp.handleTabBarClick(m)
+}
 
-	// Right-aligned button: "× Clear" occupies the rightmost 9 cells.
+func (cp *ChatPanel) shouldForwardMouse(msg tea.MouseMsg) bool {
+	return msg.Button == tea.MouseButtonWheelUp ||
+		msg.Button == tea.MouseButtonWheelDown ||
+		msg.Action == tea.MouseActionMotion ||
+		msg.Action == tea.MouseActionRelease
+}
+
+func (cp *ChatPanel) handleTabBarClick(msg tea.MouseMsg) tea.Cmd {
 	const clearBtnWidth = 9
-	clearStart := cp.width - clearBtnWidth
-	if clearStart < 0 {
-		clearStart = 0
-	}
-	if int(m.X) >= clearStart && cp.onClearSession != nil {
-		if cp.activeIdx < 0 || cp.activeIdx >= len(cp.sessions) {
-			return nil
-		}
-		active := cp.sessions[cp.activeIdx]
-		var cwd string
-		if active != nil && active.em != nil {
-			cwd = active.em.CWD()
-		}
-		cp.actionWarning = ""
-		return cp.onClearSession(cp.sessionID, cwd)
+	clearStart := max(0, cp.width-clearBtnWidth)
+	if int(msg.X) >= clearStart && cp.onClearSession != nil {
+		return cp.handleClearClick()
 	}
 
-	availableForTabs := cp.width - clearBtnWidth
-	if availableForTabs < 0 {
-		availableForTabs = 0
-	}
+	availableForTabs := max(0, cp.width-clearBtnWidth)
 	x := ansi.StringWidth(cp.tabBarWarning())
 	if x > availableForTabs {
 		return nil
 	}
-	for i, session := range cp.sessions {
+	for index, session := range cp.sessions {
 		tabWidth := ansi.StringWidth(" " + session.name + " ")
 		closeWidth := 0
 		if session.familiarID != "" {
 			closeWidth = ansi.StringWidth(" ×")
 		}
 		fullTabWidth := tabWidth + closeWidth
-		// Do not route clicks to a tab whose rendered hit region is clipped.
 		if x+fullTabWidth > availableForTabs {
 			break
 		}
-		if int(m.X) >= x && int(m.X) < x+fullTabWidth {
-			if session.familiarID != "" && int(m.X) >= x+tabWidth {
-				cp.pendingCloseFamiliar = session.familiarID
-				cp.openCloseFamiliarModal(session.name)
-				return nil
-			}
-			if i != cp.activeIdx && session.panel != nil {
-				cp.activeIdx = i
-				termHeight := cp.height - 1
-				if termHeight < 1 {
-					termHeight = 1
-				}
-				adjusted := warp.ResizeMsg{Width: cp.width, Height: termHeight}
-				return session.panel.Update(adjusted)
-			}
-			return nil
+		if int(msg.X) >= x && int(msg.X) < x+fullTabWidth {
+			return cp.handleSessionTabClick(index, session, int(msg.X), x, tabWidth)
 		}
-		x += fullTabWidth + 1 // one separating terminal cell
+		x += fullTabWidth + 1
 	}
-
 	return nil
+}
+
+func (cp *ChatPanel) handleClearClick() tea.Cmd {
+	if cp.activeIdx < 0 || cp.activeIdx >= len(cp.sessions) {
+		return nil
+	}
+	active := cp.sessions[cp.activeIdx]
+	var cwd string
+	if active != nil && active.em != nil {
+		cwd = active.em.CWD()
+	}
+	cp.actionWarning = ""
+	return cp.onClearSession(cp.sessionID, cwd)
+}
+
+func (cp *ChatPanel) handleSessionTabClick(index int, session *chatSession, clickX, tabStart, tabWidth int) tea.Cmd {
+	if session.familiarID != "" && clickX >= tabStart+tabWidth {
+		cp.pendingCloseFamiliar = session.familiarID
+		cp.openCloseFamiliarModal(session.name)
+		return nil
+	}
+	if index == cp.activeIdx || session.panel == nil {
+		return nil
+	}
+	cp.activeIdx = index
+	termHeight := max(1, cp.height-1)
+	return session.panel.Update(warp.ResizeMsg{Width: cp.width, Height: termHeight})
 }
 
 // resizeActivePanel sends a fresh warp.ResizeMsg to all sessions so their
