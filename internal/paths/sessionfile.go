@@ -211,7 +211,7 @@ func ClearFamiliarsJSONL(profile, sessionID string) error {
 	} else if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, []byte("[]\n"), 0o644)
+	return writeFileAtomic(path, []byte("[]\n"), PrivateFileMode)
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
@@ -270,5 +270,5 @@ func RemoveFamiliar(profile, sessionID, familiarID string) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, append(out, '\n'), 0o644)
+	return writeFileAtomic(path, append(out, '\n'), PrivateFileMode)
 }

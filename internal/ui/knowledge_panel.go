@@ -284,7 +284,7 @@ func (k *KnowledgePanel) attachKnowledgeWatcherIfMissing() {
 	watchPath := sessionDir
 	if info, err := os.Stat(sessionDir); err != nil || !info.IsDir() {
 		watchPath = paths.SessionsDir(k.profile)
-		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+		if err := paths.EnsurePrivateDir(watchPath); err != nil {
 			k.knowledgeWatchError = fmt.Sprintf("create session watcher path: %v", err)
 			return
 		}
@@ -413,7 +413,7 @@ func (k *KnowledgePanel) writeSettings() error {
 		k.setSettingsError(err)
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(filepath.Dir(settingsPath)); err != nil {
 		err = fmt.Errorf("create settings directory: %w", err)
 		k.setSettingsError(err)
 		return err
@@ -463,7 +463,7 @@ func settingsWriteWasCommitted(err error) bool {
 }
 
 func writeSettingsAtomic(path string, data []byte) error {
-	err := atomicfile.Write(path, data, 0o644)
+	err := atomicfile.Write(path, data, paths.PrivateFileMode)
 	if !atomicfile.IsCommitted(err) {
 		return err
 	}
@@ -749,7 +749,7 @@ func (k *KnowledgePanel) attachKanbanWatcherIfMissing() {
 	watchPath := kanbanDir
 	if info, err := os.Stat(kanbanDir); err != nil || !info.IsDir() {
 		watchPath = filepath.Dir(kanbanDir)
-		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+		if err := paths.EnsurePrivateDir(watchPath); err != nil {
 			k.kanbanWatchError = fmt.Sprintf("create Kanban watcher path: %v", err)
 			return
 		}

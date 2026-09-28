@@ -81,11 +81,14 @@ func RenameDirectory(oldPath, newPath string) error {
 		return fmt.Errorf("target %q already exists", newPath)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+	if err := EnsurePrivateDir(filepath.Dir(newPath)); err != nil {
 		return fmt.Errorf("create target parent %q: %w", filepath.Dir(newPath), err)
 	}
 	if err := durableRename(oldPath, newPath); err != nil {
 		return fmt.Errorf("rename %q to %q: %w", oldPath, newPath, err)
+	}
+	if err := EnsurePrivateDir(newPath); err != nil {
+		return &atomicfile.CommittedError{Path: newPath, Err: fmt.Errorf("harden renamed directory: %w", err)}
 	}
 	return nil
 }
@@ -108,11 +111,14 @@ func RenameFile(oldPath, newPath string) error {
 	case newErr != nil && !os.IsNotExist(newErr):
 		return fmt.Errorf("stat target %q: %w", newPath, newErr)
 	}
-	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+	if err := EnsurePrivateDir(filepath.Dir(newPath)); err != nil {
 		return fmt.Errorf("create target parent %q: %w", filepath.Dir(newPath), err)
 	}
 	if err := durableRename(oldPath, newPath); err != nil {
 		return fmt.Errorf("rename %q to %q: %w", oldPath, newPath, err)
+	}
+	if err := os.Chmod(newPath, PrivateFileMode); err != nil {
+		return &atomicfile.CommittedError{Path: newPath, Err: fmt.Errorf("harden renamed file: %w", err)}
 	}
 	return nil
 }
@@ -320,7 +326,7 @@ func RewriteFamiliarSessionIDs(profile, oldOwnerID, newOwnerID string) (map[stri
 	if err != nil {
 		return nil, fmt.Errorf("encode familiars.json: %w", err)
 	}
-	if err := writeRenameFileAtomic(path, append(updated, '\n'), 0o644); err != nil {
+	if err := writeRenameFileAtomic(path, append(updated, '\n'), PrivateFileMode); err != nil {
 		wrapped := fmt.Errorf("write familiars.json: %w", err)
 		if atomicfile.IsCommitted(err) {
 			return mapping, wrapped

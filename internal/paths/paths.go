@@ -60,6 +60,48 @@ func BaseDir() string {
 	return dataHome()
 }
 
+const (
+	// PrivateDirMode prevents other local users from enumerating Automata state.
+	PrivateDirMode os.FileMode = 0o700
+	// PrivateFileMode protects state, command history, notes, tasks, and runtime metadata.
+	PrivateFileMode os.FileMode = 0o600
+)
+
+// EnsurePrivateDir creates an Automata-owned directory and tightens the
+// complete path below BaseDir so legacy 0755 directories are hardened too.
+func EnsurePrivateDir(path string) error {
+	base := filepath.Clean(BaseDir())
+	target := filepath.Clean(path)
+	if err := os.MkdirAll(target, PrivateDirMode); err != nil {
+		return fmt.Errorf("create private directory %q: %w", target, err)
+	}
+	rel, err := filepath.Rel(base, target)
+	insideBase := err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	if !insideBase {
+		if err := os.Chmod(target, PrivateDirMode); err != nil {
+			return fmt.Errorf("harden private directory %q: %w", target, err)
+		}
+		return nil
+	}
+	current := base
+	if err := os.Chmod(current, PrivateDirMode); err != nil {
+		return fmt.Errorf("harden private directory %q: %w", current, err)
+	}
+	if rel == "." {
+		return nil
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		if err := os.Chmod(current, PrivateDirMode); err != nil {
+			return fmt.Errorf("harden private directory %q: %w", current, err)
+		}
+	}
+	return nil
+}
+
 // profileSlug normalizes a profile name for use in paths. Empty profile maps
 // to "default".
 func profileSlug(profile string) string {
@@ -125,7 +167,7 @@ func DomainDir(profile, domain string) string {
 
 // EnsureProfileDir creates the profile directory tree if it does not exist.
 func EnsureProfileDir(profile string) error {
-	return os.MkdirAll(ProfileDir(profile), 0o755)
+	return EnsurePrivateDir(ProfileDir(profile))
 }
 
 // EnsureSessionDir creates the session directory tree if it does not exist.
@@ -133,10 +175,10 @@ func EnsureSessionDir(profile, sessionID string) error {
 	if err := ValidateSessionID(sessionID); err != nil {
 		return err
 	}
-	return os.MkdirAll(SessionDir(profile, sessionID), 0o755)
+	return EnsurePrivateDir(SessionDir(profile, sessionID))
 }
 
 // EnsureDomainDir creates the domain directory tree if it does not exist.
 func EnsureDomainDir(profile, domain string) error {
-	return os.MkdirAll(DomainDir(profile, domain), 0o755)
+	return EnsurePrivateDir(DomainDir(profile, domain))
 }

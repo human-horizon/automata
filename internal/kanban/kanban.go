@@ -388,7 +388,7 @@ func writeTask(path string, task Task) error {
 		content.WriteByte('\n')
 	}
 
-	if err := atomicfile.Write(path, []byte(content.String()), 0o644); err != nil {
+	if err := atomicfile.Write(path, []byte(content.String()), paths.PrivateFileMode); err != nil {
 		return fmt.Errorf("write Kanban task %s: %w", path, err)
 	}
 	return nil

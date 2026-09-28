@@ -85,7 +85,7 @@ func (t *Tree) SaveState() error {
 		return err
 	}
 
-	if err := writeStateAtomic(path, data, 0o644); err != nil {
+	if err := writeStateAtomic(path, data, paths.PrivateFileMode); err != nil {
 		if atomicfile.IsCommitted(err) {
 			return &CommittedStateError{Path: path, Err: err}
 		}

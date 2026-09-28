@@ -217,7 +217,7 @@ func writeJSON(path string, rec *JobRecord) error {
 	if err != nil {
 		return err
 	}
-	if err := writeJobMetadataAtomic(path, data, 0o644); err != nil {
+	if err := writeJobMetadataAtomic(path, data, paths.PrivateFileMode); err != nil {
 		return fmt.Errorf("write job metadata %s: %w", path, err)
 	}
 	return nil

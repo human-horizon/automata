@@ -151,7 +151,7 @@ func (c *ContextPanel) setupNotesWatcher() {
 	if c.notesWatcher != nil {
 		c.closeNotesWatcher()
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(dir); err != nil {
 		c.notesWatchError = fmt.Sprintf("create notes watcher path: %v", err)
 		return
 	}

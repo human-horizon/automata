@@ -203,7 +203,7 @@ func (k *KanbanPanel) setupWatcher() {
 	watchPath := dir
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		watchPath = filepath.Dir(dir)
-		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+		if err := paths.EnsurePrivateDir(watchPath); err != nil {
 			k.watchWarning = fmt.Sprintf("create live-update path: %v", err)
 			return
 		}
@@ -752,7 +752,7 @@ func (k *KanbanPanel) createTaskAt(createdAt time.Time) error {
 		return errors.New("kanban domain is not selected")
 	}
 	dir := kanban.KanbanDir(k.domain, k.profile)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(dir); err != nil {
 		return fmt.Errorf("create Kanban directory: %w", err)
 	}
 	baseName := "task-" + createdAt.Format("2006-01-02T15-04-05")
@@ -763,7 +763,7 @@ func (k *KanbanPanel) createTaskAt(createdAt time.Time) error {
 			name = fmt.Sprintf("%s-%d.md", baseName, suffix+1)
 		}
 		path := filepath.Join(dir, name)
-		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, paths.PrivateFileMode)
 		if err != nil {
 			if os.IsExist(err) {
 				continue
@@ -1469,11 +1469,11 @@ func restoreStatusSnapshot(path string, snapshot statusSnapshot) error {
 		}
 		return nil
 	}
-	return writeAtomicFile(path, snapshot.data, 0o644)
+	return writeAtomicFile(path, snapshot.data, paths.PrivateFileMode)
 }
 
 func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	return atomicfile.Write(path, data, mode)
@@ -1585,7 +1585,7 @@ func writeTaskToChatStatus(profile, sessionID, taskTitle, taskPath string) error
 	if err != nil {
 		return err
 	}
-	return writeAtomicFile(statusPath, data, 0o644)
+	return writeAtomicFile(statusPath, data, paths.PrivateFileMode)
 }
 
 // writeTaskRemovedFromChat notifies the chat that a task was removed from progress.
@@ -1613,7 +1613,7 @@ func writeTaskRemovedFromChat(profile, sessionID, taskTitle string) error {
 	if err != nil {
 		return err
 	}
-	return writeAtomicFile(statusPath, data, 0o644)
+	return writeAtomicFile(statusPath, data, paths.PrivateFileMode)
 }
 
 type voidPanel struct{}

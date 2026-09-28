@@ -1230,7 +1230,7 @@ func (a *App) recordInfrastructureWarning(err error) {
 func (a *App) setupStatusWatcher() {
 	a.resetStatusWatcher()
 	base := a.sessionBaseDir()
-	if err := os.MkdirAll(base, 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(base); err != nil {
 		a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable: create %s: %w", base, err))
 		return
 	}
@@ -1276,7 +1276,7 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 			continue
 		}
 		dir := paths.SessionDir(a.profile, key)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := paths.EnsurePrivateDir(dir); err != nil {
 			a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable for %s: create session directory: %w", key, err))
 			continue
 		}
@@ -1520,7 +1520,7 @@ func disableMouse() tea.Cmd {
 }
 
 func openDebugLog(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, paths.PrivateFileMode)
 }
 
 func configureDebugLog(path string, logger *log.Logger) (*os.File, error) {

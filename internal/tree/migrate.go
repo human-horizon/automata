@@ -87,7 +87,7 @@ func migrateDefaultProfile() error {
 	} else if complete {
 		return nil
 	}
-	if err := os.MkdirAll(defaultProfileDir, 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(defaultProfileDir); err != nil {
 		return fmt.Errorf("create default profile dir: %w", err)
 	}
 
@@ -129,7 +129,7 @@ func migrateProfileTree(src, dst string) error {
 	} else if complete {
 		return nil
 	}
-	if err := os.MkdirAll(dst, 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(dst); err != nil {
 		return err
 	}
 	if err := copyDir(src, dst); err != nil {
@@ -158,7 +158,7 @@ func migrationComplete(profileDir string) (bool, error) {
 func writeMigrationMarker(profileDir string) error {
 	path := filepath.Join(profileDir, migrationMarkerName)
 	contents := "version=1\ncompletedAt=" + time.Now().UTC().Format(time.RFC3339Nano) + "\n"
-	if err := atomicfile.Write(path, []byte(contents), 0o644); err != nil {
+	if err := atomicfile.Write(path, []byte(contents), paths.PrivateFileMode); err != nil {
 		return fmt.Errorf("commit migration marker: %w", err)
 	}
 	return nil
@@ -238,7 +238,7 @@ func copyDir(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dst, 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(dst); err != nil {
 		return err
 	}
 	for _, entry := range entries {

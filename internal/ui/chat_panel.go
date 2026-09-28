@@ -350,7 +350,7 @@ func (cp *ChatPanel) setupFamiliarWatcher() {
 	watchPath := filepath.Dir(cp.familiarStatePath())
 	if info, err := os.Stat(watchPath); err != nil || !info.IsDir() {
 		watchPath = paths.SessionsDir(cp.profile)
-		if err := os.MkdirAll(watchPath, 0o755); err != nil {
+		if err := paths.EnsurePrivateDir(watchPath); err != nil {
 			cp.familiarWatchError = fmt.Sprintf("create watcher parent %s: %v", watchPath, err)
 			log.Printf("automata: familiar live-update unavailable: %s", cp.familiarWatchError)
 			return

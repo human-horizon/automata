@@ -617,7 +617,7 @@ func moveRenameTask(move *renameTaskMove) error {
 	} else if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(targetDir); err != nil {
 		return err
 	}
 	if err := paths.RenameFile(move.oldPath, move.newPath); err != nil {

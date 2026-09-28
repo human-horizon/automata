@@ -85,7 +85,7 @@ func Write(profile, domain string, notes []NoteSummary) error {
 	}
 
 	domainDir := paths.DomainDir(effectiveProfile(profile), domain)
-	if err := os.MkdirAll(domainDir, 0o755); err != nil {
+	if err := paths.EnsurePrivateDir(domainDir); err != nil {
 		return fmt.Errorf("create notes directory: %w", err)
 	}
 
@@ -98,7 +98,7 @@ func Write(profile, domain string, notes []NoteSummary) error {
 	}
 	encoded = append(encoded, '\n')
 
-	if err := atomicfile.Write(filepath.Join(domainDir, "notes.json"), encoded, 0o644); err != nil {
+	if err := atomicfile.Write(filepath.Join(domainDir, "notes.json"), encoded, paths.PrivateFileMode); err != nil {
 		return fmt.Errorf("write notes file: %w", err)
 	}
 	return nil
