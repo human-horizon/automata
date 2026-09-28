@@ -451,74 +451,10 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 		return a, cmd
 
 	case tea.KeyMsg:
-		// Ctrl+C is the application exit shortcut. Handle it before the focus
-		// router so chat, terminal, and overlays cannot consume it.
-		if msg.Type == tea.KeyCtrlC || msg.String() == "ctrl+c" {
-			return a, tea.Quit
-		}
-		if a.appModal != nil {
-			switch msg.Type {
-			case tea.KeyEsc, tea.KeyEnter, tea.KeyF1:
-				a.closeAppOverlay()
-			}
-			return a, nil
-		}
-		if a.appPopover != nil {
-			if msg.Type == tea.KeyF1 {
-				a.closeAppOverlay()
-				return a, nil
-			}
-			if a.appPopover.HandleKey(msg) {
-				return a, nil
-			}
-			return a, nil
-		}
-		if (msg.Type == tea.KeyF1 || msg.String() == "f1") && a.tree != nil {
-			a.openHelpOverlay()
-			return a, nil
-		}
-		if msg.Type == tea.KeyF6 {
-			a.setFocusArea(focusTree)
-			return a, nil
-		}
-		if (msg.Type == tea.KeyF5 || msg.Type == tea.KeyF7) &&
-			(a.tree == nil || !a.tree.IsModalOpen()) {
-			if msg.Type == tea.KeyF5 {
-				a.cycleFocus(-1)
-			} else {
-				a.cycleFocus(1)
-			}
-			return a, nil
-		}
-		if msg.String() == "f8" {
-			a.mouseEnabled = !a.mouseEnabled
-			if a.mouseEnabled {
-				return a, enableMouse()
-			}
-			return a, disableMouse()
-		}
-		if a.currentFocusArea() != focusTree && a.container != nil {
-			return a, a.container.Update(msg)
-		}
-		_, cmd := a.warp.Update(msg)
-		return a, cmd
+		return a, a.handleKeyMsg(msg)
 
 	case tea.MouseMsg:
-		if a.appModal != nil {
-			a.appModal.EnsureDimensions(a.warp.Width(), a.warp.Height())
-			a.appModal.HandleMouse(msg)
-			return a, nil
-		}
-		if a.appPopover != nil {
-			a.appPopover.HandleMouse(msg)
-			return a, nil
-		}
-		if !a.mouseEnabled {
-			// Mouse disabled — skip to allow text selection.
-			return a, nil
-		}
-		_, cmd := a.warp.Update(msg)
-		return a, cmd
+		return a, a.handleMouseMsg(msg)
 
 	case clearSessionErrorMsg:
 		if msg.err != nil {
