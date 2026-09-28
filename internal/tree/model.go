@@ -99,8 +99,9 @@ type Tree struct {
 	root     []*Item
 	selected int // Index in the visible flat list
 	scroll   int // Scroll offset
-	flat     []*Item
-	height   int // Last known view height
+	flat       []*Item
+	branchInfo []branchInfo
+	height     int // Last known view height
 	width    int // Last known view width
 
 	// Context menu (popover)
@@ -474,6 +475,7 @@ func (t *Tree) rebuildFlat() {
 	for _, item := range t.root {
 		t.flatten(item, nil, 0)
 	}
+	t.branchInfo = computeBranchInfo(t.flat)
 	t.clampSelection()
 }
 
