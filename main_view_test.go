@@ -622,7 +622,7 @@ func TestClearRestartFailureDoesNotRestoreActiveSession(t *testing.T) {
 	}
 }
 
-func TestClearAggregatesCommittedCleanupErrorsAndDoesNotRestart(t *testing.T) {
+func TestClearPreservesHistoryWhenCommittedJobStopFails(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "/bin/sh")
 	profile := "clear-errors"
@@ -633,16 +633,24 @@ func TestClearAggregatesCommittedCleanupErrorsAndDoesNotRestart(t *testing.T) {
 	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"a-familiar.jsonl", "b-owner.jsonl"} {
-		if err := os.WriteFile(filepath.Join(sessionDir, name), []byte("not-json\n"), 0o644); err != nil {
+	ownerHistory := []byte(`{"id":"` + ownerID + `"}` + "\n")
+	familiarHistory := []byte(`{"id":"` + familiarID + `"}` + "\n")
+	ownerPath := filepath.Join(sessionDir, "b-owner.jsonl")
+	familiarPath := filepath.Join(sessionDir, "a-familiar.jsonl")
+	for path, data := range map[string][]byte{
+		ownerPath:    ownerHistory,
+		familiarPath: familiarHistory,
+	} {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	registryPath := paths.FamiliarsJSONLPath(profile, ownerID)
-	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(registryPath, 0o755); err != nil {
+	registryData := []byte(`[{"id":"expert","sessionId":"` + familiarID + `"}]` + "\n")
+	if err := os.WriteFile(registryPath, registryData, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -669,22 +677,34 @@ func TestClearAggregatesCommittedCleanupErrorsAndDoesNotRestart(t *testing.T) {
 
 	msg := app.clearSessionCmd(ownerID, "", []string{familiarID})()
 	clearErr, ok := msg.(clearSessionErrorMsg)
-	if !ok {
-		t.Fatalf("Clear result = %T, want aggregated cleanup error", msg)
+	if !ok || clearErr.err == nil {
+		t.Fatalf("Clear result = %#v, want job-stop error", msg)
 	}
-	for _, want := range []string{"injected job stop failure", "clear familiar", "clear session history", "clear familiars.json"} {
-		if !strings.Contains(clearErr.err.Error(), want) {
-			t.Errorf("Clear error %q does not include %q", clearErr.err, want)
-		}
+	if !strings.Contains(clearErr.err.Error(), "injected job stop failure") {
+		t.Fatalf("Clear error = %q, want job-stop failure", clearErr.err)
 	}
 	if restarted {
-		t.Fatal("Clear restarted Pi despite committed cleanup errors")
+		t.Fatal("Clear restarted Pi after a job-stop failure")
 	}
 	if _, exists := app.emulatorCache[ownerID]; exists {
 		t.Fatal("stopped emulator remained in cache after cleanup error")
 	}
 	if _, active := app.activeSessions[ownerID]; active {
 		t.Fatal("stopped session remained active after committed cleanup")
+	}
+
+	for path, want := range map[string][]byte{
+		ownerPath:    ownerHistory,
+		familiarPath: familiarHistory,
+		registryPath: registryData,
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read preserved data %s: %v", path, err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("Clear changed protected data %s: got %q, want %q", path, got, want)
+		}
 	}
 }
 

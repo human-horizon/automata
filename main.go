@@ -838,6 +838,9 @@ func (a *App) clearSessionCmdForPanel(sessionID, cwd string, familiarSIDs []stri
 		if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
 			return fail(fmt.Errorf("stop runtime before Clear: %w", stopErr))
 		}
+		if runtimeStopJobsFailed(stopErr) {
+			return fail(fmt.Errorf("stop jobs before Clear: %w", stopErr))
+		}
 
 		var failures []error
 		if stopErr != nil {

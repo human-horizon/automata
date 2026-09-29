@@ -383,7 +383,7 @@ func RunningCountForProfile(profile, sessionID string) (int, error) {
 }
 
 // processSignal is injectable so cleanup tests can verify signal safety without
-// sending SIGTERM to a real process.
+// sending signals to a real process.
 var processSignal = func(pid int, signal syscall.Signal) error {
 	process, err := os.FindProcess(pid)
 	if err != nil {
@@ -393,19 +393,24 @@ var processSignal = func(pid int, signal syscall.Signal) error {
 }
 
 // processProbe is injectable so KillSessionForProfile can distinguish a
-// delivered SIGTERM from a confirmed process exit without making tests sleep
-// on real processes.
+// delivered signal from a confirmed process exit without making tests sleep on
+// real processes. The default only treats ESRCH as proof that a PID is absent.
 type processProbe func(pid int) bool
 
 var processProbeFn processProbe = func(pid int) bool {
-	return pid > 0 && syscall.Kill(pid, 0) == nil
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || !errors.Is(err, syscall.ESRCH)
 }
 
 var processExitSleepFn = time.Sleep
 
 const (
-	processExitProbeAttempts = 5
 	processExitProbeInterval = 20 * time.Millisecond
+	processExitGracePeriod   = 2 * time.Second
+	processKillWaitPeriod    = 1 * time.Second
 )
 
 type signaledKillCandidate struct {
@@ -414,9 +419,13 @@ type signaledKillCandidate struct {
 	metaPath  string
 }
 
-func waitForSignaledProcesses(candidates []signaledKillCandidate) (exited, running []signaledKillCandidate) {
+func waitForSignaledProcesses(candidates []signaledKillCandidate, wait time.Duration) (exited, running []signaledKillCandidate) {
 	running = append([]signaledKillCandidate(nil), candidates...)
-	for attempt := 0; attempt < processExitProbeAttempts && len(running) > 0; attempt++ {
+	attempts := int(wait/processExitProbeInterval) + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	for attempt := 0; attempt < attempts && len(running) > 0; attempt++ {
 		next := make([]signaledKillCandidate, 0, len(running))
 		for _, candidate := range running {
 			if !processProbeFn(candidate.record.PID) {
@@ -426,7 +435,7 @@ func waitForSignaledProcesses(candidates []signaledKillCandidate) (exited, runni
 			next = append(next, candidate)
 		}
 		running = next
-		if len(running) > 0 && attempt+1 < processExitProbeAttempts {
+		if len(running) > 0 && attempt+1 < attempts {
 			processExitSleepFn(processExitProbeInterval)
 		}
 	}
@@ -556,8 +565,9 @@ func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
 }
 
 // ExecuteKillPlansForProfile sends SIGTERM to every verified target before
-// polling any process. All targets must have valid session IDs before the first
-// signal; process exit checks then share one bounded polling pass.
+// polling any process. Surviving targets receive SIGKILL only after their PID
+// identities are revalidated. All targets must have valid session IDs before
+// the first signal, and each signal stage uses one shared bounded polling pass.
 func ExecuteKillPlansForProfile(profile string, targets []KillPlanTarget) error {
 	var failures []error
 	for _, target := range targets {
@@ -613,7 +623,39 @@ func ExecuteKillPlansForProfile(profile string, targets []KillPlanTarget) error 
 		}
 	}
 
-	exited, running := waitForSignaledProcesses(signaled)
+	termExited, termRunning := waitForSignaledProcesses(signaled, processExitGracePeriod)
+	exited := append([]signaledKillCandidate(nil), termExited...)
+	killSignaled := make([]signaledKillCandidate, 0, len(termRunning))
+	for _, candidate := range termRunning {
+		rec := candidate.record
+		switch identity := inspectPIDIdentity(rec.PID, rec.StartedAt); identity {
+		case PIDDead, PIDDifferent:
+			exited = append(exited, candidate)
+		case PIDUnknown:
+			failures = append(failures, fmt.Errorf("cannot verify process identity for job %s in session %s before SIGKILL", rec.ID, candidate.sessionID))
+		case PIDSame:
+			if err := processSignal(rec.PID, syscall.SIGKILL); err != nil {
+				failures = append(failures, fmt.Errorf("signal job %s in session %s with SIGKILL: %w", rec.ID, candidate.sessionID, err))
+				continue
+			}
+			killSignaled = append(killSignaled, candidate)
+		}
+	}
+
+	killExited, killRunning := waitForSignaledProcesses(killSignaled, processKillWaitPeriod)
+	exited = append(exited, killExited...)
+	for _, candidate := range killRunning {
+		rec := candidate.record
+		switch identity := inspectPIDIdentity(rec.PID, rec.StartedAt); identity {
+		case PIDDead, PIDDifferent:
+			exited = append(exited, candidate)
+		case PIDUnknown:
+			failures = append(failures, fmt.Errorf("cannot verify process identity for job %s in session %s after SIGKILL", rec.ID, candidate.sessionID))
+		case PIDSame:
+			failures = append(failures, fmt.Errorf("job %s in session %s is still running after SIGKILL", rec.ID, candidate.sessionID))
+		}
+	}
+
 	stoppedAt := time.Now().UTC().Format(time.RFC3339)
 	for _, candidate := range exited {
 		rec := candidate.record
@@ -622,9 +664,6 @@ func ExecuteKillPlansForProfile(profile string, targets []KillPlanTarget) error 
 		if err := writeJSON(candidate.metaPath, &rec); err != nil {
 			failures = append(failures, fmt.Errorf("write stopped job %s in session %s: %w", rec.ID, candidate.sessionID, err))
 		}
-	}
-	for _, candidate := range running {
-		failures = append(failures, fmt.Errorf("job %s in session %s is still running after SIGTERM", candidate.record.ID, candidate.sessionID))
 	}
 	return errors.Join(failures...)
 }

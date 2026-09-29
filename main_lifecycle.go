@@ -20,9 +20,10 @@ type stopSessionOptions struct {
 }
 
 type stopSessionError struct {
-	committed   bool
-	persistence bool
-	err         error
+	committed     bool
+	persistence   bool
+	jobStopFailed bool
+	err           error
 }
 
 func (e *stopSessionError) Error() string {
@@ -47,6 +48,11 @@ func runtimeStopWasCommitted(err error) bool {
 func runtimeStopPersistenceFailed(err error) bool {
 	var stopErr *stopSessionError
 	return errors.As(err, &stopErr) && stopErr.persistence
+}
+
+func runtimeStopJobsFailed(err error) bool {
+	var stopErr *stopSessionError
+	return errors.As(err, &stopErr) && stopErr.jobStopFailed
 }
 
 type preparedSessionJobs struct {
@@ -208,13 +214,15 @@ func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) 
 		}
 	}
 
+	jobStopFailed := false
 	if opts.stopJobs {
 		if err := a.executePreparedSessionJobs(prepared); err != nil {
+			jobStopFailed = true
 			failures = append(failures, fmt.Errorf("stop jobs: %w", err))
 		}
 	}
 	if err := errors.Join(failures...); err != nil {
-		return &stopSessionError{committed: true, persistence: persistenceFailed, err: err}
+		return &stopSessionError{committed: true, persistence: persistenceFailed, jobStopFailed: jobStopFailed, err: err}
 	}
 	return nil
 }
