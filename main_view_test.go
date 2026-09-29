@@ -238,6 +238,7 @@ func TestCreateChatEmulatorWithoutPiCommandReturnsNil(t *testing.T) {
 }
 
 func TestCreateChatEmulatorTerminalUsesShellWithoutPiEnv(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "")
 	app := &App{
 		tree:       tree.New(),
@@ -717,6 +718,7 @@ func TestRouteCachedFamiliarEmulatorMessageKeepsListenChain(t *testing.T) {
 }
 
 func TestCreateFamiliarEmulatorReusesCachedEmulator(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "/bin/sh")
 	const sessionID = "cached-familiar"
 	app := &App{profile: "test"}
@@ -739,6 +741,7 @@ func TestCreateFamiliarEmulatorReusesCachedEmulator(t *testing.T) {
 }
 
 func TestFamiliarExitEvictsCacheAndCreatesFreshEmulator(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "/bin/sh")
 	const sessionID = "exited-familiar"
 	app := &App{
@@ -1451,6 +1454,7 @@ func newTestApp(t *testing.T, profile string) *App {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", filepath.Join(home, "automata-data"))
 	tr := tree.New()
 	tr.Profile = profile
 	tr.AddChat("agent")
@@ -1742,10 +1746,11 @@ func TestConfigureDebugLogReportsOpenFailure(t *testing.T) {
 
 func TestWriteHeapProfileProducesGzipProfile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "heap.prof")
-	file, err := os.Create(path)
+	file, err := openPrivateFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertPrivateFileMode(t, file)
 	if err := writeHeapProfile(file); err != nil {
 		t.Fatalf("write heap profile: %v", err)
 	}
@@ -1766,6 +1771,68 @@ func TestWriteHeapProfileProducesGzipProfile(t *testing.T) {
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenDebugLogUsesPrivatePermissionsForNewAndExistingFiles(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing_%t", existing), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "automata.log")
+			if existing {
+				if err := os.WriteFile(path, []byte("existing\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			file, err := openDebugLog(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPrivateFileMode(t, file)
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestOpenProfileFilesUsesPrivatePermissionsForNewAndExistingFiles(t *testing.T) {
+	for _, profileName := range []string{"cpu.prof", "heap.prof"} {
+		for _, existing := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s_existing_%t", profileName, existing), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), profileName)
+				if existing {
+					if err := os.WriteFile(path, []byte("existing\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				file, err := openPrivateFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPrivateFileMode(t, file)
+				info, err := file.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.Size() != 0 {
+					t.Fatalf("profile file size after opening = %d, want truncation before profile write", info.Size())
+				}
+				if err := file.Close(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func assertPrivateFileMode(t *testing.T, file *os.File) {
+	t.Helper()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != paths.PrivateFileMode {
+		t.Fatalf("file permissions = %04o, want %04o", got, paths.PrivateFileMode)
 	}
 }
 

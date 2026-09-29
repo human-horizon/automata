@@ -1297,6 +1297,18 @@ func (t *Tree) MoveItem(item, target *Item) {
 	_ = t.MoveItemChecked(item, target)
 }
 
+type moveSnapshot struct {
+	root           []*Item
+	parent         *Item
+	parentChildren []*Item
+	targetChildren []*Item
+	archived       bool
+	selectedItem   *Item
+	selectedIndex  int
+	scroll         int
+	targetParent   *Item
+}
+
 // MoveItemChecked moves an item and returns identity, preflight, or persistence errors.
 func (t *Tree) MoveItemChecked(item, target *Item) error {
 	if item == nil || item == target || target == nil {
@@ -1306,102 +1318,138 @@ func (t *Tree) MoveItemChecked(item, target *Item) error {
 		return t.recordActionError(fmt.Errorf("move source and target must belong to this tree"))
 	}
 
-	var targetParent *Item
-	var targetIndex int
-	if target.IsFolder {
-		targetParent = target
-		targetIndex = len(target.Children)
-	} else {
-		targetParent = target.parent
-		if targetParent != nil {
-			for i, child := range targetParent.Children {
-				if child == target {
-					targetIndex = i + 1
-					break
-				}
-			}
-		} else {
-			for i, root := range t.root {
-				if root == target {
-					targetIndex = i + 1
-					break
-				}
-			}
+	targetParent, targetIndex := t.moveTargetPosition(target)
+	if err := t.validateMoveDestination(item, targetParent); err != nil {
+		return t.recordActionError(err)
+	}
+	oldID := t.sessionIDOf(item)
+	newID := t.sessionIDOfWithParent(item, targetParent)
+	rollback, err := t.prepareMoveMigration(item, targetParent, oldID, newID)
+	if err != nil {
+		return t.recordActionError(err)
+	}
+
+	snapshot := t.captureMoveSnapshot(item, targetParent)
+	t.applyMove(item, targetParent, targetIndex, snapshot.selectedItem)
+	if err := t.SaveState(); err != nil {
+		if !stateCommitWasApplied(err) {
+			return t.rollbackMove(item, snapshot, rollback, err)
 		}
+		t.finishMove(item, oldID, newID, err)
+		return err
 	}
-	if isDescendantOf(targetParent, item) {
-		return t.recordActionError(fmt.Errorf("cannot move an item into itself or its descendant"))
+	t.finishMove(item, oldID, newID, nil)
+	return nil
+}
+
+func (t *Tree) moveTargetPosition(target *Item) (*Item, int) {
+	if target.IsFolder {
+		return target, len(target.Children)
 	}
+	targetParent := target.parent
 	targetSiblings := t.root
 	if targetParent != nil {
 		targetSiblings = targetParent.Children
 	}
-	if err := validateSiblingIdentity(targetSiblings, canonicalSiblingKey(item.Name), item); err != nil {
-		return t.recordActionError(err)
-	}
-
-	oldID := t.sessionIDOf(item)
-	newID := t.sessionIDOfWithParent(item, targetParent)
-	var rollback func() error
-	if oldID != newID && t.onBeforeItemMoved != nil {
-		var err error
-		rollback, err = t.onBeforeItemMoved(item, targetParent)
-		if err != nil {
-			return t.recordActionError(err)
+	for index, sibling := range targetSiblings {
+		if sibling == target {
+			return targetParent, index + 1
 		}
 	}
+	return targetParent, 0
+}
 
-	oldRoot := append([]*Item(nil), t.root...)
+func (t *Tree) validateMoveDestination(item, targetParent *Item) error {
+	if isDescendantOf(targetParent, item) {
+		return fmt.Errorf("cannot move an item into itself or its descendant")
+	}
+	siblings := t.root
+	if targetParent != nil {
+		siblings = targetParent.Children
+	}
+	return validateSiblingIdentity(siblings, canonicalSiblingKey(item.Name), item)
+}
+
+func (t *Tree) prepareMoveMigration(item, targetParent *Item, oldID, newID string) (func() error, error) {
+	if oldID == newID || t.onBeforeItemMoved == nil {
+		return nil, nil
+	}
+	return t.onBeforeItemMoved(item, targetParent)
+}
+
+func (t *Tree) captureMoveSnapshot(item, targetParent *Item) moveSnapshot {
 	oldParent := item.parent
-	var oldParentChildren []*Item
-	if oldParent != nil {
-		oldParentChildren = append([]*Item(nil), oldParent.Children...)
+	snapshot := moveSnapshot{
+		root:          append([]*Item(nil), t.root...),
+		parent:        oldParent,
+		archived:      item.Archived,
+		selectedItem:  t.SelectedItem(),
+		selectedIndex: t.selected,
+		scroll:        t.scroll,
+		targetParent:  targetParent,
 	}
-	var oldTargetChildren []*Item
+	if oldParent != nil {
+		snapshot.parentChildren = append([]*Item(nil), oldParent.Children...)
+	}
 	if targetParent != nil && targetParent != oldParent {
-		oldTargetChildren = append([]*Item(nil), targetParent.Children...)
+		snapshot.targetChildren = append([]*Item(nil), targetParent.Children...)
 	}
-	oldArchived := item.Archived
-	oldSelectedItem := t.SelectedItem()
-	oldSelectedIndex := t.selected
-	oldScroll := t.scroll
+	return snapshot
+}
 
+func (t *Tree) applyMove(item, targetParent *Item, targetIndex int, selectedItem *Item) {
+	targetIndex = t.detachMoveSource(item, targetParent, targetIndex)
+	t.updateMovedFolderArchiveState(item, targetParent, targetIndex)
+	t.insertMovedItem(item, targetParent, targetIndex)
+	t.rebuildFlat()
+	t.reselectItem(selectedItem)
+}
+
+func (t *Tree) detachMoveSource(item, targetParent *Item, targetIndex int) int {
+	oldParent := item.parent
 	if oldParent != nil {
-		for i, child := range oldParent.Children {
+		for index, child := range oldParent.Children {
 			if child == item {
-				if oldParent == targetParent && i < targetIndex {
+				if oldParent == targetParent && index < targetIndex {
 					targetIndex--
 				}
-				oldParent.Children = append(oldParent.Children[:i], oldParent.Children[i+1:]...)
+				oldParent.Children = append(oldParent.Children[:index], oldParent.Children[index+1:]...)
 				break
 			}
 		}
-	} else {
-		for i, root := range t.root {
-			if root == item {
-				if targetParent == nil && i < targetIndex {
-					targetIndex--
-				}
-				t.root = append(t.root[:i], t.root[i+1:]...)
-				break
+		return targetIndex
+	}
+	for index, root := range t.root {
+		if root == item {
+			if targetParent == nil && index < targetIndex {
+				targetIndex--
 			}
+			t.root = append(t.root[:index], t.root[index+1:]...)
+			break
 		}
 	}
+	return targetIndex
+}
 
-	if item.IsFolder {
-		siblings := t.root
-		if targetParent != nil {
-			siblings = targetParent.Children
-		}
-		firstArchived := -1
-		for i, sibling := range siblings {
-			if sibling.IsFolder && sibling.Archived {
-				firstArchived = i
-				break
-			}
-		}
-		item.Archived = firstArchived >= 0 && targetIndex >= firstArchived
+func (t *Tree) updateMovedFolderArchiveState(item, targetParent *Item, targetIndex int) {
+	if !item.IsFolder {
+		return
 	}
+	siblings := t.root
+	if targetParent != nil {
+		siblings = targetParent.Children
+	}
+	firstArchived := -1
+	for index, sibling := range siblings {
+		if sibling.IsFolder && sibling.Archived {
+			firstArchived = index
+			break
+		}
+	}
+	item.Archived = firstArchived >= 0 && targetIndex >= firstArchived
+}
+
+func (t *Tree) insertMovedItem(item, targetParent *Item, targetIndex int) {
 	if targetIndex < 0 {
 		targetIndex = 0
 	}
@@ -1413,55 +1461,51 @@ func (t *Tree) MoveItemChecked(item, target *Item) error {
 		copy(targetParent.Children[targetIndex+1:], targetParent.Children[targetIndex:])
 		targetParent.Children[targetIndex] = item
 		item.parent = targetParent
-	} else {
-		if targetIndex > len(t.root) {
-			targetIndex = len(t.root)
-		}
-		t.root = append(t.root, nil)
-		copy(t.root[targetIndex+1:], t.root[targetIndex:])
-		t.root[targetIndex] = item
-		item.parent = nil
+		return
 	}
+	if targetIndex > len(t.root) {
+		targetIndex = len(t.root)
+	}
+	t.root = append(t.root, nil)
+	copy(t.root[targetIndex+1:], t.root[targetIndex:])
+	t.root[targetIndex] = item
+	item.parent = nil
+}
 
-	t.rebuildFlat()
-	t.reselectItem(oldSelectedItem)
-	if err := t.SaveState(); err != nil {
-		if stateCommitWasApplied(err) {
-			_ = t.recordActionError(err)
-			if oldID != newID && t.onItemMoved != nil {
-				t.onItemMoved(item, oldID, newID)
-			}
-			t.notifyItemsChanged()
-			return err
-		}
-		t.root = oldRoot
-		if oldParent != nil {
-			oldParent.Children = oldParentChildren
-		}
-		if targetParent != nil && targetParent != oldParent {
-			targetParent.Children = oldTargetChildren
-		}
-		item.parent = oldParent
-		item.Archived = oldArchived
-		t.rebuildFlat()
-		t.selected = oldSelectedIndex
-		t.scroll = oldScroll
-		if oldSelectedItem != nil {
-			t.reselectItem(oldSelectedItem)
-		}
-		if rollback != nil {
-			if rollbackErr := rollback(); rollbackErr != nil {
-				err = fmt.Errorf("%w; rollback moved data: %v", err, rollbackErr)
-			}
-		}
-		return t.recordActionError(err)
+func (t *Tree) rollbackMove(item *Item, snapshot moveSnapshot, migrationRollback func() error, err error) error {
+	t.root = snapshot.root
+	if snapshot.parent != nil {
+		snapshot.parent.Children = snapshot.parentChildren
 	}
-	t.lastActionError = nil
+	if snapshot.targetParent != nil && snapshot.targetParent != snapshot.parent {
+		snapshot.targetParent.Children = snapshot.targetChildren
+	}
+	item.parent = snapshot.parent
+	item.Archived = snapshot.archived
+	t.rebuildFlat()
+	t.selected = snapshot.selectedIndex
+	t.scroll = snapshot.scroll
+	if snapshot.selectedItem != nil {
+		t.reselectItem(snapshot.selectedItem)
+	}
+	if migrationRollback != nil {
+		if rollbackErr := migrationRollback(); rollbackErr != nil {
+			err = fmt.Errorf("%w; rollback moved data: %v", err, rollbackErr)
+		}
+	}
+	return t.recordActionError(err)
+}
+
+func (t *Tree) finishMove(item *Item, oldID, newID string, saveErr error) {
+	if saveErr != nil {
+		_ = t.recordActionError(saveErr)
+	} else {
+		t.lastActionError = nil
+	}
 	if oldID != newID && t.onItemMoved != nil {
 		t.onItemMoved(item, oldID, newID)
 	}
 	t.notifyItemsChanged()
-	return nil
 }
 
 func (t *Tree) moveItem(item, target *Item) {
@@ -1919,10 +1963,14 @@ func (t *Tree) SetTheme(id string) bool {
 	if !ok {
 		return false
 	}
-	if t.Theme != resolved.ID {
-		t.Theme = resolved.ID
-	}
+	previousTheme := t.Theme
+	t.Theme = resolved.ID
 	if err := t.SaveState(); err != nil {
+		if !stateCommitWasApplied(err) {
+			t.Theme = previousTheme
+			_ = t.recordActionError(err)
+			return true
+		}
 		_ = t.recordActionError(err)
 	} else {
 		t.lastActionError = nil

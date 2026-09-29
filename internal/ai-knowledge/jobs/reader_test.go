@@ -841,6 +841,69 @@ func TestKillPlanSignalsAllJobsBeforeWaitingForExit(t *testing.T) {
 	}
 }
 
+func TestKillPlanBatchSignalsAcrossSessionsBeforeSharedPolling(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	const firstSession = "test__batch-first"
+	const secondSession = "test__batch-second"
+	writeKillSessionRecord(t, firstSession, os.Getpid(), startedAt)
+	writeKillSessionRecord(t, secondSession, os.Getpid(), startedAt)
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	previousSleep := processExitSleepFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+		processExitSleepFn = previousSleep
+	})
+
+	signals := 0
+	processSignal = func(int, syscall.Signal) error {
+		signals++
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+	probes := 0
+	probesByPID := make(map[int]int)
+	processProbeFn = func(pid int) bool {
+		probes++
+		if signals != 2 {
+			t.Fatalf("process polling started after %d signals; both sessions must be signaled first", signals)
+		}
+		probesByPID[pid]++
+		return probesByPID[pid] == 1
+	}
+	sleeps := 0
+	processExitSleepFn = func(delay time.Duration) {
+		sleeps++
+		if delay != processExitProbeInterval {
+			t.Errorf("exit poll delay = %s, want %s", delay, processExitProbeInterval)
+		}
+	}
+
+	firstPlan, err := PrepareKillSessionForProfile("test", firstSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPlan, err := PrepareKillSessionForProfile("test", secondSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExecuteKillPlansForProfile("test", []KillPlanTarget{
+		{Plan: firstPlan, SessionID: firstSession},
+		{Plan: secondPlan, SessionID: secondSession},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if signals != 2 || probes != 3 || sleeps != 1 {
+		t.Fatalf("signals=%d probes=%d sleeps=%d, want 2/3/1", signals, probes, sleeps)
+	}
+}
+
 func TestKillPlanAttemptsAllCandidatesAfterSignalFailure(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("AI_PROFILE", "test")
@@ -1199,6 +1262,66 @@ func TestCachedReaderInvalidateRemovesOneSession(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("list calls after invalidation = %d, want 2", calls)
+	}
+}
+
+func TestCachedReaderIOOutsideMutexAndInvalidationWins(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	reader := NewCachedReader()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	firstCall := true
+	calls := 0
+	reader.listProfileFn = func(string, string) ([]Job, error) {
+		calls++
+		if firstCall {
+			firstCall = false
+			started <- struct{}{}
+			<-release
+		}
+		return []Job{{ID: fmt.Sprintf("job-%d", calls)}}, nil
+	}
+
+	const profile = "concurrent-profile"
+	const sessionID = "concurrent-profile__chat"
+	result := make(chan error, 1)
+	go func() {
+		_, err := reader.ListForProfile(profile, sessionID)
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not reach injected job I/O")
+	}
+
+	invalidated := make(chan struct{})
+	go func() {
+		reader.Invalidate(profile, sessionID)
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		release <- struct{}{}
+		t.Fatal("Invalidate blocked behind job listing")
+	}
+	release <- struct{}{}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("ListForProfile returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader did not finish after injected I/O was released")
+	}
+
+	jobs, err := reader.ListForProfile(profile, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || len(jobs) != 1 || jobs[0].ID != "job-2" {
+		t.Fatalf("post-invalidation jobs = %+v, list calls = %d", jobs, calls)
 	}
 }
 

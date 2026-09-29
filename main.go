@@ -606,6 +606,10 @@ func (a *App) createChatEmulator(sessionID string) *portalis.Emulator {
 	}
 
 	name := sessionID
+	if err := paths.EnsureSessionDir(a.profile, sessionID); err != nil {
+		a.recordInfrastructureWarning(fmt.Errorf("prepare session %s: %w", sessionID, err))
+		return nil
+	}
 	if item != nil {
 		name = item.Name
 	}
@@ -706,6 +710,10 @@ func (a *App) createFamiliarEmulator(sessionID string) (*portalis.Emulator, []st
 	cmd, args, env := a.piLaunch(sessionID)
 	if cmd == "" {
 		log.Printf("automata: no pi command for familiar %q (piAgentDir=%q, PI_CMD unset, just-pi not on PATH)", sessionID, a.piAgentDir)
+		return nil, nil
+	}
+	if err := paths.EnsureSessionDir(a.profile, sessionID); err != nil {
+		a.recordInfrastructureWarning(fmt.Errorf("prepare familiar session %s: %w", sessionID, err))
 		return nil, nil
 	}
 
@@ -1111,8 +1119,8 @@ func (a *App) syncSessionWatchers() []tea.Cmd {
 			continue
 		}
 		dir := paths.SessionDir(a.profile, key)
-		if err := paths.EnsurePrivateDir(dir); err != nil {
-			a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable for %s: create session directory: %w", key, err))
+		if err := paths.EnsureSessionDir(a.profile, key); err != nil {
+			a.recordInfrastructureWarning(fmt.Errorf("status live-update unavailable for %s: prepare session directory: %w", key, err))
 			continue
 		}
 		desired[key] = filepath.Clean(dir)
@@ -1354,8 +1362,38 @@ func disableMouse() tea.Cmd {
 	}
 }
 
+func openPrivateFile(path string, flags int) (*os.File, error) {
+	truncate := flags&os.O_TRUNC != 0
+	file, err := os.OpenFile(path, flags&^os.O_TRUNC, paths.PrivateFileMode)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(paths.PrivateFileMode); err != nil {
+		chmodErr := fmt.Errorf("set private permissions on %s: %w", path, err)
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, errors.Join(chmodErr, fmt.Errorf("close %s after chmod failure: %w", path, closeErr))
+		}
+		return nil, chmodErr
+	}
+	if truncate {
+		if err := file.Truncate(0); err != nil {
+			if closeErr := file.Close(); closeErr != nil {
+				return nil, errors.Join(fmt.Errorf("truncate %s: %w", path, err), fmt.Errorf("close %s after truncate failure: %w", path, closeErr))
+			}
+			return nil, fmt.Errorf("truncate %s: %w", path, err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			if closeErr := file.Close(); closeErr != nil {
+				return nil, errors.Join(fmt.Errorf("seek %s after truncate: %w", path, err), fmt.Errorf("close %s after seek failure: %w", path, closeErr))
+			}
+			return nil, fmt.Errorf("seek %s after truncate: %w", path, err)
+		}
+	}
+	return file, nil
+}
+
 func openDebugLog(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, paths.PrivateFileMode)
+	return openPrivateFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND)
 }
 
 func configureDebugLog(path string, logger *log.Logger) (*os.File, error) {
@@ -1500,7 +1538,7 @@ func main() {
 
 	var cpuProfileFile *os.File
 	if options.cpuProfile != "" {
-		cpuProfileFile, err = os.Create(options.cpuProfile)
+		cpuProfileFile, err = openPrivateFile(options.cpuProfile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "automata: cannot create CPU profile: %v\n", err)
 			return
@@ -1519,7 +1557,7 @@ func main() {
 
 	var memoryProfileFile *os.File
 	if options.memProfile != "" {
-		memoryProfileFile, err = os.Create(options.memProfile)
+		memoryProfileFile, err = openPrivateFile(options.memProfile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "automata: cannot create heap profile: %v\n", err)
 			return

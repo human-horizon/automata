@@ -401,14 +401,17 @@ var processProbeFn processProbe = func(pid int) bool {
 	return pid > 0 && syscall.Kill(pid, 0) == nil
 }
 
+var processExitSleepFn = time.Sleep
+
 const (
 	processExitProbeAttempts = 5
 	processExitProbeInterval = 20 * time.Millisecond
 )
 
 type signaledKillCandidate struct {
-	record   JobRecord
-	metaPath string
+	record    JobRecord
+	sessionID string
+	metaPath  string
 }
 
 func waitForSignaledProcesses(candidates []signaledKillCandidate) (exited, running []signaledKillCandidate) {
@@ -424,7 +427,7 @@ func waitForSignaledProcesses(candidates []signaledKillCandidate) (exited, runni
 		}
 		running = next
 		if len(running) > 0 && attempt+1 < processExitProbeAttempts {
-			time.Sleep(processExitProbeInterval)
+			processExitSleepFn(processExitProbeInterval)
 		}
 	}
 	return exited, running
@@ -452,6 +455,13 @@ type KillPlan struct {
 	profile    string
 	sessionID  string
 	candidates []killCandidate
+}
+
+// KillPlanTarget pairs a prepared session plan with the session directory that
+// should receive its cleanup after a rename or move has committed.
+type KillPlanTarget struct {
+	Plan      *KillPlan
+	SessionID string
 }
 
 func validateKillJobRecord(directoryName string, record JobRecord) error {
@@ -542,44 +552,65 @@ func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
 	if p == nil {
 		return nil
 	}
-	if err := paths.ValidateSessionID(sessionID); err != nil {
+	return ExecuteKillPlansForProfile(profile, []KillPlanTarget{{Plan: p, SessionID: sessionID}})
+}
+
+// ExecuteKillPlansForProfile sends SIGTERM to every verified target before
+// polling any process. All targets must have valid session IDs before the first
+// signal; process exit checks then share one bounded polling pass.
+func ExecuteKillPlansForProfile(profile string, targets []KillPlanTarget) error {
+	var failures []error
+	for _, target := range targets {
+		if target.Plan == nil {
+			continue
+		}
+		if err := paths.ValidateSessionID(target.SessionID); err != nil {
+			failures = append(failures, fmt.Errorf("invalid kill-plan target %q: %w", target.SessionID, err))
+		}
+	}
+	if err := errors.Join(failures...); err != nil {
 		return err
 	}
-	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
-	var failures []error
-	signaled := make([]signaledKillCandidate, 0, len(p.candidates))
-	for _, candidate := range p.candidates {
-		rec := candidate.record
-		jobDir := filepath.Join(jobsDir, candidate.jobDirName)
-		metaPath := filepath.Join(jobDir, "job.json")
 
-		identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
-		if identity == PIDUnknown {
-			failures = append(failures, fmt.Errorf("cannot verify process identity for job %s", rec.ID))
+	signaled := make([]signaledKillCandidate, 0)
+	for _, target := range targets {
+		if target.Plan == nil {
 			continue
 		}
-		if identity == PIDDead || identity == PIDDifferent {
-			if _, err := os.Stat(jobDir); os.IsNotExist(err) {
-				continue
-			} else if err != nil {
-				failures = append(failures, fmt.Errorf("stat stale job %s: %w", rec.ID, err))
+		jobsDir := filepath.Join(sessionDirForProfile(profile, target.SessionID), "jobs")
+		for _, candidate := range target.Plan.candidates {
+			rec := candidate.record
+			jobDir := filepath.Join(jobsDir, candidate.jobDirName)
+			metaPath := filepath.Join(jobDir, "job.json")
+
+			identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
+			if identity == PIDUnknown {
+				failures = append(failures, fmt.Errorf("cannot verify process identity for job %s in session %s", rec.ID, target.SessionID))
 				continue
 			}
-			if err := materializeStaleJob(jobDir, metaPath, &rec); err != nil {
-				failures = append(failures, fmt.Errorf("materialize stale job %s: %w", rec.ID, err))
+			if identity == PIDDead || identity == PIDDifferent {
+				if _, err := os.Stat(jobDir); os.IsNotExist(err) {
+					continue
+				} else if err != nil {
+					failures = append(failures, fmt.Errorf("stat stale job %s in session %s: %w", rec.ID, target.SessionID, err))
+					continue
+				}
+				if err := materializeStaleJob(jobDir, metaPath, &rec); err != nil {
+					failures = append(failures, fmt.Errorf("materialize stale job %s in session %s: %w", rec.ID, target.SessionID, err))
+				}
+				continue
 			}
-			continue
-		}
 
-		if _, err := os.Stat(jobDir); err != nil {
-			failures = append(failures, fmt.Errorf("locate job %s after session migration: %w", rec.ID, err))
-			continue
+			if _, err := os.Stat(jobDir); err != nil {
+				failures = append(failures, fmt.Errorf("locate job %s in session %s after migration: %w", rec.ID, target.SessionID, err))
+				continue
+			}
+			if err := processSignal(rec.PID, syscall.SIGTERM); err != nil {
+				failures = append(failures, fmt.Errorf("signal job %s in session %s: %w", rec.ID, target.SessionID, err))
+				continue
+			}
+			signaled = append(signaled, signaledKillCandidate{record: rec, sessionID: target.SessionID, metaPath: metaPath})
 		}
-		if err := processSignal(rec.PID, syscall.SIGTERM); err != nil {
-			failures = append(failures, fmt.Errorf("signal job %s: %w", rec.ID, err))
-			continue
-		}
-		signaled = append(signaled, signaledKillCandidate{record: rec, metaPath: metaPath})
 	}
 
 	exited, running := waitForSignaledProcesses(signaled)
@@ -589,11 +620,11 @@ func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
 		rec.Status = "exited"
 		rec.StoppedAt = stoppedAt
 		if err := writeJSON(candidate.metaPath, &rec); err != nil {
-			failures = append(failures, fmt.Errorf("write stopped job %s: %w", rec.ID, err))
+			failures = append(failures, fmt.Errorf("write stopped job %s in session %s: %w", rec.ID, candidate.sessionID, err))
 		}
 	}
 	for _, candidate := range running {
-		failures = append(failures, fmt.Errorf("job %s is still running after SIGTERM", candidate.record.ID))
+		failures = append(failures, fmt.Errorf("job %s in session %s is still running after SIGTERM", candidate.record.ID, candidate.sessionID))
 	}
 	return errors.Join(failures...)
 }
@@ -666,6 +697,7 @@ func readJSON(path string, v any) error {
 type CachedReader struct {
 	mu            sync.Mutex
 	cache         *cache.LRU[string, cachedJobsEntry]
+	generation    uint64
 	listProfileFn func(string, string) ([]Job, error)
 }
 
@@ -725,6 +757,7 @@ func (r *CachedReader) Invalidate(profile, sessionID string) {
 		return
 	}
 	r.mu.Lock()
+	r.generation++
 	r.cache.Delete(profile + "\x00" + sessionID)
 	r.mu.Unlock()
 }
@@ -738,19 +771,23 @@ func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) 
 	cacheKey := profile + "\x00" + sessionID
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if entry, ok := r.cache.Get(cacheKey); ok && entry.signature == signature && sourceBytes <= cache.MaxSourceMetadataBytes {
+		r.mu.Unlock()
 		return entry.jobs, nil
 	}
 	r.cache.Delete(cacheKey)
+	generation := r.generation
+	r.mu.Unlock()
 
 	jobs, err := r.listProfileFn(profile, sessionID)
 	if err != nil {
 		return jobs, err
 	}
-	if sourceBytes <= cache.MaxSourceMetadataBytes {
+
+	r.mu.Lock()
+	if generation == r.generation && sourceBytes <= cache.MaxSourceMetadataBytes {
 		r.cache.Add(cacheKey, cachedJobsEntry{jobs: jobs, signature: signature})
 	}
+	r.mu.Unlock()
 	return jobs, nil
 }

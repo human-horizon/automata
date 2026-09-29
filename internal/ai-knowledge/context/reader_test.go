@@ -255,6 +255,57 @@ func TestReadForProfileUsesExplicitCanonicalSessionDir(t *testing.T) {
 	}
 }
 
+func TestCachedReaderIOOutsideMutexAndInvalidationWins(t *testing.T) {
+	reader := NewCachedReader()
+	reader.signatureFn = func(string) (string, int64) { return "signature", 0 }
+	started := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	firstRead := true
+	reader.readFn = func(string, string) (*Data, error) {
+		if firstRead {
+			firstRead = false
+			started <- struct{}{}
+			<-release
+		}
+		return &Data{Plans: map[string][]PlanStep{}}, nil
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := reader.ReadForProfile("profile", "session")
+		readDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not reach injected I/O")
+	}
+
+	invalidateDone := make(chan struct{})
+	go func() {
+		reader.Invalidate("profile", "session")
+		close(invalidateDone)
+	}()
+	select {
+	case <-invalidateDone:
+	case <-time.After(time.Second):
+		release <- struct{}{}
+		t.Fatal("Invalidate blocked behind reader I/O")
+	}
+	release <- struct{}{}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("ReadForProfile returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader did not finish after injected I/O was released")
+	}
+	if _, cached := reader.cache.Get(contextCacheKey("profile", "session")); cached {
+		t.Fatal("read repopulated cache after concurrent invalidation")
+	}
+}
+
 func TestCachedReaderBoundsEntriesAndSkipsOversizedSource(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	reader := NewCachedReader()
