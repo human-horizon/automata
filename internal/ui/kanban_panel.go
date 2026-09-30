@@ -491,8 +491,6 @@ func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	//   y=3+ : column area
 	//
 	// X determines the column: each column is exactly colW wide.
-	colW := k.colWidth()
-
 	// Reset ALL hovers at the start — will be set below if mouse is on
 	// a specific element. This prevents hover from sticking when the
 	// mouse moves to a blank line or leaves the kanban area.
@@ -520,67 +518,57 @@ func (k *KanbanPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
-	colIdx := msg.X / colW
-	if colIdx < 0 || colIdx >= len(k.colPanels) {
+	return k.routeColumnMouse(msg)
+}
+
+func (k *KanbanPanel) routeColumnMouse(msg tea.MouseMsg) tea.Cmd {
+	columnWidth := k.colWidth()
+	columnIndex := msg.X / columnWidth
+	if columnIndex < 0 || columnIndex >= len(k.colPanels) {
 		return nil
 	}
-
-	// Click on a column makes it active.
 	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
-		k.activeCol = colIdx
+		k.activeCol = columnIndex
 	}
-
-	// Wheel events scroll the column under the cursor.
+	column := k.colPanels[columnIndex]
 	if msg.Button == tea.MouseButtonWheelUp {
-		cp := k.colPanels[colIdx]
-		if cp.scrollOffset > 0 {
-			cp.scrollOffset--
+		if column.scrollOffset > 0 {
+			column.scrollOffset--
 		}
 		return nil
 	}
 	if msg.Button == tea.MouseButtonWheelDown {
-		cp := k.colPanels[colIdx]
-		maxOff := cp.maxScrollOffset()
-		if cp.scrollOffset < maxOff {
-			cp.scrollOffset++
+		if column.scrollOffset < column.maxScrollOffset() {
+			column.scrollOffset++
 		}
 		return nil
 	}
 
-	cp := k.colPanels[colIdx]
-	colX := msg.X - colIdx*colW
-	// colY relative to column: columns start at y=3 in the kanban layout
-	// (y=0 blank, y=1 button, y=2 blank, y=3+ columns).
-	colY := msg.Y - 3
-
-	// Synthesize a mouse message for the target column so the existing
-	// colPanel.handleMouse / hitTest path runs unchanged.
-	relMsg := tea.MouseMsg{
-		X:      colX,
-		Y:      colY,
+	localMessage := tea.MouseMsg{
+		X:      msg.X - columnIndex*columnWidth,
+		Y:      msg.Y - 3,
 		Action: msg.Action,
 		Button: msg.Button,
 	}
-	// Clear hover on the other columns so only one column shows hover state.
-	for i, other := range k.colPanels {
-		if i != colIdx {
+	for index, other := range k.colPanels {
+		if index != columnIndex {
 			other.hoverRow = -1
 			other.hoverBtn = ""
 		}
 	}
-	return cp.Update(relMsg)
+	return column.Update(localMessage)
 }
 
 // colWidth returns the per-column width based on the current panel width.
 func (k *KanbanPanel) colWidth() int {
-	if k.width <= 0 {
+	return kanbanColumnWidth(k.width)
+}
+
+func kanbanColumnWidth(panelWidth int) int {
+	if panelWidth <= 0 {
 		return 20
 	}
-	w := k.width / len(kanbanColumns)
-	if w < 4 {
-		w = 4
-	}
-	return w
+	return max(4, panelWidth/len(kanbanColumns))
 }
 
 // pickerOffset returns the Y offset where the picker starts.
@@ -590,12 +578,15 @@ func (k *KanbanPanel) pickerOffset() int {
 
 // pickerHitTest returns the chat index at the given Y position, or -1.
 func (k *KanbanPanel) pickerHitTest(y int) int {
-	offset := k.pickerOffset()
-	idx := y - offset
-	if idx < 0 || idx >= len(k.chats) {
+	return pickerChatIndex(y, k.pickerOffset(), len(k.chats))
+}
+
+func pickerChatIndex(y, offset, chatCount int) int {
+	index := y - offset
+	if index < 0 || index >= chatCount {
 		return -1
 	}
-	return idx
+	return index
 }
 
 // View implements warp.Panel. Layout:
@@ -971,152 +962,145 @@ func (c *kanbanColPanel) View(width, height int) string {
 }
 
 // renderCard returns the card for the given task as a slice of pre-styled
-// lines including top/bottom borders. The card has 2 internal padding columns
-// (one on each side of the content), so the inner width is width-2.
+// lines including top/bottom borders.
 func (c *kanbanColPanel) renderCard(task kanban.Task, isHover bool) []string {
+	return newKanbanCardRenderer(c, task, isHover).render()
+}
+
+type kanbanCardRenderer struct {
+	column     *kanbanColPanel
+	task       kanban.Task
+	isHover    bool
+	innerWidth int
+	styles     kanbanStyles
+	border     lipgloss.Style
+	background lipgloss.Style
+}
+
+func newKanbanCardRenderer(column *kanbanColPanel, task kanban.Task, isHover bool) kanbanCardRenderer {
 	palette := apptheme.Default()
 	styles := newKanbanStyles(palette)
-	if c.parent != nil {
-		palette = c.parent.palette
-		styles = c.parent.styles()
+	if column.parent != nil {
+		palette = column.parent.palette
+		styles = column.parent.styles()
 	}
-	width := c.width
-	if width < 4 {
-		width = 4
-	}
-	inner := width - 2
-
-	borderStyle := styles.border
-	bgStyle := styles.background
+	width := max(4, column.width)
+	border := styles.border
+	background := styles.background
 	if isHover {
-		borderStyle = styles.border.Foreground(lipgloss.Color(palette.Border))
-		bgStyle = styles.backgroundHover
+		border = styles.border.Foreground(lipgloss.Color(palette.Border))
+		background = styles.backgroundHover
 	}
+	return kanbanCardRenderer{
+		column:     column,
+		task:       task,
+		isHover:    isHover,
+		innerWidth: width - 2,
+		styles:     styles,
+		border:     border,
+		background: background,
+	}
+}
 
-	// Top border
-	top := "┌" + strings.Repeat("─", inner) + "┐"
-	if isHover {
-		top = borderStyle.Render("┌" + strings.Repeat("─", inner) + "┐")
+func (r kanbanCardRenderer) render() []string {
+	lines := []string{r.horizontalBorder("┌", "┐"), r.renderTitle()}
+	if r.task.AssignedTo != "" {
+		lines = append(lines, r.renderAssigned())
 	}
+	if r.task.Substatus != "" {
+		lines = append(lines, r.renderSubstatus())
+	}
+	for _, item := range statusTransitions[r.task.Status] {
+		lines = append(lines, r.renderTransition(item))
+	}
+	lines = append(lines, r.renderPath(), r.horizontalBorder("└", "┘"))
+	return lines
+}
 
-	// Bottom border
-	bot := "└" + strings.Repeat("─", inner) + "┘"
-	if isHover {
-		bot = borderStyle.Render("└" + strings.Repeat("─", inner) + "┘")
+func (r kanbanCardRenderer) horizontalBorder(left, right string) string {
+	line := left + strings.Repeat("─", r.innerWidth) + right
+	if r.isHover {
+		return r.border.Render(line)
 	}
+	return line
+}
 
-	wrapLine := func(content string) string {
-		// Pad/truncate the visible content to fit inside the card.
-		if lipgloss.Width(content) > inner {
-			content = ansi.Truncate(content, inner, "…")
-		}
-		contentWidth := lipgloss.Width(content)
-		pad := strings.Repeat(" ", max(0, inner-contentWidth))
-		styled := bgStyle.Render(content + pad)
-		left := borderStyle.Render("│")
-		right := borderStyle.Render("│")
-		return left + styled + right
+func (r kanbanCardRenderer) wrapLine(content string) string {
+	if lipgloss.Width(content) > r.innerWidth {
+		content = ansi.Truncate(content, r.innerWidth, "…")
 	}
+	contentWidth := lipgloss.Width(content)
+	pad := strings.Repeat(" ", max(0, r.innerWidth-contentWidth))
+	styled := r.background.Render(content + pad)
+	left := r.border.Render("│")
+	right := r.border.Render("│")
+	return left + styled + right
+}
 
-	// Title line — reserves 2 chars at the right edge for the always-visible ×
-	titleMax := inner - 2
-	if titleMax < 1 {
-		titleMax = 1
-	}
-	title := task.Title
+func (r kanbanCardRenderer) renderTitle() string {
+	titleMax := max(1, r.innerWidth-2)
+	title := r.task.Title
 	if lipgloss.Width(title) > titleMax {
 		title = ansi.Truncate(title, titleMax, "")
 	}
 	titlePad := strings.Repeat(" ", titleMax-lipgloss.Width(title))
-	del := " ×"
-	if isHover && c.hoverBtn == "delete" {
-		del = styles.delete.Render(" ×")
+	deleteControl := " ×"
+	if r.isHover && r.column.hoverBtn == "delete" {
+		deleteControl = r.styles.delete.Render(" ×")
 	}
-	titleContent := title + titlePad + del
-	titleLine := wrapLine(titleContent)
+	return r.wrapLine(title + titlePad + deleteControl)
+}
 
-	lines := []string{top, titleLine}
-
-	// Assigned to (only if assigned)
-	if task.AssignedTo != "" {
-		name := task.AssignedTo
-		if c.parent != nil {
-			if n, ok := c.parent.sessionNames[task.AssignedTo]; ok {
-				name = n
-			}
+func (r kanbanCardRenderer) renderAssigned() string {
+	name := r.task.AssignedTo
+	if r.column.parent != nil {
+		if displayName, ok := r.column.parent.sessionNames[r.task.AssignedTo]; ok {
+			name = displayName
 		}
-		assigned := fmt.Sprintf("  👤 %s", name)
-		assignedWidth := max(0, inner-styles.assigned.GetHorizontalPadding())
-		if lipgloss.Width(assigned) > assignedWidth {
-			assigned = ansi.Truncate(assigned, assignedWidth, "")
-		}
-		styled := styles.assigned.Render(assigned)
-		// Pad to fill the inner width after styling.
-		visW := lipgloss.Width(styled)
-		if visW < inner {
-			styled += strings.Repeat(" ", inner-visW)
-		}
-		left := borderStyle.Render("│")
-		right := borderStyle.Render("│")
-		lines = append(lines, left+bgStyle.Render(strings.Repeat(" ", 0)+styled)+right)
 	}
-
-	// Substatus — shown only while the task is in progress and a substatus
-	// has been recorded. Mirrors the tree's status column.
-	if task.Substatus != "" {
-		sub := fmt.Sprintf("  ↳ %s", task.Substatus)
-		subWidth := max(0, inner-styles.substatus.GetHorizontalPadding())
-		if lipgloss.Width(sub) > subWidth {
-			sub = ansi.Truncate(sub, subWidth, "")
-		}
-		styled := styles.substatus.Render(sub)
-		visW := lipgloss.Width(styled)
-		pad := ""
-		if visW < inner {
-			pad = strings.Repeat(" ", inner-visW)
-		}
-		left := borderStyle.Render("│")
-		right := borderStyle.Render("│")
-		lines = append(lines, left+styled+bgStyle.Render(pad)+right)
+	assigned := fmt.Sprintf("  👤 %s", name)
+	assignedWidth := max(0, r.innerWidth-r.styles.assigned.GetHorizontalPadding())
+	if lipgloss.Width(assigned) > assignedWidth {
+		assigned = ansi.Truncate(assigned, assignedWidth, "")
 	}
-
-	// Transition buttons — always visible
-	for _, t := range statusTransitions[task.Status] {
-		btnText := " " + t.label + " "
-		btnStyle := styles.transit
-		if isHover && c.hoverBtn == t.next {
-			btnStyle = styles.transitHover
-		}
-		btn := btnStyle.Render(btnText)
-		visW := lipgloss.Width(btn)
-		pad := ""
-		if visW < inner {
-			pad = strings.Repeat(" ", inner-visW)
-		}
-		left := borderStyle.Render("│")
-		right := borderStyle.Render("│")
-		lines = append(lines, left+btn+bgStyle.Render(pad)+right)
+	styled := r.styles.assigned.Render(assigned)
+	if width := lipgloss.Width(styled); width < r.innerWidth {
+		styled += strings.Repeat(" ", r.innerWidth-width)
 	}
+	return r.border.Render("│") + r.background.Render(styled) + r.border.Render("│")
+}
 
-	// File link
+func (r kanbanCardRenderer) renderSubstatus() string {
+	substatus := fmt.Sprintf("  ↳ %s", r.task.Substatus)
+	substatusWidth := max(0, r.innerWidth-r.styles.substatus.GetHorizontalPadding())
+	if lipgloss.Width(substatus) > substatusWidth {
+		substatus = ansi.Truncate(substatus, substatusWidth, "")
+	}
+	styled := r.styles.substatus.Render(substatus)
+	pad := strings.Repeat(" ", max(0, r.innerWidth-lipgloss.Width(styled)))
+	return r.border.Render("│") + styled + r.background.Render(pad) + r.border.Render("│")
+}
+
+func (r kanbanCardRenderer) renderTransition(item transition) string {
+	buttonStyle := r.styles.transit
+	if r.isHover && r.column.hoverBtn == item.next {
+		buttonStyle = r.styles.transitHover
+	}
+	button := buttonStyle.Render(" " + item.label + " ")
+	pad := strings.Repeat(" ", max(0, r.innerWidth-lipgloss.Width(button)))
+	return r.border.Render("│") + button + r.background.Render(pad) + r.border.Render("│")
+}
+
+func (r kanbanCardRenderer) renderPath() string {
 	label := " Файл задачи"
-	href := "file://" + task.Path
+	href := "file://" + r.task.Path
 	hyperlinked := fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", href, label)
-	link := styles.cardPath.Render(hyperlinked)
-	if lipgloss.Width(link) > inner {
-		link = ansi.Truncate(link, inner, "")
+	link := r.styles.cardPath.Render(hyperlinked)
+	if lipgloss.Width(link) > r.innerWidth {
+		link = ansi.Truncate(link, r.innerWidth, "")
 	}
-	visW := lipgloss.Width(link)
-	pad := ""
-	if visW < inner {
-		pad = strings.Repeat(" ", inner-visW)
-	}
-	left := borderStyle.Render("│")
-	right := borderStyle.Render("│")
-	lines = append(lines, left+link+bgStyle.Render(pad)+right)
-
-	lines = append(lines, bot)
-	return lines
+	pad := strings.Repeat(" ", max(0, r.innerWidth-lipgloss.Width(link)))
+	return r.border.Render("│") + link + r.background.Render(pad) + r.border.Render("│")
 }
 
 func (c *kanbanColPanel) Update(msg tea.Msg) tea.Cmd {
@@ -1134,115 +1118,125 @@ func (c *kanbanColPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	switch msg.Button {
 	case tea.MouseButtonLeft:
 		if msg.Action == tea.MouseActionPress {
-			row, btn := c.hitTest(msg.Y, msg.X)
+			row, button := c.hitTest(msg.Y, msg.X)
 			if row >= 0 && row < len(c.tasks) {
-				switch btn {
-				case "delete":
-					var err error
-					if c.parent == nil {
-						err = os.Remove(c.tasks[row].Path)
-					} else {
-						err = c.parent.deleteTask(c.tasks[row])
-					}
-					if err != nil {
-						if c.parent != nil {
-							c.parent.assignmentErr = err.Error()
-						}
-						return nil
-					}
-					if c.parent != nil {
-						c.parent.assignmentErr = ""
-						c.parent.reload()
-					}
-				case "reassign":
-					// Open chat picker for reassignment
-					if c.parent != nil {
-						task := c.tasks[row]
-						c.parent.pendingTask = &task
-						c.parent.pickerHover = -1
-					}
-				case "pending":
-					// Open chat picker
-					if c.parent != nil {
-						task := c.tasks[row]
-						c.parent.pendingTask = &task
-						c.parent.pickerHover = -1
-					}
-				case "todo", "progress", "done":
-					task, taskSnapshot, err := readTaskFileSnapshot(c.tasks[row].Path)
-					if err != nil {
-						if c.parent != nil {
-							c.parent.assignmentErr = fmt.Sprintf("read task: %v", err)
-						}
-						return nil
-					}
-
-					var statusPath string
-					var statusBefore statusSnapshot
-					statusChanged := false
-					committedWarnings := make([]string, 0, 2)
-					if c.parent != nil && btn == "todo" && task.AssignedTo != "" {
-						statusPath = filepath.Join(paths.SessionDir(c.parent.profile, task.AssignedTo), "status.json")
-						statusBefore, err = readStatusSnapshot(statusPath)
-						if err == nil {
-							err = writeRemovedChatTaskStatus(c.parent.profile, task.AssignedTo, task.Title)
-						}
-						if err != nil && !atomicfile.IsCommitted(err) {
-							c.parent.assignmentErr = fmt.Sprintf("notify task removal: %v", err)
-							return nil
-						}
-						if err != nil {
-							committedWarnings = append(committedWarnings, err.Error())
-						}
-						statusChanged = true
-					}
-
-					if btn == "todo" {
-						_, _, err = assignKanbanTaskStatus(task.Path, "", btn)
-					} else {
-						_, err = updateKanbanTaskStatus(task.Path, btn)
-					}
-					if err != nil && !atomicfile.IsCommitted(err) {
-						rollbackErrors := []error{fmt.Errorf("update task: %w", err)}
-						if restoreErr := taskSnapshot.restore(); restoreErr != nil {
-							rollbackErrors = append(rollbackErrors, fmt.Errorf("restore Kanban task: %w", restoreErr))
-						}
-						if statusChanged {
-							if restoreErr := restoreStatusSnapshot(statusPath, statusBefore); restoreErr != nil {
-								rollbackErrors = append(rollbackErrors, fmt.Errorf("restore chat status: %w", restoreErr))
-							}
-						}
-						if c.parent != nil {
-							c.parent.assignmentErr = errors.Join(rollbackErrors...).Error()
-						}
-						return nil
-					}
-					if err != nil {
-						committedWarnings = append(committedWarnings, err.Error())
-					}
-					if c.parent != nil {
-						c.parent.assignmentErr = ""
-						c.parent.actionWarning = strings.Join(committedWarnings, "; ")
-						c.parent.reload()
-					}
-				default:
-					// Click on card — open file.
-					if err := childproc.StartAndReap(exec.Command("zed", c.tasks[row].Path)); err != nil {
-						if c.parent != nil {
-							c.parent.assignmentErr = fmt.Sprintf("open task file: %v", err)
-						}
-					} else if c.parent != nil {
-						c.parent.assignmentErr = ""
-					}
-				}
+				c.handleTaskClick(row, button)
 			}
 		}
 	case tea.MouseButtonNone:
-		row, btn := c.hitTest(msg.Y, msg.X)
-		c.hoverRow = row
-		c.hoverBtn = btn
+		c.hoverRow, c.hoverBtn = c.hitTest(msg.Y, msg.X)
 	}
 	return nil
+}
+
+func (c *kanbanColPanel) handleTaskClick(row int, button string) {
+	task := c.tasks[row]
+	switch button {
+	case "delete":
+		c.deleteTask(task)
+	case "reassign", "pending":
+		c.openTaskPicker(task)
+	case "todo", "progress", "done":
+		c.transitionTaskStatus(task, button)
+	default:
+		c.openTaskFile(task)
+	}
+}
+
+func (c *kanbanColPanel) deleteTask(task kanban.Task) {
+	var err error
+	if c.parent == nil {
+		err = os.Remove(task.Path)
+	} else {
+		err = c.parent.deleteTask(task)
+	}
+	if err != nil {
+		if c.parent != nil {
+			c.parent.assignmentErr = err.Error()
+		}
+		return
+	}
+	if c.parent != nil {
+		c.parent.assignmentErr = ""
+		c.parent.reload()
+	}
+}
+
+func (c *kanbanColPanel) openTaskPicker(task kanban.Task) {
+	if c.parent == nil {
+		return
+	}
+	c.parent.pendingTask = &task
+	c.parent.pickerHover = -1
+}
+
+func (c *kanbanColPanel) transitionTaskStatus(task kanban.Task, nextStatus string) {
+	updatedTask, taskSnapshot, err := readTaskFileSnapshot(task.Path)
+	if err != nil {
+		if c.parent != nil {
+			c.parent.assignmentErr = fmt.Sprintf("read task: %v", err)
+		}
+		return
+	}
+
+	var statusPath string
+	var statusBefore statusSnapshot
+	statusChanged := false
+	committedWarnings := make([]string, 0, 2)
+	if c.parent != nil && nextStatus == "todo" && updatedTask.AssignedTo != "" {
+		statusPath = filepath.Join(paths.SessionDir(c.parent.profile, updatedTask.AssignedTo), "status.json")
+		statusBefore, err = readStatusSnapshot(statusPath)
+		if err == nil {
+			err = writeRemovedChatTaskStatus(c.parent.profile, updatedTask.AssignedTo, updatedTask.Title)
+		}
+		if err != nil && !atomicfile.IsCommitted(err) {
+			c.parent.assignmentErr = fmt.Sprintf("notify task removal: %v", err)
+			return
+		}
+		if err != nil {
+			committedWarnings = append(committedWarnings, err.Error())
+		}
+		statusChanged = true
+	}
+
+	if nextStatus == "todo" {
+		_, _, err = assignKanbanTaskStatus(updatedTask.Path, "", nextStatus)
+	} else {
+		_, err = updateKanbanTaskStatus(updatedTask.Path, nextStatus)
+	}
+	if err != nil && !atomicfile.IsCommitted(err) {
+		rollbackErrors := []error{fmt.Errorf("update task: %w", err)}
+		if restoreErr := taskSnapshot.restore(); restoreErr != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore Kanban task: %w", restoreErr))
+		}
+		if statusChanged {
+			if restoreErr := restoreStatusSnapshot(statusPath, statusBefore); restoreErr != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restore chat status: %w", restoreErr))
+			}
+		}
+		if c.parent != nil {
+			c.parent.assignmentErr = errors.Join(rollbackErrors...).Error()
+		}
+		return
+	}
+	if err != nil {
+		committedWarnings = append(committedWarnings, err.Error())
+	}
+	if c.parent != nil {
+		c.parent.assignmentErr = ""
+		c.parent.actionWarning = strings.Join(committedWarnings, "; ")
+		c.parent.reload()
+	}
+}
+
+func (c *kanbanColPanel) openTaskFile(task kanban.Task) {
+	if err := childproc.StartAndReap(exec.Command("zed", task.Path)); err != nil {
+		if c.parent != nil {
+			c.parent.assignmentErr = fmt.Sprintf("open task file: %v", err)
+		}
+	} else if c.parent != nil {
+		c.parent.assignmentErr = ""
+	}
 }
 
 // cardContentLines returns the number of content lines inside a card (title
@@ -1271,14 +1265,18 @@ func cardTotalLines(task kanban.Task) int {
 // It is the number of lines that can be scrolled past before the last
 // task is fully visible at the bottom of the column.
 func (c *kanbanColPanel) maxScrollOffset() int {
+	return kanbanMaxScrollOffset(c.tasks, c.height)
+}
+
+func kanbanMaxScrollOffset(tasks []kanban.Task, height int) int {
 	total := 1 // header
-	for _, task := range c.tasks {
+	for _, task := range tasks {
 		total += cardTotalLines(task) + 1 // +1 for gap after card
 	}
-	if total <= c.height {
+	if total <= height {
 		return 0
 	}
-	return total - c.height
+	return total - height
 }
 
 // hitTest returns (taskIndex, button) for the given Y, X position.
@@ -1292,15 +1290,19 @@ func (c *kanbanColPanel) maxScrollOffset() int {
 //	y=3+: assigned / transitions / file / bottom border
 //	... then a 1-line gap before the next card
 func (c *kanbanColPanel) hitTest(y, x int) (int, string) {
+	return hitTestKanbanColumn(c.tasks, c.width, c.scrollOffset, y, x)
+}
+
+func hitTestKanbanColumn(tasks []kanban.Task, width, scrollOffset, y, x int) (int, string) {
 	if y < 1 {
 		return -1, ""
 	}
 	// Convert visible Y to actual Y by adding scrollOffset.
 	// Header (y=0) is always visible and not affected by scroll.
-	actualY := y + c.scrollOffset
+	actualY := y + scrollOffset
 
 	line := 1 // first content line — corresponds to the top border of card 0
-	for i, task := range c.tasks {
+	for i, task := range tasks {
 		// Top border
 		if actualY == line {
 			return i, "" // borders are visual only; clicks fall through to body
@@ -1309,7 +1311,7 @@ func (c *kanbanColPanel) hitTest(y, x int) (int, string) {
 
 		// Title line — detect × click on the right edge
 		if actualY == line {
-			if x >= c.width-3 && x < c.width-1 {
+			if x >= width-3 && x < width-1 {
 				return i, "delete"
 			}
 			return i, ""
@@ -1354,7 +1356,7 @@ func (c *kanbanColPanel) hitTest(y, x int) (int, string) {
 		line++
 
 		// Gap between cards (1 blank line), except after the last card
-		if i < len(c.tasks)-1 {
+		if i < len(tasks)-1 {
 			if actualY == line {
 				return -1, ""
 			}

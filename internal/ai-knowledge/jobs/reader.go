@@ -383,7 +383,7 @@ func RunningCountForProfile(profile, sessionID string) (int, error) {
 }
 
 // processSignal is injectable so cleanup tests can verify signal safety without
-// sending SIGTERM to a real process.
+// sending signals to a real process.
 var processSignal = func(pid int, signal syscall.Signal) error {
 	process, err := os.FindProcess(pid)
 	if err != nil {
@@ -393,27 +393,39 @@ var processSignal = func(pid int, signal syscall.Signal) error {
 }
 
 // processProbe is injectable so KillSessionForProfile can distinguish a
-// delivered SIGTERM from a confirmed process exit without making tests sleep
-// on real processes.
+// delivered signal from a confirmed process exit without making tests sleep on
+// real processes. The default only treats ESRCH as proof that a PID is absent.
 type processProbe func(pid int) bool
 
 var processProbeFn processProbe = func(pid int) bool {
-	return pid > 0 && syscall.Kill(pid, 0) == nil
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || !errors.Is(err, syscall.ESRCH)
 }
 
+var processExitSleepFn = time.Sleep
+
 const (
-	processExitProbeAttempts = 5
 	processExitProbeInterval = 20 * time.Millisecond
+	processExitGracePeriod   = 2 * time.Second
+	processKillWaitPeriod    = 1 * time.Second
 )
 
 type signaledKillCandidate struct {
-	record   JobRecord
-	metaPath string
+	record    JobRecord
+	sessionID string
+	metaPath  string
 }
 
-func waitForSignaledProcesses(candidates []signaledKillCandidate) (exited, running []signaledKillCandidate) {
+func waitForSignaledProcesses(candidates []signaledKillCandidate, wait time.Duration) (exited, running []signaledKillCandidate) {
 	running = append([]signaledKillCandidate(nil), candidates...)
-	for attempt := 0; attempt < processExitProbeAttempts && len(running) > 0; attempt++ {
+	attempts := int(wait/processExitProbeInterval) + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	for attempt := 0; attempt < attempts && len(running) > 0; attempt++ {
 		next := make([]signaledKillCandidate, 0, len(running))
 		for _, candidate := range running {
 			if !processProbeFn(candidate.record.PID) {
@@ -423,8 +435,8 @@ func waitForSignaledProcesses(candidates []signaledKillCandidate) (exited, runni
 			next = append(next, candidate)
 		}
 		running = next
-		if len(running) > 0 && attempt+1 < processExitProbeAttempts {
-			time.Sleep(processExitProbeInterval)
+		if len(running) > 0 && attempt+1 < attempts {
+			processExitSleepFn(processExitProbeInterval)
 		}
 	}
 	return exited, running
@@ -452,6 +464,13 @@ type KillPlan struct {
 	profile    string
 	sessionID  string
 	candidates []killCandidate
+}
+
+// KillPlanTarget pairs a prepared session plan with the session directory that
+// should receive its cleanup after a rename or move has committed.
+type KillPlanTarget struct {
+	Plan      *KillPlan
+	SessionID string
 }
 
 func validateKillJobRecord(directoryName string, record JobRecord) error {
@@ -542,58 +561,109 @@ func (p *KillPlan) ExecuteForProfile(profile, sessionID string) error {
 	if p == nil {
 		return nil
 	}
-	if err := paths.ValidateSessionID(sessionID); err != nil {
+	return ExecuteKillPlansForProfile(profile, []KillPlanTarget{{Plan: p, SessionID: sessionID}})
+}
+
+// ExecuteKillPlansForProfile sends SIGTERM to every verified target before
+// polling any process. Surviving targets receive SIGKILL only after their PID
+// identities are revalidated. All targets must have valid session IDs before
+// the first signal, and each signal stage uses one shared bounded polling pass.
+func ExecuteKillPlansForProfile(profile string, targets []KillPlanTarget) error {
+	var failures []error
+	for _, target := range targets {
+		if target.Plan == nil {
+			continue
+		}
+		if err := paths.ValidateSessionID(target.SessionID); err != nil {
+			failures = append(failures, fmt.Errorf("invalid kill-plan target %q: %w", target.SessionID, err))
+		}
+	}
+	if err := errors.Join(failures...); err != nil {
 		return err
 	}
-	jobsDir := filepath.Join(sessionDirForProfile(profile, sessionID), "jobs")
-	var failures []error
-	signaled := make([]signaledKillCandidate, 0, len(p.candidates))
-	for _, candidate := range p.candidates {
-		rec := candidate.record
-		jobDir := filepath.Join(jobsDir, candidate.jobDirName)
-		metaPath := filepath.Join(jobDir, "job.json")
 
-		identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
-		if identity == PIDUnknown {
-			failures = append(failures, fmt.Errorf("cannot verify process identity for job %s", rec.ID))
+	signaled := make([]signaledKillCandidate, 0)
+	for _, target := range targets {
+		if target.Plan == nil {
 			continue
 		}
-		if identity == PIDDead || identity == PIDDifferent {
-			if _, err := os.Stat(jobDir); os.IsNotExist(err) {
-				continue
-			} else if err != nil {
-				failures = append(failures, fmt.Errorf("stat stale job %s: %w", rec.ID, err))
+		jobsDir := filepath.Join(sessionDirForProfile(profile, target.SessionID), "jobs")
+		for _, candidate := range target.Plan.candidates {
+			rec := candidate.record
+			jobDir := filepath.Join(jobsDir, candidate.jobDirName)
+			metaPath := filepath.Join(jobDir, "job.json")
+
+			identity := inspectPIDIdentity(rec.PID, rec.StartedAt)
+			if identity == PIDUnknown {
+				failures = append(failures, fmt.Errorf("cannot verify process identity for job %s in session %s", rec.ID, target.SessionID))
 				continue
 			}
-			if err := materializeStaleJob(jobDir, metaPath, &rec); err != nil {
-				failures = append(failures, fmt.Errorf("materialize stale job %s: %w", rec.ID, err))
+			if identity == PIDDead || identity == PIDDifferent {
+				if _, err := os.Stat(jobDir); os.IsNotExist(err) {
+					continue
+				} else if err != nil {
+					failures = append(failures, fmt.Errorf("stat stale job %s in session %s: %w", rec.ID, target.SessionID, err))
+					continue
+				}
+				if err := materializeStaleJob(jobDir, metaPath, &rec); err != nil {
+					failures = append(failures, fmt.Errorf("materialize stale job %s in session %s: %w", rec.ID, target.SessionID, err))
+				}
+				continue
 			}
-			continue
-		}
 
-		if _, err := os.Stat(jobDir); err != nil {
-			failures = append(failures, fmt.Errorf("locate job %s after session migration: %w", rec.ID, err))
-			continue
+			if _, err := os.Stat(jobDir); err != nil {
+				failures = append(failures, fmt.Errorf("locate job %s in session %s after migration: %w", rec.ID, target.SessionID, err))
+				continue
+			}
+			if err := processSignal(rec.PID, syscall.SIGTERM); err != nil {
+				failures = append(failures, fmt.Errorf("signal job %s in session %s: %w", rec.ID, target.SessionID, err))
+				continue
+			}
+			signaled = append(signaled, signaledKillCandidate{record: rec, sessionID: target.SessionID, metaPath: metaPath})
 		}
-		if err := processSignal(rec.PID, syscall.SIGTERM); err != nil {
-			failures = append(failures, fmt.Errorf("signal job %s: %w", rec.ID, err))
-			continue
-		}
-		signaled = append(signaled, signaledKillCandidate{record: rec, metaPath: metaPath})
 	}
 
-	exited, running := waitForSignaledProcesses(signaled)
+	termExited, termRunning := waitForSignaledProcesses(signaled, processExitGracePeriod)
+	exited := append([]signaledKillCandidate(nil), termExited...)
+	killSignaled := make([]signaledKillCandidate, 0, len(termRunning))
+	for _, candidate := range termRunning {
+		rec := candidate.record
+		switch identity := inspectPIDIdentity(rec.PID, rec.StartedAt); identity {
+		case PIDDead, PIDDifferent:
+			exited = append(exited, candidate)
+		case PIDUnknown:
+			failures = append(failures, fmt.Errorf("cannot verify process identity for job %s in session %s before SIGKILL", rec.ID, candidate.sessionID))
+		case PIDSame:
+			if err := processSignal(rec.PID, syscall.SIGKILL); err != nil {
+				failures = append(failures, fmt.Errorf("signal job %s in session %s with SIGKILL: %w", rec.ID, candidate.sessionID, err))
+				continue
+			}
+			killSignaled = append(killSignaled, candidate)
+		}
+	}
+
+	killExited, killRunning := waitForSignaledProcesses(killSignaled, processKillWaitPeriod)
+	exited = append(exited, killExited...)
+	for _, candidate := range killRunning {
+		rec := candidate.record
+		switch identity := inspectPIDIdentity(rec.PID, rec.StartedAt); identity {
+		case PIDDead, PIDDifferent:
+			exited = append(exited, candidate)
+		case PIDUnknown:
+			failures = append(failures, fmt.Errorf("cannot verify process identity for job %s in session %s after SIGKILL", rec.ID, candidate.sessionID))
+		case PIDSame:
+			failures = append(failures, fmt.Errorf("job %s in session %s is still running after SIGKILL", rec.ID, candidate.sessionID))
+		}
+	}
+
 	stoppedAt := time.Now().UTC().Format(time.RFC3339)
 	for _, candidate := range exited {
 		rec := candidate.record
 		rec.Status = "exited"
 		rec.StoppedAt = stoppedAt
 		if err := writeJSON(candidate.metaPath, &rec); err != nil {
-			failures = append(failures, fmt.Errorf("write stopped job %s: %w", rec.ID, err))
+			failures = append(failures, fmt.Errorf("write stopped job %s in session %s: %w", rec.ID, candidate.sessionID, err))
 		}
-	}
-	for _, candidate := range running {
-		failures = append(failures, fmt.Errorf("job %s is still running after SIGTERM", candidate.record.ID))
 	}
 	return errors.Join(failures...)
 }
@@ -666,6 +736,7 @@ func readJSON(path string, v any) error {
 type CachedReader struct {
 	mu            sync.Mutex
 	cache         *cache.LRU[string, cachedJobsEntry]
+	generation    uint64
 	listProfileFn func(string, string) ([]Job, error)
 }
 
@@ -725,6 +796,7 @@ func (r *CachedReader) Invalidate(profile, sessionID string) {
 		return
 	}
 	r.mu.Lock()
+	r.generation++
 	r.cache.Delete(profile + "\x00" + sessionID)
 	r.mu.Unlock()
 }
@@ -738,19 +810,23 @@ func (r *CachedReader) ListForProfile(profile, sessionID string) ([]Job, error) 
 	cacheKey := profile + "\x00" + sessionID
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if entry, ok := r.cache.Get(cacheKey); ok && entry.signature == signature && sourceBytes <= cache.MaxSourceMetadataBytes {
+		r.mu.Unlock()
 		return entry.jobs, nil
 	}
 	r.cache.Delete(cacheKey)
+	generation := r.generation
+	r.mu.Unlock()
 
 	jobs, err := r.listProfileFn(profile, sessionID)
 	if err != nil {
 		return jobs, err
 	}
-	if sourceBytes <= cache.MaxSourceMetadataBytes {
+
+	r.mu.Lock()
+	if generation == r.generation && sourceBytes <= cache.MaxSourceMetadataBytes {
 		r.cache.Add(cacheKey, cachedJobsEntry{jobs: jobs, signature: signature})
 	}
+	r.mu.Unlock()
 	return jobs, nil
 }

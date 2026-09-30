@@ -206,8 +206,11 @@ func ReadForProfile(profile, sessionID string) (*Data, error) {
 // CachedReader caches session context (plans/status/settings) by the max mtime
 // of the relevant files. Safe for concurrent use (single reader locks).
 type CachedReader struct {
-	mu    sync.Mutex
-	cache *cache.LRU[string, cachedCtxEntry]
+	mu          sync.Mutex
+	cache       *cache.LRU[string, cachedCtxEntry]
+	generation  uint64
+	signatureFn func(string) (string, int64)
+	readFn      func(string, string) (*Data, error)
 }
 
 type cachedCtxEntry struct {
@@ -219,7 +222,11 @@ var contextFiles = []string{"plans.json", "status.json", "settings.json"}
 
 // NewCachedReader creates a context reader with file-signature caching.
 func NewCachedReader() *CachedReader {
-	return &CachedReader{cache: cache.NewLRU[string, cachedCtxEntry](cache.ReaderCacheCapacity)}
+	return &CachedReader{
+		cache:       cache.NewLRU[string, cachedCtxEntry](cache.ReaderCacheCapacity),
+		signatureFn: contextFileSignature,
+		readFn:      readForProfile,
+	}
 }
 
 func contextCacheKey(profile, sessionID string) string {
@@ -259,6 +266,7 @@ func (r *CachedReader) Invalidate(profile, sessionID string) {
 		return
 	}
 	r.mu.Lock()
+	r.generation++
 	r.cache.Delete(contextCacheKey(profile, sessionID))
 	r.mu.Unlock()
 }
@@ -270,22 +278,26 @@ func (r *CachedReader) ReadForProfile(profile, sessionID string) (*Data, error) 
 	}
 	dir := sessionDirForProfile(profile, sessionID)
 	cacheKey := contextCacheKey(profile, sessionID)
-	signature, sourceBytes := contextFileSignature(dir)
+	signature, sourceBytes := r.signatureFn(dir)
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if entry, ok := r.cache.Get(cacheKey); ok && entry.signature == signature && sourceBytes <= cache.MaxSourceMetadataBytes {
+		r.mu.Unlock()
 		return entry.data, nil
 	}
 	r.cache.Delete(cacheKey)
+	generation := r.generation
+	r.mu.Unlock()
 
-	data, err := readForProfile(profile, sessionID)
+	data, err := r.readFn(profile, sessionID)
 	if err != nil {
 		return data, err
 	}
-	if sourceBytes <= cache.MaxSourceMetadataBytes {
+
+	r.mu.Lock()
+	if generation == r.generation && sourceBytes <= cache.MaxSourceMetadataBytes {
 		r.cache.Add(cacheKey, cachedCtxEntry{data: data, signature: signature})
 	}
+	r.mu.Unlock()
 	return data, nil
 }

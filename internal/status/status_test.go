@@ -261,6 +261,114 @@ func TestCachedReaderBoundsSessionEntries(t *testing.T) {
 	}
 }
 
+func TestReadStatusRecordRetriesTransientTruncation(t *testing.T) {
+	reads := 0
+	delays := 0
+	record, err := readStatusRecord("status.json", func(string) ([]byte, error) {
+		reads++
+		if reads == 1 {
+			return []byte(`{"action":"`), nil
+		}
+		return []byte(`{"action":"read"}`), nil
+	}, func(delay time.Duration) {
+		delays++
+		if delay != statusReadRetryDelay {
+			t.Errorf("retry delay = %s, want %s", delay, statusReadRetryDelay)
+		}
+	})
+	if err != nil {
+		t.Fatalf("readStatusRecord returned error: %v", err)
+	}
+	if record.Action != "read" || reads != 2 || delays != 1 {
+		t.Fatalf("record=%+v reads=%d delays=%d", record, reads, delays)
+	}
+}
+
+func TestReadStatusRecordKeepsPersistentCorruptionVisible(t *testing.T) {
+	reads := 0
+	delays := 0
+	_, err := readStatusRecord("status.json", func(string) ([]byte, error) {
+		reads++
+		return []byte("{"), nil
+	}, func(time.Duration) { delays++ })
+	if err == nil {
+		t.Fatal("persistent malformed status returned success")
+	}
+	if reads != statusReadAttempts || delays != statusReadAttempts-1 {
+		t.Fatalf("reads=%d delays=%d, want %d reads and %d delays", reads, delays, statusReadAttempts, statusReadAttempts-1)
+	}
+}
+
+func TestCachedReaderIOOutsideMutexAndInvalidationWins(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "io-outside-mutex"
+	dir := paths.SessionDir("", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(dir, "status.json")
+	if err := os.WriteFile(statusPath, []byte(`{"action":"read"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := NewCachedReader("")
+	originalRead := reader.readFile
+	started := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	firstRead := true
+	readCalls := 0
+	reader.readFile = func(path string) ([]byte, error) {
+		readCalls++
+		if firstRead {
+			firstRead = false
+			started <- struct{}{}
+			<-release
+		}
+		return originalRead(path)
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := reader.Read(sessionID)
+		readDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not reach injected file read")
+	}
+
+	invalidated := make(chan struct{})
+	go func() {
+		reader.Invalidate(sessionID)
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		release <- struct{}{}
+		t.Fatal("Invalidate blocked behind status file read")
+	}
+	release <- struct{}{}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("Read returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader did not finish after injected file read was released")
+	}
+	if _, cached := reader.cache.Get(sessionID); cached {
+		t.Fatal("read repopulated cache after concurrent invalidation")
+	}
+	if _, err := reader.Read(sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if readCalls != 2 {
+		t.Fatalf("status file read calls = %d, want 2 after invalidation", readCalls)
+	}
+}
+
 func TestCachedReaderConcurrentReadAndInvalidate(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	const sessionID = "concurrent-status"

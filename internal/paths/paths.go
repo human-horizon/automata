@@ -170,12 +170,12 @@ func EnsureProfileDir(profile string) error {
 	return EnsurePrivateDir(ProfileDir(profile))
 }
 
-// EnsureSessionDir creates the session directory tree if it does not exist.
+// EnsureSessionDir creates a versioned new session directory and leaves existing legacy sessions unchanged.
 func EnsureSessionDir(profile, sessionID string) error {
 	if err := ValidateSessionID(sessionID); err != nil {
 		return err
 	}
-	return EnsurePrivateDir(SessionDir(profile, sessionID))
+	return ensureSessionDir(profile, sessionID)
 }
 
 // EnsureDomainDir creates the domain directory tree if it does not exist.

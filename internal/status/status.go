@@ -5,6 +5,7 @@ package status
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,9 +25,13 @@ type Record struct {
 // CachedReader caches status reads while file identity, size and mtime remain unchanged.
 // Safe for concurrent use.
 type CachedReader struct {
-	mu      sync.Mutex
-	profile string
-	cache   *cache.LRU[string, cachedEntry]
+	mu         sync.Mutex
+	profile    string
+	cache      *cache.LRU[string, cachedEntry]
+	generation uint64
+	statFile   func(string) (os.FileInfo, error)
+	readFile   func(string) ([]byte, error)
+	sleep      func(time.Duration)
 }
 
 type cachedEntry struct {
@@ -40,13 +45,20 @@ func statusPath(profile, sessionID string) string {
 	return filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 }
 
-const statusCacheCapacity = 1024
+const (
+	statusCacheCapacity  = 1024
+	statusReadAttempts   = 3
+	statusReadRetryDelay = 5 * time.Millisecond
+)
 
 // NewCachedReader creates a reader that caches by file identity, size and mtime.
 func NewCachedReader(profile string) *CachedReader {
 	return &CachedReader{
-		profile: profile,
-		cache:   cache.NewLRU[string, cachedEntry](statusCacheCapacity),
+		profile:  profile,
+		cache:    cache.NewLRU[string, cachedEntry](statusCacheCapacity),
+		statFile: os.Stat,
+		readFile: os.ReadFile,
+		sleep:    time.Sleep,
 	}
 }
 
@@ -58,6 +70,7 @@ func (r *CachedReader) Invalidate(sessionID string) {
 		return
 	}
 	r.mu.Lock()
+	r.generation++
 	r.cache.Delete(sessionID)
 	r.mu.Unlock()
 }
@@ -66,31 +79,35 @@ func (r *CachedReader) Read(sessionID string) (string, error) {
 	if sessionID == "" {
 		return "", nil
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	path := statusPath(r.profile, sessionID)
-	fi, err := os.Stat(path)
+	fi, err := r.statFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
 		}
 		return "", fmt.Errorf("stat status %s: %w", path, err)
 	}
+
+	r.mu.Lock()
 	if entry, ok := r.cache.Get(sessionID); ok && entry.info != nil &&
 		entry.mtime.Equal(fi.ModTime()) && entry.size == fi.Size() && os.SameFile(entry.info, fi) {
+		r.mu.Unlock()
 		return entry.value, nil
 	}
+	r.cache.Delete(sessionID)
+	generation := r.generation
+	r.mu.Unlock()
 
-	data, err := os.ReadFile(path)
+	rec, err := readStatusRecord(path, r.readFile, r.sleep)
 	if err != nil {
-		return "", fmt.Errorf("read status %s: %w", path, err)
+		return "", err
 	}
-	var rec Record
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return "", fmt.Errorf("decode status %s: %w", path, err)
+
+	r.mu.Lock()
+	if generation == r.generation {
+		r.cache.Add(sessionID, cachedEntry{value: rec.Action, mtime: fi.ModTime(), size: fi.Size(), info: fi})
 	}
-	r.cache.Add(sessionID, cachedEntry{value: rec.Action, mtime: fi.ModTime(), size: fi.Size(), info: fi})
+	r.mu.Unlock()
 	return rec.Action, nil
 }
 
@@ -100,18 +117,31 @@ func Read(profile, sessionID string) (string, error) {
 		return "", nil
 	}
 	path := statusPath(profile, sessionID)
-	data, err := os.ReadFile(path)
+	rec, err := readStatusRecord(path, os.ReadFile, time.Sleep)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
 		}
-		return "", fmt.Errorf("read status %s: %w", path, err)
-	}
-	var rec Record
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return "", fmt.Errorf("decode status %s: %w", path, err)
+		return "", err
 	}
 	return rec.Action, nil
+}
+
+func readStatusRecord(path string, readFile func(string) ([]byte, error), sleep func(time.Duration)) (Record, error) {
+	for attempt := 0; attempt < statusReadAttempts; attempt++ {
+		data, err := readFile(path)
+		if err != nil {
+			return Record{}, fmt.Errorf("read status %s: %w", path, err)
+		}
+		var rec Record
+		if err := json.Unmarshal(data, &rec); err == nil {
+			return rec, nil
+		} else if attempt == statusReadAttempts-1 {
+			return Record{}, fmt.Errorf("decode status %s: %w", path, err)
+		}
+		sleep(statusReadRetryDelay)
+	}
+	return Record{}, fmt.Errorf("decode status %s: exhausted retries", path)
 }
 
 // Emoji returns the single-glyph indicator for a status action, or "" when

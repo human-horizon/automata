@@ -238,6 +238,7 @@ func TestCreateChatEmulatorWithoutPiCommandReturnsNil(t *testing.T) {
 }
 
 func TestCreateChatEmulatorTerminalUsesShellWithoutPiEnv(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "")
 	app := &App{
 		tree:       tree.New(),
@@ -621,7 +622,7 @@ func TestClearRestartFailureDoesNotRestoreActiveSession(t *testing.T) {
 	}
 }
 
-func TestClearAggregatesCommittedCleanupErrorsAndDoesNotRestart(t *testing.T) {
+func TestClearPreservesHistoryWhenCommittedJobStopFails(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "/bin/sh")
 	profile := "clear-errors"
@@ -632,16 +633,24 @@ func TestClearAggregatesCommittedCleanupErrorsAndDoesNotRestart(t *testing.T) {
 	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"a-familiar.jsonl", "b-owner.jsonl"} {
-		if err := os.WriteFile(filepath.Join(sessionDir, name), []byte("not-json\n"), 0o644); err != nil {
+	ownerHistory := []byte(`{"id":"` + ownerID + `"}` + "\n")
+	familiarHistory := []byte(`{"id":"` + familiarID + `"}` + "\n")
+	ownerPath := filepath.Join(sessionDir, "b-owner.jsonl")
+	familiarPath := filepath.Join(sessionDir, "a-familiar.jsonl")
+	for path, data := range map[string][]byte{
+		ownerPath:    ownerHistory,
+		familiarPath: familiarHistory,
+	} {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	registryPath := paths.FamiliarsJSONLPath(profile, ownerID)
-	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(registryPath, 0o755); err != nil {
+	registryData := []byte(`[{"id":"expert","sessionId":"` + familiarID + `"}]` + "\n")
+	if err := os.WriteFile(registryPath, registryData, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -668,22 +677,34 @@ func TestClearAggregatesCommittedCleanupErrorsAndDoesNotRestart(t *testing.T) {
 
 	msg := app.clearSessionCmd(ownerID, "", []string{familiarID})()
 	clearErr, ok := msg.(clearSessionErrorMsg)
-	if !ok {
-		t.Fatalf("Clear result = %T, want aggregated cleanup error", msg)
+	if !ok || clearErr.err == nil {
+		t.Fatalf("Clear result = %#v, want job-stop error", msg)
 	}
-	for _, want := range []string{"injected job stop failure", "clear familiar", "clear session history", "clear familiars.json"} {
-		if !strings.Contains(clearErr.err.Error(), want) {
-			t.Errorf("Clear error %q does not include %q", clearErr.err, want)
-		}
+	if !strings.Contains(clearErr.err.Error(), "injected job stop failure") {
+		t.Fatalf("Clear error = %q, want job-stop failure", clearErr.err)
 	}
 	if restarted {
-		t.Fatal("Clear restarted Pi despite committed cleanup errors")
+		t.Fatal("Clear restarted Pi after a job-stop failure")
 	}
 	if _, exists := app.emulatorCache[ownerID]; exists {
 		t.Fatal("stopped emulator remained in cache after cleanup error")
 	}
 	if _, active := app.activeSessions[ownerID]; active {
 		t.Fatal("stopped session remained active after committed cleanup")
+	}
+
+	for path, want := range map[string][]byte{
+		ownerPath:    ownerHistory,
+		familiarPath: familiarHistory,
+		registryPath: registryData,
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read preserved data %s: %v", path, err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("Clear changed protected data %s: got %q, want %q", path, got, want)
+		}
 	}
 }
 
@@ -717,6 +738,7 @@ func TestRouteCachedFamiliarEmulatorMessageKeepsListenChain(t *testing.T) {
 }
 
 func TestCreateFamiliarEmulatorReusesCachedEmulator(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "/bin/sh")
 	const sessionID = "cached-familiar"
 	app := &App{profile: "test"}
@@ -739,6 +761,7 @@ func TestCreateFamiliarEmulatorReusesCachedEmulator(t *testing.T) {
 }
 
 func TestFamiliarExitEvictsCacheAndCreatesFreshEmulator(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "/bin/sh")
 	const sessionID = "exited-familiar"
 	app := &App{
@@ -1451,6 +1474,7 @@ func newTestApp(t *testing.T, profile string) *App {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", filepath.Join(home, "automata-data"))
 	tr := tree.New()
 	tr.Profile = profile
 	tr.AddChat("agent")
@@ -1742,10 +1766,11 @@ func TestConfigureDebugLogReportsOpenFailure(t *testing.T) {
 
 func TestWriteHeapProfileProducesGzipProfile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "heap.prof")
-	file, err := os.Create(path)
+	file, err := openPrivateFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertPrivateFileMode(t, file)
 	if err := writeHeapProfile(file); err != nil {
 		t.Fatalf("write heap profile: %v", err)
 	}
@@ -1766,6 +1791,68 @@ func TestWriteHeapProfileProducesGzipProfile(t *testing.T) {
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenDebugLogUsesPrivatePermissionsForNewAndExistingFiles(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing_%t", existing), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "automata.log")
+			if existing {
+				if err := os.WriteFile(path, []byte("existing\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			file, err := openDebugLog(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPrivateFileMode(t, file)
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestOpenProfileFilesUsesPrivatePermissionsForNewAndExistingFiles(t *testing.T) {
+	for _, profileName := range []string{"cpu.prof", "heap.prof"} {
+		for _, existing := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s_existing_%t", profileName, existing), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), profileName)
+				if existing {
+					if err := os.WriteFile(path, []byte("existing\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				file, err := openPrivateFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPrivateFileMode(t, file)
+				info, err := file.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.Size() != 0 {
+					t.Fatalf("profile file size after opening = %d, want truncation before profile write", info.Size())
+				}
+				if err := file.Close(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func assertPrivateFileMode(t *testing.T, file *os.File) {
+	t.Helper()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != paths.PrivateFileMode {
+		t.Fatalf("file permissions = %04o, want %04o", got, paths.PrivateFileMode)
 	}
 }
 
