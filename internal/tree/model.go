@@ -1957,7 +1957,8 @@ func (t *Tree) SetOnOpenSettings(fn func()) {
 	t.onOpenSettings = fn
 }
 
-// SetTheme applies a known theme, persists it, and notifies the application.
+// SetTheme returns whether id names a known theme.
+// Persistence failures are recorded in LastActionError.
 func (t *Tree) SetTheme(id string) bool {
 	resolved, ok := apptheme.ByID(id)
 	if !ok {
