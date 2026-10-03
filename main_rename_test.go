@@ -653,7 +653,9 @@ func TestMoveRenameTaskRollsBackCommittedAssignmentWarning(t *testing.T) {
 		t.Fatal("committed assignment was not recorded for rollback")
 	}
 
-	rollbackRenameTask(&move)
+	if err := rollbackRenameTask(&move); err != nil {
+		t.Fatalf("rollbackRenameTask: %v", err)
+	}
 	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
 		t.Fatalf("target task remains after rollback: %v", err)
 	}
@@ -663,6 +665,75 @@ func TestMoveRenameTaskRollsBackCommittedAssignmentWarning(t *testing.T) {
 	}
 	if rolledBack.AssignedTo != "profile__old" {
 		t.Fatalf("rolled-back assignee = %q, want profile__old", rolledBack.AssignedTo)
+	}
+}
+
+func TestRollbackRenameJoinsFailuresAndContinues(t *testing.T) {
+	filesystemFailure := errors.New("injected filesystem rollback failure")
+	jsonlFailure := errors.New("injected JSONL rollback failure")
+	kanbanFailure := errors.New("injected Kanban rollback failure")
+	registryFailure := errors.New("injected familiar registry rollback failure")
+
+	previousRenameDirectory := rollbackRenameDirectory
+	previousRenameFile := rollbackRenameFile
+	previousMigrateJSONL := rollbackMigrateSessionJSONL
+	previousRewriteFamiliars := rollbackRewriteFamiliarSessionIDs
+	previousAssignTask := assignRenameTask
+	t.Cleanup(func() {
+		rollbackRenameDirectory = previousRenameDirectory
+		rollbackRenameFile = previousRenameFile
+		rollbackMigrateSessionJSONL = previousMigrateJSONL
+		rollbackRewriteFamiliarSessionIDs = previousRewriteFamiliars
+		assignRenameTask = previousAssignTask
+	})
+
+	directoryCalls := 0
+	fileCalls := 0
+	jsonlCalls := 0
+	familiarCalls := 0
+	kanbanCalls := 0
+	rollbackRenameDirectory = func(string, string) error {
+		directoryCalls++
+		return filesystemFailure
+	}
+	rollbackRenameFile = func(string, string) error {
+		fileCalls++
+		return filesystemFailure
+	}
+	rollbackMigrateSessionJSONL = func(string, string, string, string) (string, error) {
+		jsonlCalls++
+		return "", jsonlFailure
+	}
+	rollbackRewriteFamiliarSessionIDs = func(string, string, string) (map[string]string, error) {
+		familiarCalls++
+		return nil, registryFailure
+	}
+	assignRenameTask = func(string, string) (kanban.Task, error) {
+		kanbanCalls++
+		return kanban.Task{}, kanbanFailure
+	}
+
+	joined := rollbackRename(
+		&App{profile: "profile", piAgentDir: "pi-agent"},
+		[]renameDirectoryMove{{oldPath: "old-dir", newPath: "new-dir"}},
+		[]renameJSONLMove{{oldID: "new-id", newID: "old-id"}},
+		[]renameFamiliarFileMove{{oldOwnerID: "old-owner", newOwnerID: "new-owner"}},
+		[]renameAssignmentMove{{path: "task.md", old: "old-id"}},
+		[]renameTaskMove{{oldPath: "old-task.md", newPath: "new-task.md", oldAssigned: "old-id", moved: true, assignmentUpdated: true}},
+	)
+
+	for name, failure := range map[string]error{
+		"filesystem": filesystemFailure,
+		"JSONL":      jsonlFailure,
+		"Kanban":     kanbanFailure,
+		"registry":   registryFailure,
+	} {
+		if !errors.Is(joined, failure) {
+			t.Errorf("rollback error does not preserve %s failure: %v", name, joined)
+		}
+	}
+	if directoryCalls != 1 || fileCalls != 1 || jsonlCalls != 1 || familiarCalls != 1 || kanbanCalls != 2 {
+		t.Fatalf("rollback calls: directory=%d file=%d jsonl=%d familiars=%d Kanban=%d", directoryCalls, fileCalls, jsonlCalls, familiarCalls, kanbanCalls)
 	}
 }
 

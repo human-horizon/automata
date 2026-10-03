@@ -562,7 +562,161 @@ func TestKillSessionFailsClosedForUnknownPIDIdentity(t *testing.T) {
 	}
 }
 
-func TestKillSessionLeavesMetadataRunningWhenProcessSurvivesSIGTERM(t *testing.T) {
+func TestKillSessionEscalatesToSIGKILLAfterGraceAndWritesExitedMetadata(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__kill-escalates"
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	previousSleep := processExitSleepFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+		processExitSleepFn = previousSleep
+	})
+
+	var signals []syscall.Signal
+	killed := false
+	processSignal = func(pid int, signal syscall.Signal) error {
+		if pid != os.Getpid() {
+			t.Fatalf("signal PID = %d, want %d", pid, os.Getpid())
+		}
+		signals = append(signals, signal)
+		if signal == syscall.SIGKILL {
+			killed = true
+		}
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+	processProbeFn = func(int) bool { return !killed }
+	sleeps := 0
+	processExitSleepFn = func(delay time.Duration) {
+		if delay != processExitProbeInterval {
+			t.Errorf("probe delay = %s, want %s", delay, processExitProbeInterval)
+		}
+		sleeps++
+	}
+
+	_, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+	if err := KillSessionForProfile("test", sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 2 || signals[0] != syscall.SIGTERM || signals[1] != syscall.SIGKILL {
+		t.Fatalf("signals = %v, want [SIGTERM SIGKILL]", signals)
+	}
+	wantSleeps := int(processExitGracePeriod / processExitProbeInterval)
+	if sleeps != wantSleeps {
+		t.Fatalf("SIGTERM grace sleeps = %d, want %d", sleeps, wantSleeps)
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "exited" {
+		t.Fatalf("job status = %q, want exited", record.Status)
+	}
+}
+
+func TestKillSessionDoesNotSIGKILLReusedPID(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__kill-reused-after-term"
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	previousSleep := processExitSleepFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+		processExitSleepFn = previousSleep
+	})
+
+	var signals []syscall.Signal
+	processSignal = func(_ int, signal syscall.Signal) error {
+		signals = append(signals, signal)
+		return nil
+	}
+	psCalls := 0
+	psRunnerOverride = func(int) (string, error) {
+		psCalls++
+		if psCalls <= 2 {
+			return time.Now().Local().Format("Mon Jan 2 15:04:05 2006"), nil
+		}
+		return "Mon Jan 2 15:04:05 2006", nil
+	}
+	processProbeFn = func(int) bool { return true }
+	processExitSleepFn = func(time.Duration) {}
+
+	_, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+	if err := KillSessionForProfile("test", sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 1 || signals[0] != syscall.SIGTERM {
+		t.Fatalf("signals = %v, want only SIGTERM", signals)
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "exited" {
+		t.Fatalf("reused PID status = %q, want exited for the original process", record.Status)
+	}
+}
+
+func TestKillSessionDoesNotSIGKILLWhenPIDIdentityBecomesUnknown(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	const sessionID = "test__kill-unknown-before-escalation"
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	previousSleep := processExitSleepFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+		processExitSleepFn = previousSleep
+	})
+
+	var signals []syscall.Signal
+	processSignal = func(_ int, signal syscall.Signal) error {
+		signals = append(signals, signal)
+		return nil
+	}
+	psCalls := 0
+	psRunnerOverride = func(int) (string, error) {
+		psCalls++
+		if psCalls <= 2 {
+			return time.Now().Local().Format("Mon Jan 2 15:04:05 2006"), nil
+		}
+		return "", errFakePS
+	}
+	processProbeFn = func(int) bool { return true }
+	processExitSleepFn = func(time.Duration) {}
+
+	_, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+	if err := KillSessionForProfile("test", sessionID); err == nil || !strings.Contains(err.Error(), "before SIGKILL") {
+		t.Fatalf("KillSession error = %v, want identity verification error", err)
+	}
+	if len(signals) != 1 || signals[0] != syscall.SIGTERM {
+		t.Fatalf("signals = %v, want only SIGTERM", signals)
+	}
+	var record JobRecord
+	if err := readJSON(metaPath, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "running" {
+		t.Fatalf("unknown identity status = %q, want running", record.Status)
+	}
+}
+
+func TestKillSessionLeavesMetadataRunningWhenProcessSurvivesSIGKILL(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("AI_PROFILE", "test")
 	const sessionID = "test__kill-still-running"
@@ -570,18 +724,28 @@ func TestKillSessionLeavesMetadataRunningWhenProcessSurvivesSIGTERM(t *testing.T
 	previousSignal := processSignal
 	previousPS := psRunnerOverride
 	previousProbe := processProbeFn
+	previousSleep := processExitSleepFn
 	t.Cleanup(func() {
 		processSignal = previousSignal
 		psRunnerOverride = previousPS
 		processProbeFn = previousProbe
+		processExitSleepFn = previousSleep
 	})
-	processSignal = func(int, syscall.Signal) error { return nil }
+	var signals []syscall.Signal
+	processSignal = func(_ int, signal syscall.Signal) error {
+		signals = append(signals, signal)
+		return nil
+	}
 	psRunnerOverride = matchingPSRunner()
 	processProbeFn = func(int) bool { return true }
+	processExitSleepFn = func(time.Duration) {}
 
 	jobDir, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
-	if err := KillSessionForProfile("test", sessionID); err == nil || !strings.Contains(err.Error(), "still running") {
-		t.Fatalf("KillSession error = %v, want still-running error", err)
+	if err := KillSessionForProfile("test", sessionID); err == nil || !strings.Contains(err.Error(), "still running after SIGKILL") {
+		t.Fatalf("KillSession error = %v, want still-running-after-SIGKILL error", err)
+	}
+	if len(signals) != 2 || signals[0] != syscall.SIGTERM || signals[1] != syscall.SIGKILL {
+		t.Fatalf("signals = %v, want [SIGTERM SIGKILL]", signals)
 	}
 	var record JobRecord
 	if err := readJSON(metaPath, &record); err != nil {
@@ -592,6 +756,70 @@ func TestKillSessionLeavesMetadataRunningWhenProcessSurvivesSIGTERM(t *testing.T
 	}
 	if _, err := os.Stat(jobDir); err != nil {
 		t.Fatalf("job metadata disappeared: %v", err)
+	}
+}
+
+func TestKillSessionPreservesMetadataWhenSIGKILLIsUnconfirmed(t *testing.T) {
+	tests := []struct {
+		name          string
+		killSignalErr bool
+		unknownAfter  bool
+		wantError     string
+	}{
+		{name: "signal error", killSignalErr: true, wantError: "kill denied"},
+		{name: "identity unavailable after signal", unknownAfter: true, wantError: "after SIGKILL"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AI_DATA_HOME", t.TempDir())
+			t.Setenv("AI_PROFILE", "test")
+			const sessionID = "test__kill-unconfirmed"
+
+			previousSignal := processSignal
+			previousPS := psRunnerOverride
+			previousProbe := processProbeFn
+			previousSleep := processExitSleepFn
+			t.Cleanup(func() {
+				processSignal = previousSignal
+				psRunnerOverride = previousPS
+				processProbeFn = previousProbe
+				processExitSleepFn = previousSleep
+			})
+
+			var signals []syscall.Signal
+			processSignal = func(_ int, signal syscall.Signal) error {
+				signals = append(signals, signal)
+				if signal == syscall.SIGKILL && tt.killSignalErr {
+					return errString("kill denied")
+				}
+				return nil
+			}
+			psCalls := 0
+			psRunnerOverride = func(int) (string, error) {
+				psCalls++
+				if tt.unknownAfter && psCalls >= 4 {
+					return "", errFakePS
+				}
+				return time.Now().Local().Format("Mon Jan 2 15:04:05 2006"), nil
+			}
+			processProbeFn = func(int) bool { return true }
+			processExitSleepFn = func(time.Duration) {}
+
+			_, metaPath := writeKillSessionRecord(t, sessionID, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+			if err := KillSessionForProfile("test", sessionID); err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("KillSession error = %v, want %q", err, tt.wantError)
+			}
+			if len(signals) != 2 || signals[0] != syscall.SIGTERM || signals[1] != syscall.SIGKILL {
+				t.Fatalf("signals = %v, want [SIGTERM SIGKILL]", signals)
+			}
+			var record JobRecord
+			if err := readJSON(metaPath, &record); err != nil {
+				t.Fatal(err)
+			}
+			if record.Status != "running" {
+				t.Fatalf("unconfirmed job status = %q, want running", record.Status)
+			}
+		})
 	}
 }
 
@@ -838,6 +1066,69 @@ func TestKillPlanSignalsAllJobsBeforeWaitingForExit(t *testing.T) {
 	}
 	if signals != 2 || probes != 2 {
 		t.Fatalf("signals=%d probes=%d, want 2/2", signals, probes)
+	}
+}
+
+func TestKillPlanBatchSignalsAcrossSessionsBeforeSharedPolling(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	t.Setenv("AI_PROFILE", "test")
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	const firstSession = "test__batch-first"
+	const secondSession = "test__batch-second"
+	writeKillSessionRecord(t, firstSession, os.Getpid(), startedAt)
+	writeKillSessionRecord(t, secondSession, os.Getpid(), startedAt)
+
+	previousSignal := processSignal
+	previousPS := psRunnerOverride
+	previousProbe := processProbeFn
+	previousSleep := processExitSleepFn
+	t.Cleanup(func() {
+		processSignal = previousSignal
+		psRunnerOverride = previousPS
+		processProbeFn = previousProbe
+		processExitSleepFn = previousSleep
+	})
+
+	signals := 0
+	processSignal = func(int, syscall.Signal) error {
+		signals++
+		return nil
+	}
+	psRunnerOverride = matchingPSRunner()
+	probes := 0
+	probesByPID := make(map[int]int)
+	processProbeFn = func(pid int) bool {
+		probes++
+		if signals != 2 {
+			t.Fatalf("process polling started after %d signals; both sessions must be signaled first", signals)
+		}
+		probesByPID[pid]++
+		return probesByPID[pid] == 1
+	}
+	sleeps := 0
+	processExitSleepFn = func(delay time.Duration) {
+		sleeps++
+		if delay != processExitProbeInterval {
+			t.Errorf("exit poll delay = %s, want %s", delay, processExitProbeInterval)
+		}
+	}
+
+	firstPlan, err := PrepareKillSessionForProfile("test", firstSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPlan, err := PrepareKillSessionForProfile("test", secondSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExecuteKillPlansForProfile("test", []KillPlanTarget{
+		{Plan: firstPlan, SessionID: firstSession},
+		{Plan: secondPlan, SessionID: secondSession},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if signals != 2 || probes != 3 || sleeps != 1 {
+		t.Fatalf("signals=%d probes=%d sleeps=%d, want 2/3/1", signals, probes, sleeps)
 	}
 }
 
@@ -1199,6 +1490,66 @@ func TestCachedReaderInvalidateRemovesOneSession(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("list calls after invalidation = %d, want 2", calls)
+	}
+}
+
+func TestCachedReaderIOOutsideMutexAndInvalidationWins(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	reader := NewCachedReader()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	firstCall := true
+	calls := 0
+	reader.listProfileFn = func(string, string) ([]Job, error) {
+		calls++
+		if firstCall {
+			firstCall = false
+			started <- struct{}{}
+			<-release
+		}
+		return []Job{{ID: fmt.Sprintf("job-%d", calls)}}, nil
+	}
+
+	const profile = "concurrent-profile"
+	const sessionID = "concurrent-profile__chat"
+	result := make(chan error, 1)
+	go func() {
+		_, err := reader.ListForProfile(profile, sessionID)
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not reach injected job I/O")
+	}
+
+	invalidated := make(chan struct{})
+	go func() {
+		reader.Invalidate(profile, sessionID)
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		release <- struct{}{}
+		t.Fatal("Invalidate blocked behind job listing")
+	}
+	release <- struct{}{}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("ListForProfile returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader did not finish after injected I/O was released")
+	}
+
+	jobs, err := reader.ListForProfile(profile, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || len(jobs) != 1 || jobs[0].ID != "job-2" {
+		t.Fatalf("post-invalidation jobs = %+v, list calls = %d", jobs, calls)
 	}
 }
 

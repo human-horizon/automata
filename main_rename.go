@@ -17,7 +17,14 @@ import (
 	"github.com/Starframe/portalis"
 )
 
-var assignRenameTask = kanban.AssignTask
+var (
+	assignRenameTask                  = kanban.AssignTask
+	rollbackRenameDirectory           = paths.RenameDirectory
+	rollbackRenameFile                = paths.RenameFile
+	rollbackMigrateSessionJSONL       = paths.MigrateSessionJSONL
+	rollbackRewriteFamiliarSessionIDs = paths.RewriteFamiliarSessionIDs
+	rollbackRemove                    = os.Remove
+)
 
 type renameSessionPlan struct {
 	oldID      string
@@ -569,17 +576,17 @@ func (a *App) finalizeRenamePlan(plan *renamePlan) error {
 	if plan == nil {
 		return nil
 	}
-	var failures []error
+	prepared := make([]preparedSessionJobs, 0, len(plan.jobStops))
 	for _, jobPlan := range plan.jobStops {
-		var err error
-		if jobPlan.plan != nil {
-			err = jobPlan.plan.ExecuteForProfile(a.profile, jobPlan.newSessionID)
-		} else {
-			err = a.killSessionForProfile(jobPlan.newSessionID)
-		}
-		if err != nil {
-			failures = append(failures, fmt.Errorf("stop jobs for renamed session %s: %w", jobPlan.newSessionID, err))
-		}
+		prepared = append(prepared, preparedSessionJobs{
+			sessionID: jobPlan.newSessionID,
+			plan:      jobPlan.plan,
+			injected:  jobPlan.plan == nil,
+		})
+	}
+	var failures []error
+	if err := a.executePreparedSessionJobs(prepared); err != nil {
+		failures = append(failures, fmt.Errorf("stop jobs for renamed sessions: %w", err))
 	}
 	if err := errors.Join(failures...); err != nil {
 		warning := fmt.Errorf("rename/move committed but runtime cleanup is incomplete: %w", err)
@@ -637,23 +644,25 @@ func moveRenameTask(move *renameTaskMove) error {
 	return nil
 }
 
-func rollbackRenameTask(move *renameTaskMove) {
+func rollbackRenameTask(move *renameTaskMove) error {
 	if !move.moved {
-		return
+		return nil
 	}
+	var failures []error
 	if move.assignmentUpdated {
 		if _, err := assignRenameTask(move.newPath, move.oldAssigned); err != nil {
-			log.Printf("automata: rollback Kanban task assignment %s: %v", move.newPath, err)
+			failures = append(failures, fmt.Errorf("restore Kanban assignment %s: %w", move.newPath, err))
 		}
 	}
-	if err := paths.RenameFile(move.newPath, move.oldPath); err != nil {
-		log.Printf("automata: rollback Kanban task %s -> %s: %v", move.newPath, move.oldPath, err)
+	if err := rollbackRenameFile(move.newPath, move.oldPath); err != nil {
+		failures = append(failures, fmt.Errorf("restore Kanban task %s -> %s: %w", move.newPath, move.oldPath, err))
 	}
 	if move.createdTargetDir {
-		if err := os.Remove(filepath.Dir(move.newPath)); err != nil && !os.IsNotExist(err) {
-			log.Printf("automata: rollback empty Kanban directory %s: %v", filepath.Dir(move.newPath), err)
+		if err := rollbackRemove(filepath.Dir(move.newPath)); err != nil && !os.IsNotExist(err) {
+			failures = append(failures, fmt.Errorf("remove empty Kanban directory %s: %w", filepath.Dir(move.newPath), err))
 		}
 	}
+	return errors.Join(failures...)
 }
 
 func rollbackRename(
@@ -663,35 +672,45 @@ func rollbackRename(
 	familiarFiles []renameFamiliarFileMove,
 	assignmentMoves []renameAssignmentMove,
 	taskMoves []renameTaskMove,
-) {
+) error {
 	agentDir := a.renameAgentDir()
+	var failures []error
+	appendFailure := func(context string, err error) {
+		if err == nil {
+			return
+		}
+		wrapped := fmt.Errorf("rollback %s: %w", context, err)
+		log.Printf("automata: %v", wrapped)
+		failures = append(failures, wrapped)
+	}
 	for i := len(taskMoves) - 1; i >= 0; i-- {
-		rollbackRenameTask(&taskMoves[i])
+		appendFailure("Kanban task move", rollbackRenameTask(&taskMoves[i]))
 	}
 	for i := len(assignmentMoves) - 1; i >= 0; i-- {
 		move := assignmentMoves[i]
 		if _, err := assignRenameTask(move.path, move.old); err != nil {
-			log.Printf("automata: rollback Kanban assignment %s: %v", move.path, err)
+			appendFailure(fmt.Sprintf("Kanban assignment %s", move.path), err)
 		}
 	}
 	for i := len(familiarFiles) - 1; i >= 0; i-- {
 		move := familiarFiles[i]
-		if _, err := paths.RewriteFamiliarSessionIDs(a.profile, move.newOwnerID, move.oldOwnerID); err != nil {
-			log.Printf("automata: rollback familiars %s -> %s: %v", move.newOwnerID, move.oldOwnerID, err)
+		if _, err := rollbackRewriteFamiliarSessionIDs(a.profile, move.newOwnerID, move.oldOwnerID); err != nil {
+			appendFailure(fmt.Sprintf("familiars %s -> %s", move.newOwnerID, move.oldOwnerID), err)
 		}
 	}
 	for i := len(jsonlMoves) - 1; i >= 0; i-- {
 		move := jsonlMoves[i]
-		if _, err := paths.MigrateSessionJSONL(move.newID, move.oldID, move.cwd, agentDir); err != nil {
-			log.Printf("automata: rollback JSONL %s -> %s: %v", move.newID, move.oldID, err)
+		if _, err := rollbackMigrateSessionJSONL(move.newID, move.oldID, move.cwd, agentDir); err != nil {
+			appendFailure(fmt.Sprintf("JSONL %s -> %s", move.newID, move.oldID), err)
 		}
 	}
 	for i := len(directoryMoves) - 1; i >= 0; i-- {
 		move := directoryMoves[i]
-		if err := paths.RenameDirectory(move.newPath, move.oldPath); err != nil {
-			log.Printf("automata: rollback directory %s -> %s: %v", move.newPath, move.oldPath, err)
+		if err := rollbackRenameDirectory(move.newPath, move.oldPath); err != nil {
+			appendFailure(fmt.Sprintf("directory %s -> %s", move.newPath, move.oldPath), err)
 		}
 	}
+	return errors.Join(failures...)
 }
 
 func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
@@ -702,7 +721,7 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	runtimeSnapshot, err := a.stopRenameSessions(plan)
 	if err != nil {
 		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot, false); restoreErr != nil {
-			return nil, fmt.Errorf("%w; restore runtime: %v", err, restoreErr)
+			return nil, errors.Join(err, fmt.Errorf("restore runtime after failed stop: %w", restoreErr))
 		}
 		return nil, err
 	}
@@ -712,11 +731,14 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 	var familiarFiles []renameFamiliarFileMove
 	var assignmentMoves []renameAssignmentMove
 	fail := func(err error) (func() error, error) {
-		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves, plan.taskMoves)
-		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot, false); restoreErr != nil {
-			return nil, fmt.Errorf("%w; restore runtime: %v", err, restoreErr)
+		failures := []error{err}
+		if rollbackErr := rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves, plan.taskMoves); rollbackErr != nil {
+			failures = append(failures, fmt.Errorf("rollback rename: %w", rollbackErr))
 		}
-		return nil, err
+		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot, false); restoreErr != nil {
+			failures = append(failures, fmt.Errorf("restore runtime: %w", restoreErr))
+		}
+		return nil, errors.Join(failures...)
 	}
 
 	for _, session := range plan.sessions {
@@ -816,7 +838,13 @@ func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
 			return nil
 		}
 		rolledBack = true
-		rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves, plan.taskMoves)
-		return a.restoreRenameRuntime(runtimeSnapshot, false)
+		var failures []error
+		if err := rollbackRename(a, directoryMoves, jsonlMoves, familiarFiles, assignmentMoves, plan.taskMoves); err != nil {
+			failures = append(failures, fmt.Errorf("rollback rename: %w", err))
+		}
+		if err := a.restoreRenameRuntime(runtimeSnapshot, false); err != nil {
+			failures = append(failures, fmt.Errorf("restore runtime: %w", err))
+		}
+		return errors.Join(failures...)
 	}, nil
 }
