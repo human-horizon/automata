@@ -20,9 +20,10 @@ type stopSessionOptions struct {
 }
 
 type stopSessionError struct {
-	committed   bool
-	persistence bool
-	err         error
+	committed     bool
+	persistence   bool
+	jobStopFailed bool
+	err           error
 }
 
 func (e *stopSessionError) Error() string {
@@ -47,6 +48,11 @@ func runtimeStopWasCommitted(err error) bool {
 func runtimeStopPersistenceFailed(err error) bool {
 	var stopErr *stopSessionError
 	return errors.As(err, &stopErr) && stopErr.persistence
+}
+
+func runtimeStopJobsFailed(err error) bool {
+	var stopErr *stopSessionError
+	return errors.As(err, &stopErr) && stopErr.jobStopFailed
 }
 
 type preparedSessionJobs struct {
@@ -96,14 +102,24 @@ func (a *App) prepareSessionJobs(sessionIDs []string) ([]preparedSessionJobs, er
 	return prepared, nil
 }
 
-func (a *App) executeSessionJob(jobPlan preparedSessionJobs, sessionID string) error {
-	if jobPlan.injected {
-		return a.killSessionForProfile(sessionID)
+func (a *App) executePreparedSessionJobs(prepared []preparedSessionJobs) error {
+	var failures []error
+	targets := make([]akjobs.KillPlanTarget, 0, len(prepared))
+	for _, jobPlan := range prepared {
+		if jobPlan.injected {
+			if err := a.killSessionForProfile(jobPlan.sessionID); err != nil {
+				failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
+			}
+			continue
+		}
+		if jobPlan.plan != nil {
+			targets = append(targets, akjobs.KillPlanTarget{Plan: jobPlan.plan, SessionID: jobPlan.sessionID})
+		}
 	}
-	if jobPlan.plan == nil {
-		return nil
+	if err := akjobs.ExecuteKillPlansForProfile(a.profile, targets); err != nil {
+		failures = append(failures, err)
 	}
-	return jobPlan.plan.ExecuteForProfile(a.profile, sessionID)
+	return errors.Join(failures...)
 }
 
 func (a *App) persistRuntimeActiveSessions() error {
@@ -152,10 +168,8 @@ func (a *App) commitDeletedTreeRuntime(plan *preparedDeleteRuntime) error {
 		persistenceFailed = true
 		failures = append(failures, fmt.Errorf("persist inactive sessions after delete: %w", err))
 	}
-	for _, jobPlan := range plan.jobs {
-		if err := a.executeSessionJob(jobPlan, jobPlan.sessionID); err != nil {
-			failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
-		}
+	if err := a.executePreparedSessionJobs(plan.jobs); err != nil {
+		failures = append(failures, fmt.Errorf("stop jobs: %w", err))
 	}
 	for _, ownerID := range plan.ownerIDs {
 		if a.currentSessionID == ownerID || strings.HasPrefix(a.currentSessionID, ownerID+"__") {
@@ -200,15 +214,15 @@ func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) 
 		}
 	}
 
+	jobStopFailed := false
 	if opts.stopJobs {
-		for _, jobPlan := range prepared {
-			if err := a.executeSessionJob(jobPlan, jobPlan.sessionID); err != nil {
-				failures = append(failures, fmt.Errorf("stop jobs for %s: %w", jobPlan.sessionID, err))
-			}
+		if err := a.executePreparedSessionJobs(prepared); err != nil {
+			jobStopFailed = true
+			failures = append(failures, fmt.Errorf("stop jobs: %w", err))
 		}
 	}
 	if err := errors.Join(failures...); err != nil {
-		return &stopSessionError{committed: true, persistence: persistenceFailed, err: err}
+		return &stopSessionError{committed: true, persistence: persistenceFailed, jobStopFailed: jobStopFailed, err: err}
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func goEnvValue(name string) (string, error) {
@@ -20,6 +21,23 @@ func goEnvValue(name string) (string, error) {
 		return "", fmt.Errorf("go env %s returned an empty value", name)
 	}
 	return value, nil
+}
+
+func removeAllWithRetry(path string, attempts int, delay time.Duration, remove func(string) error) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		err = remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if attempt+1 < attempts && delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+	return err
 }
 
 func TestMain(m *testing.M) {
@@ -40,7 +58,9 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	cleanup := func() error { return os.RemoveAll(sandbox) }
+	cleanup := func() error {
+		return removeAllWithRetry(sandbox, 10, 20*time.Millisecond, os.RemoveAll)
+	}
 	failSetup := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 		if cleanupErr := cleanup(); cleanupErr != nil {

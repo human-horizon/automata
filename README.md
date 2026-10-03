@@ -60,7 +60,7 @@ go mod verify
 test -z "$(gofmt -l .)"
 go vet ./...
 golangci-lint run --timeout=5m ./...
-govulncheck ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 go test ./... -count=1 -p 1
 go test -race ./internal/... . -count=1 -p 1
 git diff --check
@@ -81,4 +81,4 @@ The E2E suite may build and launch an Automata test binary. Tests isolate `HOME`
 
 ## Security baseline
 
-Destructive job actions validate process identity before signalling, persistent state uses atomic writes, corrupt state is not silently overwritten, and CI runs `govulncheck`. Session IDs are validated before being used as path components.
+Destructive job actions validate process identity before signalling, persistent state uses atomic writes, corrupt state is not silently overwritten, and CI runs `govulncheck`. Session IDs are validated before being used as path components. See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
