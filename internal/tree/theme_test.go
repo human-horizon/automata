@@ -2,11 +2,13 @@ package tree
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/HumanHorizon/automata/internal/paths"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -96,6 +98,68 @@ func TestSettingsButtonUsesApplicationCallbackWhenConfigured(t *testing.T) {
 	}
 	if tree.popover != nil {
 		t.Fatal("Tree opened a local Settings popover despite application callback")
+	}
+}
+
+func TestSetThemeRollsBackAndSkipsCallbackOnSaveFailure(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	tr := New()
+	tr.Theme = "previous-theme"
+	saveErr := errors.New("state write failed")
+	tr.SetSaveStateFunc(func() error { return saveErr })
+	callbackCalls := 0
+	tr.SetOnThemeChange(func(string) { callbackCalls++ })
+
+	if !tr.SetTheme(apptheme.DinosaurEarthSunnyGrassyID) {
+		t.Fatal("known theme was rejected")
+	}
+	if tr.Theme != "previous-theme" {
+		t.Fatalf("theme after save failure = %q, want previous value", tr.Theme)
+	}
+	if callbackCalls != 0 {
+		t.Fatalf("theme callback calls = %d, want none after failed persistence", callbackCalls)
+	}
+	if !errors.Is(tr.LastActionError(), saveErr) {
+		t.Fatalf("action error = %v, want %v", tr.LastActionError(), saveErr)
+	}
+}
+
+func TestSetThemeKeepsCommittedValueAndNotifiesOnDurabilityWarning(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	tr := New()
+	tr.Profile = "theme-committed"
+	tr.Theme = "previous-theme"
+	callbackCalls := 0
+	callbackTheme := ""
+	tr.SetOnThemeChange(func(id string) {
+		callbackCalls++
+		callbackTheme = id
+	})
+	injectCommittedStateWarning(t)
+
+	if !tr.SetTheme(apptheme.DinosaurEarthSunnyGrassyID) {
+		t.Fatal("known theme was rejected")
+	}
+	if tr.Theme != apptheme.DinosaurEarthSunnyGrassyID {
+		t.Fatalf("theme after committed save warning = %q", tr.Theme)
+	}
+	if callbackCalls != 1 || callbackTheme != apptheme.DinosaurEarthSunnyGrassyID {
+		t.Fatalf("callback calls=%d theme=%q, want one callback for committed theme", callbackCalls, callbackTheme)
+	}
+	var committed *CommittedStateError
+	if !errors.As(tr.LastActionError(), &committed) {
+		t.Fatalf("action error = %v, want visible committed durability warning", tr.LastActionError())
+	}
+	data, err := os.ReadFile(paths.StatePath(tr.Profile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state TreeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Theme != apptheme.DinosaurEarthSunnyGrassyID {
+		t.Fatalf("persisted theme = %q", state.Theme)
 	}
 }
 

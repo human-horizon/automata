@@ -36,8 +36,11 @@ type Data struct {
 
 // CachedReader caches notes reads by file signature so we only re-read when the file changes.
 type CachedReader struct {
-	mu    sync.Mutex
-	cache *cache.LRU[string, cachedNotesEntry]
+	mu         sync.Mutex
+	cache      *cache.LRU[string, cachedNotesEntry]
+	generation uint64
+	statFile   func(string) (os.FileInfo, error)
+	readFile   func(string) (*Data, string, error)
 }
 
 type cachedNotesEntry struct {
@@ -47,7 +50,11 @@ type cachedNotesEntry struct {
 
 // NewCachedReader creates a notes reader with file-signature caching.
 func NewCachedReader() *CachedReader {
-	return &CachedReader{cache: cache.NewLRU[string, cachedNotesEntry](cache.ReaderCacheCapacity)}
+	return &CachedReader{
+		cache:    cache.NewLRU[string, cachedNotesEntry](cache.ReaderCacheCapacity),
+		statFile: os.Stat,
+		readFile: readNotesFile,
+	}
 }
 
 // Invalidate removes a domain from the cache so a subsequent read sees
@@ -59,6 +66,7 @@ func (r *CachedReader) Invalidate(profile, domain string) {
 
 	path := filepath.Join(paths.DomainDir(effectiveProfile(profile), domain), "notes.json")
 	r.mu.Lock()
+	r.generation++
 	r.cache.Delete(path)
 	r.mu.Unlock()
 }
@@ -141,27 +149,35 @@ func (r *CachedReader) Read(profile, domain string) (*Data, error) {
 	}
 	path := filepath.Join(paths.DomainDir(effectiveProfile(profile), domain), "notes.json")
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	info, statErr := os.Stat(path)
+	info, statErr := r.statFile(path)
+	signature := "missing"
 	var sourceBytes int64
 	if statErr == nil {
 		sourceBytes = info.Size()
+		signature = notesSignature(info)
 	} else if !os.IsNotExist(statErr) {
 		return nil, fmt.Errorf("stat notes file %s: %w", path, statErr)
 	}
-	data, signature, err := readNotesFile(path)
-	if err != nil {
-		return nil, err
-	}
+
+	r.mu.Lock()
 	if entry, ok := r.cache.Get(path); ok && entry.signature == signature && sourceBytes <= cache.MaxSourceMetadataBytes {
+		r.mu.Unlock()
 		return entry.data, nil
 	}
 	r.cache.Delete(path)
-	if sourceBytes <= cache.MaxSourceMetadataBytes {
-		r.cache.Add(path, cachedNotesEntry{data: data, signature: signature})
+	generation := r.generation
+	r.mu.Unlock()
+
+	data, readSignature, err := r.readFile(path)
+	if err != nil {
+		return nil, err
 	}
+
+	r.mu.Lock()
+	if generation == r.generation && sourceBytes <= cache.MaxSourceMetadataBytes {
+		r.cache.Add(path, cachedNotesEntry{data: data, signature: readSignature})
+	}
+	r.mu.Unlock()
 	return data, nil
 }
 

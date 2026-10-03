@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HumanHorizon/automata/internal/cache"
 	"github.com/HumanHorizon/automata/internal/paths"
@@ -137,6 +138,105 @@ func TestCachedReaderReadsSections(t *testing.T) {
 	}
 	if got := cached.Notes[0].Sections[0].Content; got != "Content" {
 		t.Fatalf("cached section content = %q", got)
+	}
+}
+
+func TestCachedReaderCacheHitSkipsNotesFileReadAndDecode(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	writeNotesFixture(t, "", "cache-profile", "cache-domain", `[{"title":"Cached"}]`)
+
+	reader := NewCachedReader()
+	originalStat := reader.statFile
+	originalRead := reader.readFile
+	statCalls := 0
+	readCalls := 0
+	reader.statFile = func(path string) (os.FileInfo, error) {
+		statCalls++
+		return originalStat(path)
+	}
+	reader.readFile = func(path string) (*Data, string, error) {
+		readCalls++
+		return originalRead(path)
+	}
+
+	first, err := reader.Read("cache-profile", "cache-domain")
+	if err != nil {
+		t.Fatalf("first Read returned error: %v", err)
+	}
+	second, err := reader.Read("cache-profile", "cache-domain")
+	if err != nil {
+		t.Fatalf("cache-hit Read returned error: %v", err)
+	}
+	if first != second {
+		t.Fatal("cache hit returned a different Data pointer")
+	}
+	if statCalls != 2 {
+		t.Fatalf("stat calls = %d, want 2 signature checks", statCalls)
+	}
+	if readCalls != 1 {
+		t.Fatalf("notes file reads/decodes = %d, want 1", readCalls)
+	}
+}
+
+func TestCachedReaderIOOutsideMutexAndInvalidationWins(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	writeNotesFixture(t, "", "concurrent-profile", "concurrent-domain", `[{"title":"Concurrent"}]`)
+	reader := NewCachedReader()
+	originalRead := reader.readFile
+	started := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	firstRead := true
+	readCalls := 0
+	reader.readFile = func(path string) (*Data, string, error) {
+		readCalls++
+		if firstRead {
+			firstRead = false
+			started <- struct{}{}
+			<-release
+		}
+		return originalRead(path)
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := reader.Read("concurrent-profile", "concurrent-domain")
+		readDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not reach injected file read")
+	}
+
+	invalidated := make(chan struct{})
+	go func() {
+		reader.Invalidate("concurrent-profile", "concurrent-domain")
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		release <- struct{}{}
+		t.Fatal("Invalidate blocked behind notes file read")
+	}
+	release <- struct{}{}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("Read returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader did not finish after injected file read was released")
+	}
+	path := filepath.Join(paths.DomainDir("concurrent-profile", "concurrent-domain"), "notes.json")
+	if _, cached := reader.cache.Get(path); cached {
+		t.Fatal("read repopulated cache after concurrent invalidation")
+	}
+	if _, err := reader.Read("concurrent-profile", "concurrent-domain"); err != nil {
+		t.Fatal(err)
+	}
+	if readCalls != 2 {
+		t.Fatalf("notes file read calls = %d, want 2 after invalidation", readCalls)
 	}
 }
 
