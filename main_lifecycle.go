@@ -20,10 +20,9 @@ type stopSessionOptions struct {
 }
 
 type stopSessionError struct {
-	committed     bool
-	persistence   bool
-	jobStopFailed bool
-	err           error
+	committed   bool
+	persistence bool
+	err         error
 }
 
 func (e *stopSessionError) Error() string {
@@ -50,11 +49,6 @@ func runtimeStopPersistenceFailed(err error) bool {
 	return errors.As(err, &stopErr) && stopErr.persistence
 }
 
-func runtimeStopJobsFailed(err error) bool {
-	var stopErr *stopSessionError
-	return errors.As(err, &stopErr) && stopErr.jobStopFailed
-}
-
 type preparedSessionJobs struct {
 	sessionID string
 	plan      *akjobs.KillPlan
@@ -62,9 +56,10 @@ type preparedSessionJobs struct {
 }
 
 type preparedDeleteRuntime struct {
-	ownerIDs   []string
-	sessionIDs []string
-	jobs       []preparedSessionJobs
+	ownerIDs    []string
+	sessionIDs  []string
+	jobs        []preparedSessionJobs
+	operationID uint64
 }
 
 func (a *App) killSessionForProfile(sessionID string) error {
@@ -153,7 +148,7 @@ func (a *App) prepareDeletedTreeRuntime(item *tree.Item) (*preparedDeleteRuntime
 	return &preparedDeleteRuntime{ownerIDs: ownerIDs, sessionIDs: sessionIDs, jobs: jobs}, nil
 }
 
-func (a *App) commitDeletedTreeRuntime(plan *preparedDeleteRuntime) error {
+func (a *App) commitDeletedTreeRuntimeState(plan *preparedDeleteRuntime) error {
 	if plan == nil {
 		return fmt.Errorf("deleted tree runtime preflight is missing")
 	}
@@ -162,14 +157,9 @@ func (a *App) commitDeletedTreeRuntime(plan *preparedDeleteRuntime) error {
 		delete(a.runningSessions, sessionID)
 		delete(a.activeSessions, sessionID)
 	}
-	var failures []error
-	persistenceFailed := false
+	var persistenceErr error
 	if err := a.persistRuntimeActiveSessions(); err != nil {
-		persistenceFailed = true
-		failures = append(failures, fmt.Errorf("persist inactive sessions after delete: %w", err))
-	}
-	if err := a.executePreparedSessionJobs(plan.jobs); err != nil {
-		failures = append(failures, fmt.Errorf("stop jobs: %w", err))
+		persistenceErr = fmt.Errorf("persist inactive sessions after delete: %w", err)
 	}
 	for _, ownerID := range plan.ownerIDs {
 		if a.currentSessionID == ownerID || strings.HasPrefix(a.currentSessionID, ownerID+"__") {
@@ -177,9 +167,47 @@ func (a *App) commitDeletedTreeRuntime(plan *preparedDeleteRuntime) error {
 			break
 		}
 	}
-	if err := errors.Join(failures...); err != nil {
-		return &stopSessionError{committed: true, persistence: persistenceFailed, err: err}
+	if persistenceErr != nil {
+		return &stopSessionError{committed: true, persistence: true, err: persistenceErr}
 	}
+	return nil
+}
+
+func (a *App) commitDeletedTreeRuntime(plan *preparedDeleteRuntime) error {
+	stateErr := a.commitDeletedTreeRuntimeState(plan)
+	if plan == nil {
+		return stateErr
+	}
+	jobsErr := a.executePreparedSessionJobs(plan.jobs)
+	var failures []error
+	if stateErr != nil {
+		failures = append(failures, stateErr)
+	}
+	if jobsErr != nil {
+		failures = append(failures, fmt.Errorf("stop jobs: %w", jobsErr))
+	}
+	if err := errors.Join(failures...); err != nil {
+		return &stopSessionError{
+			committed:   true,
+			persistence: runtimeStopPersistenceFailed(stateErr),
+			err:         err,
+		}
+	}
+	return nil
+}
+
+func (a *App) commitDeletedTreeRuntimeAsync(plan *preparedDeleteRuntime) error {
+	if plan == nil {
+		return fmt.Errorf("deleted tree runtime preflight is missing")
+	}
+	cmd := a.runtimeJobsCmd(runtimeJobsSnapshot{
+		operationID: plan.operationID,
+		operation:   "delete runtime cleanup",
+		sessionIDs:  plan.sessionIDs,
+		prepared:    plan.jobs,
+		deletePlan:  plan,
+	})
+	a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, cmd)
 	return nil
 }
 
@@ -214,15 +242,13 @@ func (a *App) stopSessionRuntimeIDs(ownerIDs []string, opts stopSessionOptions) 
 		}
 	}
 
-	jobStopFailed := false
 	if opts.stopJobs {
 		if err := a.executePreparedSessionJobs(prepared); err != nil {
-			jobStopFailed = true
 			failures = append(failures, fmt.Errorf("stop jobs: %w", err))
 		}
 	}
 	if err := errors.Join(failures...); err != nil {
-		return &stopSessionError{committed: true, persistence: persistenceFailed, jobStopFailed: jobStopFailed, err: err}
+		return &stopSessionError{committed: true, persistence: persistenceFailed, err: err}
 	}
 	return nil
 }

@@ -1564,6 +1564,9 @@ func (k *KanbanPanel) assignTaskToChat(task kanban.Task, chat ChatInfo, status s
 // writeTaskToChatStatus writes a task assignment to the chat's status.json
 // so the just-pi extension can pick it up on agent_end.
 func writeTaskToChatStatus(profile, sessionID, taskTitle, taskPath string) error {
+	if err := paths.EnsureSessionDir(profile, sessionID); err != nil {
+		return fmt.Errorf("ensure task status session directory: %w", err)
+	}
 	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 
 	var status map[string]interface{}
@@ -1592,6 +1595,9 @@ func writeTaskToChatStatus(profile, sessionID, taskTitle, taskPath string) error
 
 // writeTaskRemovedFromChat notifies the chat that a task was removed from progress.
 func writeTaskRemovedFromChat(profile, sessionID, taskTitle string) error {
+	if err := paths.EnsureSessionDir(profile, sessionID); err != nil {
+		return fmt.Errorf("ensure task status session directory: %w", err)
+	}
 	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 
 	var status map[string]interface{}

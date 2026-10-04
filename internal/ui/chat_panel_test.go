@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
@@ -290,22 +291,33 @@ func TestExternalFamiliarRemovalRetriesCleanupFailure(t *testing.T) {
 	}
 	preflightErr := errors.New("job identity is unknown")
 	calls := 0
-	cp.SetOnRemoveFamiliar(func(familiarID string, _ *portalis.Emulator) error {
+	cp.SetOnRemoveFamiliar(func(familiarID string, _ *portalis.Emulator) tea.Cmd {
 		calls++
 		if familiarID != "test__expert" {
 			t.Fatalf("cleanup familiar ID = %q", familiarID)
 		}
+		committed := calls > 1
+		var err error
 		if calls == 1 {
-			return preflightErr
+			err = preflightErr
 		}
-		return nil
+		return func() tea.Msg {
+			return FamiliarCleanupResultMsg{
+				Panel: cp, OwnerSessionID: sessionID, FamiliarSessionID: familiarID,
+				Kind: FamiliarExternalRemovalCleanup, Phase: FamiliarJobsStopped,
+				Committed: committed, Err: err,
+			}
+		}
 	})
 
-	cmds := cp.checkFamiliars()
-	if len(cmds) != 1 {
+	if cmds := cp.checkFamiliars(); len(cmds) != 1 {
 		t.Fatalf("initial removal commands = %d, want 1", len(cmds))
 	}
-	cp.Update(cmds[0]())
+	cleanupCmd := cp.handleExternalFamiliarRemoval(familiarRemovedMsg{id: "expert", familiarID: "test__expert"})
+	if cleanupCmd == nil {
+		t.Fatal("external cleanup command is nil")
+	}
+	cp.HandleFamiliarCleanupResult(cleanupCmd().(FamiliarCleanupResultMsg))
 	if !cp.known["expert"] || len(cp.sessions) != 2 || cp.removalPending["expert"] {
 		t.Fatalf("preflight failure lost tracking/tab: known=%v sessions=%v pending=%v", cp.known, sessionNames(cp.sessions), cp.removalPending)
 	}
@@ -316,11 +328,11 @@ func TestExternalFamiliarRemovalRetriesCleanupFailure(t *testing.T) {
 		t.Fatal("preflight failure is not visible in tab bar")
 	}
 
-	cmds = cp.checkFamiliars()
-	if len(cmds) != 1 {
-		t.Fatalf("retry commands = %d, want 1", len(cmds))
+	cleanupCmd = cp.handleExternalFamiliarRemoval(familiarRemovedMsg{id: "expert", familiarID: "test__expert"})
+	if cleanupCmd == nil {
+		t.Fatal("retry cleanup command is nil")
 	}
-	cp.Update(cmds[0]())
+	cp.HandleFamiliarCleanupResult(cleanupCmd().(FamiliarCleanupResultMsg))
 	if calls != 2 || cp.known["expert"] || len(cp.sessions) != 1 || cp.familiarCleanupError != "" {
 		t.Fatalf("retry did not commit cleanup: calls=%d known=%v sessions=%v error=%q", calls, cp.known, sessionNames(cp.sessions), cp.familiarCleanupError)
 	}
@@ -348,14 +360,20 @@ func TestExternalFamiliarRemovalDropsTabAfterCommittedWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	warning := errors.New("active-state persistence failed after runtime stop")
-	cp.SetOnRemoveFamiliar(func(string, *portalis.Emulator) error {
-		return &CommittedCleanupError{Err: warning}
+	cp.SetOnRemoveFamiliar(func(string, *portalis.Emulator) tea.Cmd {
+		return func() tea.Msg {
+			return FamiliarCleanupResultMsg{
+				Panel: cp, OwnerSessionID: sessionID, FamiliarSessionID: "test__expert",
+				Kind: FamiliarExternalRemovalCleanup, Phase: FamiliarJobsStopped,
+				Committed: true, Err: warning,
+			}
+		}
 	})
-	cmds := cp.checkFamiliars()
-	if len(cmds) != 1 {
-		t.Fatalf("removal commands = %d, want 1", len(cmds))
+	cleanupCmd := cp.handleExternalFamiliarRemoval(familiarRemovedMsg{id: "expert", familiarID: "test__expert"})
+	if cleanupCmd == nil {
+		t.Fatal("external cleanup command is nil")
 	}
-	cp.Update(cmds[0]())
+	cp.HandleFamiliarCleanupResult(cleanupCmd().(FamiliarCleanupResultMsg))
 	if cp.known["expert"] || len(cp.sessions) != 1 {
 		t.Fatalf("committed cleanup warning retained familiar: known=%v sessions=%v", cp.known, sessionNames(cp.sessions))
 	}
@@ -469,11 +487,11 @@ func TestFamiliarOwnershipRejectsExternalActions(t *testing.T) {
 		createCalls++
 		return nil, nil
 	})
-	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) error {
+	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) tea.Cmd {
 		closeCalls++
 		return nil
 	})
-	cp.SetOnRemoveFamiliar(func(string, *portalis.Emulator) error {
+	cp.SetOnRemoveFamiliar(func(string, *portalis.Emulator) tea.Cmd {
 		removeCalls++
 		return nil
 	})
@@ -560,6 +578,43 @@ func TestRemoveFamiliarRemovesTab(t *testing.T) {
 	// activeIdx stays at 1, now pointing to "helper" (shifted down).
 	if cp.activeIdx != 1 {
 		t.Fatalf("expected activeIdx=1 (helper), got %d", cp.activeIdx)
+	}
+}
+
+func TestHandleSessionClearRemovesFamiliarTabsAndPendingState(t *testing.T) {
+	const (
+		ownerID    = "owner__chat"
+		familiarID = "owner__chat__expert"
+	)
+	mainEm := portalis.NewEmulator(ownerID, "chat", "/bin/sh", nil)
+	famEm := portalis.NewEmulator(familiarID, "expert", "/bin/sh", nil)
+	cp := NewChatPanel(mainEm, ownerID, "profile")
+	cp.sessions = append(cp.sessions, &chatSession{name: "expert", em: famEm, familiarID: "expert"})
+	cp.activeIdx = 1
+	cp.known["expert"] = true
+	cp.familiarSessions["expert"] = familiarID
+	cp.removalPending["expert"] = true
+	cp.cleanupPending["expert"] = true
+	cp.pendingCloseFamiliar = "expert"
+	cp.openCloseFamiliarModal("expert")
+	cp.confirmedCloseFamiliar = "expert"
+
+	cp.HandleSessionClear()
+
+	if len(cp.Sessions()) != 1 || cp.Sessions()[0].Em() != mainEm {
+		t.Fatalf("sessions after clear = %#v, want only owner session", cp.Sessions())
+	}
+	if got := cp.FamiliarSessionIDs(); len(got) != 0 {
+		t.Fatalf("familiar session IDs after clear = %v, want empty", got)
+	}
+	if len(cp.known) != 0 || len(cp.familiarSessions) != 0 || len(cp.removalPending) != 0 || len(cp.cleanupPending) != 0 {
+		t.Fatal("clear retained familiar registry or pending state")
+	}
+	if cp.pendingCloseFamiliar != "" || cp.confirmedCloseFamiliar != "" || cp.closeFamiliarModal != nil {
+		t.Fatal("clear retained familiar close confirmation state")
+	}
+	if cp.activeIdx != 0 {
+		t.Fatalf("active tab index after clear = %d, want 0", cp.activeIdx)
 	}
 }
 
@@ -824,49 +879,59 @@ func TestHandleMouseFamiliarCloseButtonTriggersConfirm(t *testing.T) {
 	}
 }
 
-// TestConfirmYesDropsTabAndCallsCallback confirms via Y and verifies the
-// tab is removed plus the onCloseFamiliar callback fires with the right id.
+// TestConfirmYesDropsTabAndCallsCallback verifies the tab remains pending until
+// the host reports both job shutdown and history cleanup complete.
 func TestConfirmYesDropsTabAndCallsCallback(t *testing.T) {
 	var capturedID string
 	var capturedEm *portalis.Emulator
+	familiar := portalis.NewEmulator("owner__f1", "owner__f1", "/bin/sh", nil)
 	cp := &ChatPanel{
 		sessionID: "owner",
 		sessions: []*chatSession{
 			{name: "Main"},
-			{name: "expert", familiarID: "owner__f1", em: portalis.NewEmulator("owner__f1", "owner__f1", "/bin/sh", nil), panel: &fakePanel{}},
+			{name: "expert", familiarID: "owner__f1", em: familiar, panel: &fakePanel{}},
 		},
 		activeIdx: 0,
-		active:    true,
 		known:     map[string]bool{},
 	}
-	cp.SetOnCloseFamiliar(func(id string, em *portalis.Emulator) error {
+	cp.SetOnCloseFamiliar(func(id string, em *portalis.Emulator) tea.Cmd {
 		capturedID = id
 		capturedEm = em
-		return nil
+		return func() tea.Msg {
+			return FamiliarCleanupResultMsg{
+				Panel: cp, OwnerSessionID: "owner", FamiliarSessionID: id, Emulator: em,
+				Kind: FamiliarCloseCleanup, Phase: FamiliarJobsStopped, Committed: true,
+			}
+		}
 	})
 	cp.pendingCloseFamiliar = "owner__f1"
 	cp.openCloseFamiliarModal("expert")
 
-	// closeFamiliarByID is now synchronous; Update may return nil or a
-	// poll cmd. Either is acceptable — the cleanup must have already run.
-	_ = cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	if len(cp.sessions) != 1 {
-		t.Fatalf("expected 1 session after close, got %d", len(cp.sessions))
+	cmd := cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmd == nil {
+		t.Fatal("close confirmation returned no command")
 	}
-	if cp.sessions[0].familiarID != "" {
-		t.Errorf("main tab must remain, got familiarID=%q", cp.sessions[0].familiarID)
+	if len(cp.sessions) != 2 || !cp.cleanupPending["owner__f1"] {
+		t.Fatal("tab was removed before async cleanup completed")
 	}
-	if cp.pendingCloseFamiliar != "" {
-		t.Errorf("pendingCloseFamiliar should be cleared, got %q", cp.pendingCloseFamiliar)
+	result, ok := cmd().(FamiliarCleanupResultMsg)
+	if !ok {
+		t.Fatal("close command returned an unexpected message")
 	}
-	if cp.closeFamiliarModal != nil {
-		t.Error("closeFamiliarModal should be cleared")
+	cp.HandleFamiliarCleanupResult(result)
+	if len(cp.sessions) != 2 {
+		t.Fatal("tab was removed before history cleanup completed")
 	}
-	if capturedID != "owner__f1" {
-		t.Errorf("onCloseFamiliar called with %q, want owner__f1", capturedID)
+	result.Phase = FamiliarHistoryRemoved
+	cp.HandleFamiliarCleanupResult(result)
+	if len(cp.sessions) != 1 || cp.sessions[0].familiarID != "" {
+		t.Fatalf("sessions after final cleanup = %+v, want only Main", cp.sessions)
 	}
-	if capturedEm == nil {
-		t.Error("onCloseFamiliar should receive the familiar's emulator")
+	if cp.pendingCloseFamiliar != "" || cp.closeFamiliarModal != nil {
+		t.Fatal("close confirmation state was not cleared")
+	}
+	if capturedID != "owner__f1" || capturedEm != familiar {
+		t.Fatalf("callback captured id=%q emulator=%p", capturedID, capturedEm)
 	}
 }
 
@@ -883,20 +948,33 @@ func TestConfirmYesRemovesTabAfterCommittedCleanupWarning(t *testing.T) {
 		known:     map[string]bool{"expert": true},
 	}
 	cleanupErr := errors.New("active-state persistence failed after stop")
-	var observedErr error
-	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) error {
-		observedErr = &CommittedCleanupError{Err: cleanupErr}
-		return observedErr
+	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) tea.Cmd {
+		return func() tea.Msg {
+			return FamiliarCleanupResultMsg{
+				Panel: cp, OwnerSessionID: "owner", FamiliarSessionID: "owner__f1",
+				Kind: FamiliarCloseCleanup, Phase: FamiliarJobsStopped, Committed: true, Err: cleanupErr,
+			}
+		}
 	})
 	cp.pendingCloseFamiliar = "owner__f1"
 	cp.openCloseFamiliarModal("expert")
 
-	_ = cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	cmd := cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmd == nil {
+		t.Fatal("close confirmation returned no command")
+	}
+	result := cmd().(FamiliarCleanupResultMsg)
+	cp.HandleFamiliarCleanupResult(result)
+	if len(cp.sessions) != 2 {
+		t.Fatal("committed job phase removed tab before history phase")
+	}
+	result.Phase = FamiliarHistoryRemoved
+	cp.HandleFamiliarCleanupResult(result)
 	if len(cp.sessions) != 1 || cp.sessions[0].familiarID != "" {
 		t.Fatalf("sessions after committed cleanup = %+v, want only Main", cp.sessions)
 	}
-	if !errors.Is(observedErr, cleanupErr) {
-		t.Fatalf("observable committed warning = %v, want wrapped cleanup error", observedErr)
+	if !strings.Contains(cp.familiarCleanupError, cleanupErr.Error()) {
+		t.Fatalf("observable committed warning = %q, want %q", cp.familiarCleanupError, cleanupErr)
 	}
 }
 
@@ -913,21 +991,93 @@ func TestConfirmYesKeepsTabWhenHostCleanupFails(t *testing.T) {
 		known:     map[string]bool{"expert": true},
 	}
 	cleanupErr := errors.New("unknown PID identity")
-	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) error {
-		return cleanupErr
+	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) tea.Cmd {
+		return func() tea.Msg {
+			return FamiliarCleanupResultMsg{
+				Panel: cp, OwnerSessionID: "owner", FamiliarSessionID: "owner__f1",
+				Kind: FamiliarCloseCleanup, Phase: FamiliarJobsStopped, Err: cleanupErr,
+			}
+		}
 	})
 	cp.pendingCloseFamiliar = "owner__f1"
 	cp.openCloseFamiliarModal("expert")
 
-	_ = cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	cmd := cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmd == nil {
+		t.Fatal("close confirmation returned no command")
+	}
+	cp.HandleFamiliarCleanupResult(cmd().(FamiliarCleanupResultMsg))
 	if len(cp.sessions) != 2 {
 		t.Fatalf("sessions after failed cleanup = %d, want 2", len(cp.sessions))
 	}
 	if cp.sessions[1].em != familiar || cp.sessions[1].familiarID != "owner__f1" {
 		t.Fatal("familiar tab/emulator was removed after failed cleanup")
 	}
-	if !cp.known["expert"] {
-		t.Fatal("failed cleanup removed familiar tracking state")
+	if !cp.known["expert"] || cp.cleanupPending["owner__f1"] {
+		t.Fatal("failed cleanup removed familiar tracking or left pending state")
+	}
+}
+
+func TestConfirmYesReturnsBeforeBlockedCleanupCompletes(t *testing.T) {
+	familiar := portalis.NewEmulator("owner__f1", "owner__f1", "/bin/sh", nil)
+	cp := &ChatPanel{
+		sessionID: "owner",
+		sessions: []*chatSession{
+			{name: "Main", panel: &fakePanel{}},
+			{name: "expert", familiarID: "owner__f1", em: familiar, panel: &fakePanel{}},
+		},
+		activeIdx: 0,
+		known:     map[string]bool{"expert": true},
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	completion := make(chan tea.Msg, 1)
+	cp.SetOnCloseFamiliar(func(string, *portalis.Emulator) tea.Cmd {
+		return func() tea.Msg {
+			close(started)
+			<-release
+			return FamiliarCleanupResultMsg{
+				Panel: cp, OwnerSessionID: "owner", FamiliarSessionID: "owner__f1",
+				Kind: FamiliarCloseCleanup, Phase: FamiliarJobsStopped,
+				Err: errors.New("injected blocked job-stop failure"),
+			}
+		}
+	})
+	cp.pendingCloseFamiliar = "owner__f1"
+	cp.openCloseFamiliarModal("expert")
+
+	updateDone := make(chan tea.Cmd, 1)
+	go func() {
+		updateDone <- cp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	}()
+	var cmd tea.Cmd
+	select {
+	case cmd = <-updateDone:
+	case <-time.After(time.Second):
+		t.Fatal("ChatPanel.Update waited for familiar cleanup")
+	}
+	if cmd == nil {
+		t.Fatal("close confirmation returned no command")
+	}
+	go func() { completion <- cmd() }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup command did not start")
+	}
+	select {
+	case <-completion:
+		t.Fatal("blocked cleanup completed before release")
+	default:
+	}
+	if len(cp.sessions) != 2 || !cp.cleanupPending["owner__f1"] {
+		t.Fatal("pending cleanup changed the familiar tab")
+	}
+	close(release)
+	result := (<-completion).(FamiliarCleanupResultMsg)
+	cp.HandleFamiliarCleanupResult(result)
+	if len(cp.sessions) != 2 || cp.cleanupPending["owner__f1"] {
+		t.Fatal("failed completion did not preserve tab and clear pending state")
 	}
 }
 

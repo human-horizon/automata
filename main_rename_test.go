@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	akactions "github.com/HumanHorizon/automata/internal/ai-knowledge/actions"
 	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/kanban"
 	"github.com/HumanHorizon/automata/internal/paths"
@@ -179,6 +180,18 @@ func TestRenameFolderMigratesContextsAndJSONL(t *testing.T) {
 	if err := os.WriteFile(kanban, []byte(kanbanData), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	actionsDir, err := akactions.Directory(profile, oldDomain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(actionsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	actionID := strings.Repeat("a", 64)
+	actionJSON := fmt.Sprintf(`{"id":%q,"name":"Build","command":"make test","cwd":"/work"}`, actionID)
+	if err := os.WriteFile(filepath.Join(actionsDir, actionID+".json"), []byte(actionJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	jsonlDir := filepath.Join(agentDir, "sessions", paths.EncodeCwdDir(chat.CWD))
 	if err := os.MkdirAll(jsonlDir, 0o755); err != nil {
@@ -252,6 +265,13 @@ func TestRenameFolderMigratesContextsAndJSONL(t *testing.T) {
 	if err != nil || !strings.Contains(string(gotKanban), "assigned_to: "+newChatID) || !strings.Contains(string(gotKanban), "task data") {
 		t.Fatalf("kanban was not preserved or reassigned: err=%v data=%q", err, gotKanban)
 	}
+	gotActions, err := akactions.ReadForProfile(profile, newDomain)
+	if err != nil || len(gotActions) != 1 || gotActions[0].Name != "Build" {
+		t.Fatalf("folder actions were not migrated with the domain: err=%v actions=%#v", err, gotActions)
+	}
+	if _, err := os.Stat(filepath.Join(paths.DomainDir(profile, oldDomain), "actions", actionID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("old domain still contains moved action: %v", err)
+	}
 
 	gotJSONL, err := os.ReadFile(jsonlPath)
 	if err != nil {
@@ -280,6 +300,78 @@ func TestRenameFolderMigratesContextsAndJSONL(t *testing.T) {
 	}
 	if len(app.activeSessions) != 0 || len(app.emulatorCache) != 0 || len(app.familiarEmulatorCache) != 0 {
 		t.Fatalf("working sessions were not stopped: active=%v cache=%v familiar=%v", app.activeSessions, app.emulatorCache, app.familiarEmulatorCache)
+	}
+}
+
+func TestMoveFolderMigratesActions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	profile := "HumanHorizon"
+	tr := tree.New()
+	tr.Profile = profile
+	tr.AddFolder("source")
+	tr.AddFolder("target")
+	source, target := tr.Root()[0], tr.Root()[1]
+	oldDomain := source.Domain(profile)
+	actionsDir, err := akactions.Directory(profile, oldDomain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(actionsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	actionID := strings.Repeat("c", 64)
+	actionJSON := fmt.Sprintf(`{"id":%q,"name":"Build","command":"make test","cwd":"/work"}`, actionID)
+	if err := os.WriteFile(filepath.Join(actionsDir, actionID+".json"), []byte(actionJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{
+		tree:                  tr,
+		profile:               profile,
+		activeSessions:        make(map[string]struct{}),
+		runningSessions:       make(map[string]struct{}),
+		emulatorCache:         make(map[string]*portalis.Emulator),
+		familiarEmulatorCache: make(map[string]*portalis.Emulator),
+		pendingMovePlans:      make(map[*tree.Item]*renamePlan),
+	}
+	tr.SetOnBeforeItemMoved(func(item, newParent *tree.Item) (func() error, error) {
+		plan, err := buildMovePlan(item, newParent, profile)
+		if err != nil {
+			return nil, err
+		}
+		rollback, err := app.applyRenamePlan(plan)
+		if err != nil {
+			return nil, err
+		}
+		app.pendingMovePlans[item] = plan
+		return func() error {
+			delete(app.pendingMovePlans, item)
+			return rollback()
+		}, nil
+	})
+	tr.SetOnItemMoved(func(item *tree.Item, _, _ string) {
+		plan := app.pendingMovePlans[item]
+		delete(app.pendingMovePlans, item)
+		app.applyRenameMappings(plan)
+		if err := app.finalizeRenamePlan(plan); err != nil {
+			t.Errorf("finalize folder move: %v", err)
+		}
+	})
+
+	if err := tr.MoveItemChecked(source, target); err != nil {
+		t.Fatalf("MoveItemChecked: %v", err)
+	}
+	newDomain := source.Domain(profile)
+	if newDomain == oldDomain {
+		t.Fatal("moving folder did not change its domain")
+	}
+	got, err := akactions.ReadForProfile(profile, newDomain)
+	if err != nil || len(got) != 1 || got[0].Name != "Build" {
+		t.Fatalf("folder action was not migrated with the moved folder: err=%v actions=%#v", err, got)
+	}
+	if _, err := os.Stat(filepath.Join(paths.DomainDir(profile, oldDomain), "actions", actionID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("old domain still contains moved action: %v", err)
 	}
 }
 
@@ -759,6 +851,7 @@ func TestMoveChatReusesRenameMigrationWithoutMovingDomain(t *testing.T) {
 	oldAID := app.tree.SessionKeyOf(chatA)
 	oldBID := app.tree.SessionKeyOf(chatB)
 	newAID := fullRenameSessionID(profile, []string{"target"}, "chat-a")
+	app.currentSessionID = oldAID
 	sourceDomain := source.Domain(profile)
 	targetDomain := target.Domain(profile)
 	for _, id := range []string{oldAID, oldBID} {
@@ -819,6 +912,21 @@ func TestMoveChatReusesRenameMigrationWithoutMovingDomain(t *testing.T) {
 	}
 
 	app.tree.MoveItem(chatA, target)
+	if app.currentSessionID != oldAID {
+		t.Fatal("move remapped the active session before asynchronous completion")
+	}
+	if len(jobStops) != 0 {
+		t.Fatalf("move stopped jobs before asynchronous completion: %v", jobStops)
+	}
+	if len(app.pendingBubbleTeaCmds) != 1 {
+		t.Fatalf("move completion commands = %d, want 1", len(app.pendingBubbleTeaCmds))
+	}
+	completionCmd := app.pendingBubbleTeaCmds[0]
+	app.pendingBubbleTeaCmds = nil
+	app.Update(completionCmd())
+	if app.currentSessionID != newAID {
+		t.Fatalf("move completion active session = %q, want %q", app.currentSessionID, newAID)
+	}
 
 	if len(jobStops) != 2 {
 		t.Fatalf("job stops = %v, want chat and familiar after filesystem commit", jobStops)

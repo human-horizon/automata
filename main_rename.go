@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
@@ -64,11 +65,12 @@ type renameJobPlan struct {
 }
 
 type renamePlan struct {
-	sessions  []renameSessionPlan
-	domains   []renameDomainPlan
-	familiars []renameFamiliarPlan
-	taskMoves []renameTaskMove
-	jobStops  []renameJobPlan
+	sessions    []renameSessionPlan
+	domains     []renameDomainPlan
+	familiars   []renameFamiliarPlan
+	taskMoves   []renameTaskMove
+	jobStops    []renameJobPlan
+	operationID uint64
 }
 
 type renameRuntimeSnapshot struct {
@@ -468,6 +470,47 @@ func renamePlanSessionIDs(plan *renamePlan) map[string]struct{} {
 	return ids
 }
 
+func renamePlanOperationIDs(plan *renamePlan) []string {
+	if plan == nil {
+		return nil
+	}
+	unique := make(map[string]struct{}, len(plan.sessions)*2+len(plan.familiars)*2)
+	add := func(sessionID string) {
+		if sessionID != "" {
+			unique[sessionID] = struct{}{}
+		}
+	}
+	for _, session := range plan.sessions {
+		add(session.oldID)
+		add(session.newID)
+	}
+	for _, familiar := range plan.familiars {
+		add(familiar.oldID)
+		add(familiar.newID)
+	}
+	ids := make([]string, 0, len(unique))
+	for sessionID := range unique {
+		ids = append(ids, sessionID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func preparedRenameJobs(plan *renamePlan) []preparedSessionJobs {
+	if plan == nil {
+		return nil
+	}
+	prepared := make([]preparedSessionJobs, 0, len(plan.jobStops))
+	for _, jobPlan := range plan.jobStops {
+		prepared = append(prepared, preparedSessionJobs{
+			sessionID: jobPlan.newSessionID,
+			plan:      jobPlan.plan,
+			injected:  jobPlan.plan == nil,
+		})
+	}
+	return prepared
+}
+
 func (a *App) captureRenameRuntime(plan *renamePlan) renameRuntimeSnapshot {
 	ids := renamePlanSessionIDs(plan)
 	snapshot := renameRuntimeSnapshot{
@@ -572,18 +615,26 @@ func (a *App) stopRenameSessions(plan *renamePlan) (renameRuntimeSnapshot, error
 	return snapshot, nil
 }
 
+func (a *App) scheduleFinalizeRenamePlan(plan *renamePlan) error {
+	if plan == nil {
+		return nil
+	}
+	cmd := a.runtimeJobsCmd(runtimeJobsSnapshot{
+		operationID: plan.operationID,
+		operation:   "rename/move committed runtime cleanup",
+		sessionIDs:  renamePlanOperationIDs(plan),
+		prepared:    preparedRenameJobs(plan),
+		renamePlan:  plan,
+	})
+	a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, cmd)
+	return nil
+}
+
 func (a *App) finalizeRenamePlan(plan *renamePlan) error {
 	if plan == nil {
 		return nil
 	}
-	prepared := make([]preparedSessionJobs, 0, len(plan.jobStops))
-	for _, jobPlan := range plan.jobStops {
-		prepared = append(prepared, preparedSessionJobs{
-			sessionID: jobPlan.newSessionID,
-			plan:      jobPlan.plan,
-			injected:  jobPlan.plan == nil,
-		})
-	}
+	prepared := preparedRenameJobs(plan)
 	var failures []error
 	if err := a.executePreparedSessionJobs(prepared); err != nil {
 		failures = append(failures, fmt.Errorf("stop jobs for renamed sessions: %w", err))
@@ -714,10 +765,14 @@ func rollbackRename(
 }
 
 func (a *App) applyRenamePlan(plan *renamePlan) (func() error, error) {
-	agentDir := a.renameAgentDir()
 	if err := a.prepareRenamePlan(plan); err != nil {
 		return nil, err
 	}
+	return a.applyPreparedRenamePlan(plan)
+}
+
+func (a *App) applyPreparedRenamePlan(plan *renamePlan) (func() error, error) {
+	agentDir := a.renameAgentDir()
 	runtimeSnapshot, err := a.stopRenameSessions(plan)
 	if err != nil {
 		if restoreErr := a.restoreRenameRuntime(runtimeSnapshot, false); restoreErr != nil {

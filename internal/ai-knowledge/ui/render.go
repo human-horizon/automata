@@ -10,7 +10,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
+	"github.com/HumanHorizon/automata/internal/ai-knowledge/actions"
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/context"
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
@@ -84,8 +86,9 @@ func View(width, height int, ctx *context.Data, js []jobs.Job, currentTask strin
 
 // CollapseState records which knowledge sections are hidden.
 type CollapseState struct {
-	Plans bool
-	Jobs  bool
+	Actions bool
+	Plans   bool
+	Jobs    bool
 }
 
 // ViewWithTheme renders the knowledge panel with the supplied palette and a fixed height.
@@ -96,6 +99,11 @@ func ViewWithTheme(width, height int, ctx *context.Data, js []jobs.Job, currentT
 // ContentWithTheme renders all content without clipping it to a viewport. The
 // embedding panel owns scrolling and can collapse selected sections.
 func ContentWithTheme(width int, ctx *context.Data, js []jobs.Job, currentTask string, palette apptheme.Theme, collapsed CollapseState) string {
+	return ContentWithActions(width, ctx, js, currentTask, nil, palette, collapsed)
+}
+
+// ContentWithActions renders knowledge content and folder-scoped action buttons.
+func ContentWithActions(width int, ctx *context.Data, js []jobs.Job, currentTask string, actionList []actions.Action, palette apptheme.Theme, collapsed CollapseState) string {
 	styles := newRenderStyles(palette)
 	if width <= 0 {
 		width = 80
@@ -122,6 +130,18 @@ func ContentWithTheme(width int, ctx *context.Data, js []jobs.Job, currentTask s
 		}
 	} else {
 		b.WriteString(styles.empty.Render("  (no status)"))
+		b.WriteString("\n")
+	}
+
+	writeCollapsibleSection(&b, "Actions", collapsed.Actions, styles.section)
+	if !collapsed.Actions && len(actionList) > 0 {
+		for _, action := range actionList {
+			line := ansi.Truncate("  ↗ "+action.Name, width, "…")
+			b.WriteString(styles.item.Render(line))
+			b.WriteString("\n")
+		}
+	} else if !collapsed.Actions {
+		b.WriteString(styles.empty.Render("  (no actions)"))
 		b.WriteString("\n")
 	}
 

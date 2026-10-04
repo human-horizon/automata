@@ -1,12 +1,4 @@
 // Package testutil exposes helpers shared by Automata tests.
-//
-// RunMain is meant to be called from a package-level TestMain to redirect
-// HOME to a temporary directory for the lifetime of the test binary.
-// Tests that call tree.AddChat, tree.AddFolder, or anything that triggers
-// autoSave otherwise write to the real ~/.ai/automata/profiles/<profile>/
-// state.json and pollute the user's profile. The original HOME is
-// restored after the test run, so manual runs of `automata` are
-// unaffected.
 package testutil
 
 import (
@@ -15,49 +7,71 @@ import (
 	"testing"
 )
 
-// RunMain wraps m.Run() with HOME isolation. The caller must put a
-// TestMain in their *_test.go that calls this:
+// RunMain isolates HOME and removes inherited storage/profile overrides for
+// the lifetime of a test binary. Tests may still set their own HOME or explicit
+// data root without writing to the caller's workspace.
 //
 //	func TestMain(m *testing.M) { testutil.RunMain(m) }
-//
-// Any test that calls paths.BaseDir() (directly or via Tree.SaveState,
-// Tree.LoadState, status.NewCachedReader, etc.) will then read and write
-// only inside the temporary directory.
 func RunMain(m *testing.M) {
-	origHome, hadHome := os.LookupEnv("HOME")
-	origData, hadData := os.LookupEnv("AI_DATA_HOME")
+	os.Exit(runMain(m.Run))
+}
 
-	tmp, err := os.MkdirTemp("", "automata-test-home-")
+func runMain(run func() int) (code int) {
+	environment := []struct {
+		name    string
+		value   string
+		present bool
+	}{
+		{name: "HOME"},
+		{name: "AI_DATA_HOME"},
+		{name: "AUTOMATA_HOME"},
+		{name: "AI_PROFILE"},
+		{name: "AUTOMATA_PROFILE"},
+	}
+	for index := range environment {
+		variable := &environment[index]
+		variable.value, variable.present = os.LookupEnv(variable.name)
+	}
+
+	temporaryHome, err := os.MkdirTemp("", "automata-test-home-")
 	if err != nil {
-		panic("testutil: cannot create temp HOME: " + err.Error())
+		fmt.Fprintln(os.Stderr, "testutil: create temp HOME:", err)
+		return 1
 	}
+	defer func() {
+		for _, variable := range environment {
+			var err error
+			if variable.present {
+				err = os.Setenv(variable.name, variable.value)
+			} else {
+				err = os.Unsetenv(variable.name)
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "testutil: restore %s: %v\n", variable.name, err)
+				if code == 0 {
+					code = 1
+				}
+			}
+		}
+		if err := os.RemoveAll(temporaryHome); err != nil {
+			fmt.Fprintln(os.Stderr, "testutil: remove temp HOME:", err)
+			if code == 0 {
+				code = 1
+			}
+		}
+	}()
 
-	// HOME drives os.UserHomeDir(); paths.dataHome() honours
-	// AI_DATA_HOME, so we set both for belt-and-suspenders coverage.
-	if err := os.Setenv("HOME", tmp); err != nil {
-		panic("testutil: cannot set HOME: " + err.Error())
-	}
-	if err := os.Setenv("AI_DATA_HOME", tmp); err != nil {
-		panic("testutil: cannot set AI_DATA_HOME: " + err.Error())
-	}
-
-	code := m.Run()
-
-	if hadHome {
-		_ = os.Setenv("HOME", origHome)
-	} else {
-		_ = os.Unsetenv("HOME")
-	}
-	if hadData {
-		_ = os.Setenv("AI_DATA_HOME", origData)
-	} else {
-		_ = os.Unsetenv("AI_DATA_HOME")
-	}
-	if err := os.RemoveAll(tmp); err != nil {
-		fmt.Fprintln(os.Stderr, "testutil: remove temp HOME:", err)
-		if code == 0 {
-			code = 1
+	for _, variable := range environment {
+		var err error
+		if variable.name == "HOME" {
+			err = os.Setenv(variable.name, temporaryHome)
+		} else {
+			err = os.Unsetenv(variable.name)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "testutil: isolate %s: %v\n", variable.name, err)
+			return 1
 		}
 	}
-	os.Exit(code)
+	return run()
 }

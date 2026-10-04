@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/HumanHorizon/automata/internal/atomicfile"
@@ -17,6 +18,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	warp "github.com/starframe-dev/warp"
 
+	akactions "github.com/HumanHorizon/automata/internal/ai-knowledge/actions"
 	akcontext "github.com/HumanHorizon/automata/internal/ai-knowledge/context"
 	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	akui "github.com/HumanHorizon/automata/internal/ai-knowledge/ui"
@@ -59,6 +61,25 @@ type knowledgeKanbanWatcherErrorMsg struct {
 	err        error
 }
 
+type actionsChangedMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+}
+
+type actionsWatcherErrorMsg struct {
+	generation uint64
+	watcher    *fsnotify.Watcher
+	err        error
+}
+
+type actionRunCompletedMsg struct {
+	generation uint64
+	profile    string
+	domain     string
+	name       string
+	err        error
+}
+
 // sessionDataPath returns the per-session directory that owns status.json,
 // plans.json, settings.json and the jobs/ subdirectory. Notes live one level
 // up under the domain directory, so they have their own watcher set up by
@@ -75,13 +96,16 @@ type KnowledgePanel struct {
 	domain    string
 	palette   apptheme.Theme
 
-	width          int
-	height         int
-	scrollOffset   int
-	plansCollapsed bool
-	jobsCollapsed  bool
-	plansHeaderY   int
-	jobsHeaderY    int
+	width            int
+	height           int
+	scrollOffset     int
+	actionsCollapsed bool
+	plansCollapsed   bool
+	jobsCollapsed    bool
+	actionsHeaderY   int
+	plansHeaderY     int
+	jobsHeaderY      int
+	actionRows       map[int]akactions.Action
 
 	data                *akcontext.Data
 	jobs                []akjobs.Job
@@ -90,6 +114,11 @@ type KnowledgePanel struct {
 	knowledgeWatchError string
 	jobsWatchError      string
 	kanbanWatchError    string
+	actionsError        string
+	actionsWatchError   string
+	actions             []akactions.Action
+	actionStatus        string
+	actionStatusIsError bool
 
 	// Cached readers prevent re-reading unchanged files across watcher events.
 	contextReader *akcontext.CachedReader
@@ -100,6 +129,13 @@ type KnowledgePanel struct {
 	dual           bool
 	settingsError  string
 	settingsWriter func(path string, data []byte) error
+	actionRunner   func(akactions.Action) error
+
+	pendingAction         *akactions.Action
+	actionConfirmScroll   int
+	actionConfirmButtonY  int
+	actionConfirmRunRange terminalCellRange
+	actionConfirmNoRange  terminalCellRange
 
 	// Current task title (from kanban) shown before plans.
 	currentTask string
@@ -121,6 +157,10 @@ type KnowledgePanel struct {
 	kanbanWatcher     *fsnotify.Watcher
 	kanbanWatcherPath string
 
+	// actionsWatcher observes the current folder-domain's actions directory.
+	actionsWatcher     *fsnotify.Watcher
+	actionsWatcherPath string
+
 	// active gates filesystem resources while the panel is hidden.
 	active bool
 
@@ -128,21 +168,25 @@ type KnowledgePanel struct {
 	knowledgeGeneration uint64
 	jobsGeneration      uint64
 	kanbanGeneration    uint64
+	actionsGeneration   uint64
+	actionRunGeneration uint64
 
 	// Pending flags guarantee at most one blocking reader per watcher.
 	knowledgeWatchPending bool
 	jobsWatchPending      bool
 	kanbanWatchPending    bool
+	actionsWatchPending   bool
 }
 
 // NewKnowledgePanel creates an empty panel; activation/session changes load data.
 func NewKnowledgePanel() *KnowledgePanel {
 	return &KnowledgePanel{
-		palette:       apptheme.Default(),
-		contextReader: akcontext.NewCachedReader(),
-		jobsReader:    akjobs.NewCachedReader(),
-		plansHeaderY:  -1,
-		jobsHeaderY:   -1,
+		palette:        apptheme.Default(),
+		contextReader:  akcontext.NewCachedReader(),
+		jobsReader:     akjobs.NewCachedReader(),
+		actionsHeaderY: -1,
+		plansHeaderY:   -1,
+		jobsHeaderY:    -1,
 	}
 }
 
@@ -159,8 +203,15 @@ func (k *KnowledgePanel) SetProfile(profile string) {
 	k.profile = profile
 	k.data = nil
 	k.jobs = nil
+	k.actions = nil
 	k.contextError = ""
 	k.jobsError = ""
+	k.actionsError = ""
+	k.actionsWatchError = ""
+	k.actionStatus = ""
+	k.actionStatusIsError = false
+	k.pendingAction = nil
+	k.actionRunGeneration++
 	k.readSettings()
 	if k.active {
 		k.setupWatchers()
@@ -180,11 +231,20 @@ func (k *KnowledgePanel) SetDomain(domain string) {
 		return
 	}
 	k.resetKanbanWatcher()
+	k.resetActionsWatcher()
 	k.domain = domain
 	k.currentTask = ""
+	k.actions = nil
+	k.actionsError = ""
+	k.actionsWatchError = ""
+	k.actionStatus = ""
+	k.actionStatusIsError = false
+	k.pendingAction = nil
+	k.actionRunGeneration++
 	k.refreshCurrentTask()
 	if k.active {
 		k.attachKanbanWatcherIfMissing()
+		k.refreshActionsData()
 	}
 }
 
@@ -213,6 +273,7 @@ func (k *KnowledgePanel) closeWatchers() {
 	k.knowledgeGeneration++
 	k.jobsGeneration++
 	k.kanbanGeneration++
+	k.actionsGeneration++
 	if k.knowledgeWatcher != nil {
 		_ = k.knowledgeWatcher.Close()
 		k.knowledgeWatcher = nil
@@ -226,12 +287,18 @@ func (k *KnowledgePanel) closeWatchers() {
 		_ = k.kanbanWatcher.Close()
 		k.kanbanWatcher = nil
 	}
+	if k.actionsWatcher != nil {
+		_ = k.actionsWatcher.Close()
+		k.actionsWatcher = nil
+	}
 	k.knowledgeWatcherPath = ""
 	k.jobsWatcherPath = ""
 	k.kanbanWatcherPath = ""
+	k.actionsWatcherPath = ""
 	k.knowledgeWatchPending = false
 	k.jobsWatchPending = false
 	k.kanbanWatchPending = false
+	k.actionsWatchPending = false
 }
 
 // Activate refreshes the panel and starts its filesystem watchers.
@@ -241,6 +308,7 @@ func (k *KnowledgePanel) Activate() tea.Cmd {
 		k.knowledgeGeneration++
 		k.jobsGeneration++
 		k.kanbanGeneration++
+		k.actionsGeneration++
 		k.setupWatchers()
 		k.refreshKnowledgeData()
 	}
@@ -249,10 +317,11 @@ func (k *KnowledgePanel) Activate() tea.Cmd {
 
 // Deactivate releases watchers without clearing the panel's UI state.
 func (k *KnowledgePanel) Deactivate() {
-	if !k.active && k.knowledgeWatcher == nil && k.jobsWatcher == nil && k.kanbanWatcher == nil {
+	if !k.active && k.knowledgeWatcher == nil && k.jobsWatcher == nil && k.kanbanWatcher == nil && k.actionsWatcher == nil {
 		return
 	}
 	k.active = false
+	k.pendingAction = nil
 	k.closeWatchers()
 }
 
@@ -266,12 +335,15 @@ func (k *KnowledgePanel) Close() {
 // are watched through their nearest existing parent, so creation is handled
 // by a filesystem event.
 func (k *KnowledgePanel) setupWatchers() {
-	if !k.active || k.sessionID == "" {
+	if !k.active {
 		return
 	}
-	k.attachKnowledgeWatcherIfMissing()
-	k.attachJobsWatcherIfMissing()
-	k.attachKanbanWatcherIfMissing()
+	if k.sessionID != "" {
+		k.attachKnowledgeWatcherIfMissing()
+		k.attachJobsWatcherIfMissing()
+		k.attachKanbanWatcherIfMissing()
+	}
+	k.attachActionsWatcherIfMissing()
 }
 
 // attachKnowledgeWatcherIfMissing watches the session directory directly, or
@@ -381,6 +453,11 @@ func (k *KnowledgePanel) writeSettings() error {
 		k.setSettingsError(err)
 		return err
 	}
+	if err := paths.EnsureSessionDir(k.profile, k.sessionID); err != nil {
+		err = fmt.Errorf("create settings session directory: %w", err)
+		k.setSettingsError(err)
+		return err
+	}
 	settingsPath := k.settingsPath()
 	settings := make(map[string]json.RawMessage)
 	current, err := os.ReadFile(settingsPath)
@@ -410,11 +487,6 @@ func (k *KnowledgePanel) writeSettings() error {
 	data, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		err = fmt.Errorf("encode settings: %w", err)
-		k.setSettingsError(err)
-		return err
-	}
-	if err := paths.EnsurePrivateDir(filepath.Dir(settingsPath)); err != nil {
-		err = fmt.Errorf("create settings directory: %w", err)
 		k.setSettingsError(err)
 		return err
 	}
@@ -493,9 +565,9 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 	case warp.ResizeMsg:
 		k.SetSize(msg.Width, msg.Height)
 	case tea.MouseMsg:
-		k.handleMouse(msg)
+		baseCmd = k.handleMouse(msg)
 	case tea.KeyMsg:
-		k.handleKey(msg)
+		baseCmd = k.handleKey(msg)
 	case knowledgeChangedMsg:
 		if k.isCurrentKnowledgeWatcher(msg.generation, msg.watcher) {
 			k.knowledgeWatchPending = false
@@ -542,6 +614,31 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 			k.attachKanbanWatcherIfMissing()
 			k.refreshCurrentTask()
 		}
+	case actionsChangedMsg:
+		if k.isCurrentActionsWatcher(msg.generation, msg.watcher) {
+			k.actionsWatchPending = false
+			k.refreshActionsData()
+		}
+	case actionsWatcherErrorMsg:
+		if k.isCurrentActionsWatcher(msg.generation, msg.watcher) {
+			k.actionsWatchPending = false
+			if msg.err != nil {
+				log.Printf("automata: folder actions watcher failed: %v", msg.err)
+			}
+			k.resetActionsWatcher()
+			k.attachActionsWatcherIfMissing()
+			k.refreshActionsData()
+		}
+	case actionRunCompletedMsg:
+		if msg.generation == k.actionRunGeneration && msg.profile == k.profile && msg.domain == k.domain {
+			k.actionStatusIsError = msg.err != nil
+			if msg.err != nil {
+				k.actionStatus = fmt.Sprintf("Failed: %s: %v", msg.name, msg.err)
+				log.Printf("automata: folder action %q failed: %v", msg.name, msg.err)
+			} else {
+				k.actionStatus = fmt.Sprintf("Completed: %s", msg.name)
+			}
+		}
 	}
 
 	return tea.Batch(baseCmd, k.armWatchers())
@@ -570,6 +667,12 @@ func (k *KnowledgePanel) armWatchers() tea.Cmd {
 			cmds = append(cmds, cmd)
 		}
 	}
+	if k.actionsWatcher != nil && !k.actionsWatchPending {
+		k.actionsWatchPending = true
+		if cmd := k.watchActionsCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -583,6 +686,10 @@ func (k *KnowledgePanel) isCurrentJobsWatcher(generation uint64, watcher *fsnoti
 
 func (k *KnowledgePanel) isCurrentKanbanWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
 	return k.active && watcher != nil && watcher == k.kanbanWatcher && generation == k.kanbanGeneration
+}
+
+func (k *KnowledgePanel) isCurrentActionsWatcher(generation uint64, watcher *fsnotify.Watcher) bool {
+	return k.active && watcher != nil && watcher == k.actionsWatcher && generation == k.actionsGeneration
 }
 
 // resetKnowledgeWatcher closes the session-data watcher and invalidates its
@@ -618,7 +725,27 @@ func (k *KnowledgePanel) resetKanbanWatcher() {
 	k.kanbanWatcherPath = ""
 }
 
+func (k *KnowledgePanel) resetActionsWatcher() {
+	k.actionsGeneration++
+	k.actionsWatchPending = false
+	if k.actionsWatcher != nil {
+		_ = k.actionsWatcher.Close()
+		k.actionsWatcher = nil
+	}
+	k.actionsWatcherPath = ""
+}
+
 func (k *KnowledgePanel) refreshKnowledgeData() {
+	if k.sessionID == "" {
+		k.data = nil
+		k.jobs = nil
+		k.contextError = ""
+		k.jobsError = ""
+		k.readSettings()
+		k.refreshCurrentTask()
+		k.refreshActionsData()
+		return
+	}
 	k.contextReader.Invalidate(k.profile, k.sessionID)
 	// The session-level watcher fires both for data changes and for creation
 	// of the jobs/ directory. Reattaching all watchers keeps the chain alive
@@ -626,6 +753,7 @@ func (k *KnowledgePanel) refreshKnowledgeData() {
 	k.attachKnowledgeWatcherIfMissing()
 	k.attachJobsWatcherIfMissing()
 	k.attachKanbanWatcherIfMissing()
+	k.attachActionsWatcherIfMissing()
 	data, contextErr := k.contextReader.ReadForProfile(k.profile, k.sessionID)
 	if data != nil {
 		k.data = data
@@ -637,6 +765,20 @@ func (k *KnowledgePanel) refreshKnowledgeData() {
 	k.jobsError = knowledgeReadError(jobsErr)
 	k.readSettings()
 	k.refreshCurrentTask()
+	k.refreshActionsData()
+}
+
+func (k *KnowledgePanel) refreshActionsData() {
+	if k.domain == "" {
+		k.actions = nil
+		k.actionsError = ""
+		k.actionsWatchError = ""
+		return
+	}
+	k.attachActionsWatcherIfMissing()
+	actions, err := akactions.ReadForProfile(k.profile, k.domain)
+	k.actions = actions
+	k.actionsError = knowledgeReadError(err)
 }
 
 func (k *KnowledgePanel) refreshJobsData() {
@@ -774,6 +916,64 @@ func (k *KnowledgePanel) attachKanbanWatcherIfMissing() {
 	k.kanbanWatchError = ""
 }
 
+func (k *KnowledgePanel) attachActionsWatcherIfMissing() {
+	if !k.active || k.domain == "" {
+		return
+	}
+	actionsDir, err := akactions.Directory(k.profile, k.domain)
+	if err != nil {
+		k.actionsWatchError = fmt.Sprintf("resolve folder actions directory: %v", err)
+		return
+	}
+	domainDir := filepath.Dir(actionsDir)
+	domainInfo, err := os.Lstat(domainDir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := paths.EnsurePrivateDir(domainDir); err != nil {
+			k.actionsWatchError = fmt.Sprintf("create folder actions watcher path: %v", err)
+			return
+		}
+		domainInfo, err = os.Lstat(domainDir)
+	}
+	if err != nil {
+		k.actionsWatchError = fmt.Sprintf("inspect folder actions domain: %v", err)
+		return
+	}
+	if domainInfo.Mode()&os.ModeSymlink != 0 || !domainInfo.IsDir() {
+		k.actionsWatchError = "folder actions domain is not a real directory"
+		return
+	}
+
+	watchPath := actionsDir
+	actionsInfo, err := os.Lstat(actionsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		watchPath = domainDir
+	} else if err != nil {
+		k.actionsWatchError = fmt.Sprintf("inspect folder actions directory: %v", err)
+		return
+	} else if actionsInfo.Mode()&os.ModeSymlink != 0 || !actionsInfo.IsDir() {
+		k.actionsWatchError = "folder actions path is not a real directory"
+		return
+	}
+	if k.actionsWatcher != nil && k.actionsWatcherPath == watchPath {
+		k.actionsWatchError = ""
+		return
+	}
+	k.resetActionsWatcher()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		k.actionsWatchError = fmt.Sprintf("create folder actions watcher: %v", err)
+		return
+	}
+	if err := watcher.Add(watchPath); err != nil {
+		_ = watcher.Close()
+		k.actionsWatchError = fmt.Sprintf("watch folder actions: %v", err)
+		return
+	}
+	k.actionsWatcher = watcher
+	k.actionsWatcherPath = watchPath
+	k.actionsWatchError = ""
+}
+
 // watchKnowledgeCmd blocks on the session-level fsnotify watcher and
 // returns a single knowledgeChangedMsg when an event arrives.
 func (k *KnowledgePanel) watchKnowledgeCmd() tea.Cmd {
@@ -840,6 +1040,28 @@ func (k *KnowledgePanel) watchKanbanCmd() tea.Cmd {
 				return knowledgeKanbanWatcherErrorMsg{generation: generation, watcher: w}
 			}
 			return knowledgeKanbanWatcherErrorMsg{generation: generation, watcher: w, err: err}
+		}
+	}
+}
+
+func (k *KnowledgePanel) watchActionsCmd() tea.Cmd {
+	if k.actionsWatcher == nil {
+		return nil
+	}
+	watcher := k.actionsWatcher
+	generation := k.actionsGeneration
+	return func() tea.Msg {
+		select {
+		case _, ok := <-watcher.Events:
+			if !ok {
+				return actionsWatcherErrorMsg{generation: generation, watcher: watcher}
+			}
+			return actionsChangedMsg{generation: generation, watcher: watcher}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return actionsWatcherErrorMsg{generation: generation, watcher: watcher}
+			}
+			return actionsWatcherErrorMsg{generation: generation, watcher: watcher, err: err}
 		}
 	}
 }
@@ -932,15 +1154,49 @@ func (k *KnowledgePanel) headerLayout(width int) knowledgeHeaderLayout {
 	return layout
 }
 
-func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) {
+func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	if k.pendingAction != nil {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			k.actionConfirmScroll -= 3
+			if k.actionConfirmScroll < 0 {
+				k.actionConfirmScroll = 0
+			}
+			return nil
+		case tea.MouseButtonWheelDown:
+			k.actionConfirmScroll += 3
+			return nil
+		}
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			if msg.Y == k.actionConfirmButtonY {
+				if k.actionConfirmRunRange.contains(msg.X) {
+					return k.confirmPendingAction()
+				}
+				if k.actionConfirmNoRange.contains(msg.X) {
+					k.cancelPendingAction()
+					return nil
+				}
+			}
+			k.cancelPendingAction()
+		}
+		return nil
+	}
 	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		if msg.Y == k.actionsHeaderY {
+			k.actionsCollapsed = !k.actionsCollapsed
+			return nil
+		}
+		if action, ok := k.actionRows[msg.Y]; ok {
+			k.openActionConfirmation(action)
+			return nil
+		}
 		if msg.Y == k.plansHeaderY {
 			k.plansCollapsed = !k.plansCollapsed
-			return
+			return nil
 		}
 		if msg.Y == k.jobsHeaderY {
 			k.jobsCollapsed = !k.jobsCollapsed
-			return
+			return nil
 		}
 	}
 	if msg.Y == 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
@@ -958,7 +1214,7 @@ func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) {
 			if err := k.writeSettings(); err != nil && !settingsWriteWasCommitted(err) {
 				k.autoContinue, k.dual = oldAutoContinue, oldDual
 			}
-			return
+			return nil
 		}
 		if layout.dual.contains(msg.X) {
 			oldAutoContinue, oldDual := k.autoContinue, k.dual
@@ -969,7 +1225,7 @@ func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) {
 			if err := k.writeSettings(); err != nil && !settingsWriteWasCommitted(err) {
 				k.autoContinue, k.dual = oldAutoContinue, oldDual
 			}
-			return
+			return nil
 		}
 	}
 	switch msg.Button {
@@ -981,9 +1237,33 @@ func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) {
 	case tea.MouseButtonWheelDown:
 		k.scrollOffset += 3
 	}
+	return nil
 }
 
-func (k *KnowledgePanel) handleKey(msg tea.KeyMsg) {
+func (k *KnowledgePanel) handleKey(msg tea.KeyMsg) tea.Cmd {
+	if k.pendingAction != nil {
+		switch msg.String() {
+		case "esc", "n":
+			k.cancelPendingAction()
+		case "enter", "y":
+			return k.confirmPendingAction()
+		case "up":
+			k.actionConfirmScroll--
+			if k.actionConfirmScroll < 0 {
+				k.actionConfirmScroll = 0
+			}
+		case "down":
+			k.actionConfirmScroll++
+		case "pgup":
+			k.actionConfirmScroll -= 10
+			if k.actionConfirmScroll < 0 {
+				k.actionConfirmScroll = 0
+			}
+		case "pgdown":
+			k.actionConfirmScroll += 10
+		}
+		return nil
+	}
 	switch msg.String() {
 	case "up":
 		k.scrollOffset--
@@ -1000,6 +1280,7 @@ func (k *KnowledgePanel) handleKey(msg tea.KeyMsg) {
 	case "pgdown":
 		k.scrollOffset += 10
 	}
+	return nil
 }
 
 func knowledgeSectionLine(content, title string) int {
@@ -1030,11 +1311,16 @@ func (k *KnowledgePanel) View(width, height int) string {
 	}
 
 	header := k.headerLayout(k.width).rendered
+	k.actionsHeaderY = -1
 	k.plansHeaderY = -1
 	k.jobsHeaderY = -1
+	k.actionRows = make(map[int]akactions.Action)
 
 	if k.height < 2 {
 		return header
+	}
+	if k.pendingAction != nil {
+		return k.renderActionConfirmation(header)
 	}
 	bodyHeight := k.height - 1
 	var diagnostics []string
@@ -1056,6 +1342,12 @@ func (k *KnowledgePanel) View(width, height int) string {
 	if k.kanbanWatchError != "" {
 		diagnostics = append(diagnostics, "Kanban live-update warning: "+k.kanbanWatchError)
 	}
+	if k.actionsError != "" {
+		diagnostics = append(diagnostics, "Actions read warning: "+k.actionsError)
+	}
+	if k.actionsWatchError != "" {
+		diagnostics = append(diagnostics, "Actions live-update warning: "+k.actionsWatchError)
+	}
 	warning := ""
 	if len(diagnostics) > 0 {
 		warning = lipgloss.NewStyle().Foreground(lipgloss.Color(k.palette.Error)).Render(
@@ -1063,16 +1355,32 @@ func (k *KnowledgePanel) View(width, height int) string {
 		)
 		bodyHeight--
 	}
+	statusLine := ""
+	if k.actionStatus != "" && bodyHeight > 0 {
+		color := k.palette.Success
+		if k.actionStatusIsError {
+			color = k.palette.Error
+		}
+		statusLine = lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(
+			ansi.Truncate("Action: "+strconv.QuoteToGraphic(k.actionStatus), k.width, "…"),
+		)
+		bodyHeight--
+	}
+	if bodyHeight < 0 {
+		bodyHeight = 0
+	}
 	lines := []string{}
 	sectionBody := ""
-	sectionLines := [2]int{-1, -1}
+	sectionLines := [3]int{-1, -1, -1}
 	if bodyHeight > 0 {
-		sectionBody = akui.ContentWithTheme(k.width, k.data, k.jobs, k.currentTask, k.palette, akui.CollapseState{
-			Plans: k.plansCollapsed,
-			Jobs:  k.jobsCollapsed,
+		sectionBody = akui.ContentWithActions(k.width, k.data, k.jobs, k.currentTask, k.actions, k.palette, akui.CollapseState{
+			Actions: k.actionsCollapsed,
+			Plans:   k.plansCollapsed,
+			Jobs:    k.jobsCollapsed,
 		})
 		plainBody := ansi.Strip(sectionBody)
-		sectionLines = [2]int{
+		sectionLines = [3]int{
+			knowledgeSectionLine(plainBody, "Actions"),
 			knowledgeSectionLine(plainBody, "Plans"),
 			knowledgeSectionLine(plainBody, "Jobs"),
 		}
@@ -1097,28 +1405,45 @@ func (k *KnowledgePanel) View(width, height int) string {
 	if warning != "" {
 		sectionBaseY++
 	}
+	if statusLine != "" {
+		sectionBaseY++
+	}
 	for index, sectionLine := range sectionLines {
 		visibleLine := sectionLine - k.scrollOffset
 		if sectionLine < 0 || visibleLine < 0 || visibleLine >= bodyHeight {
 			continue
 		}
 		headerY := sectionBaseY + visibleLine
-		if index == 0 {
+		switch index {
+		case 0:
+			k.actionsHeaderY = headerY
+		case 1:
 			k.plansHeaderY = headerY
-		} else {
+		case 2:
 			k.jobsHeaderY = headerY
+		}
+	}
+	if sectionLines[0] >= 0 && !k.actionsCollapsed {
+		for index, action := range k.actions {
+			visibleLine := sectionLines[0] + index + 1 - k.scrollOffset
+			if visibleLine >= 0 && visibleLine < bodyHeight {
+				k.actionRows[sectionBaseY+visibleLine] = action
+			}
 		}
 	}
 	for len(lines) < bodyHeight {
 		lines = append(lines, strings.Repeat(" ", k.width))
 	}
 	content := strings.Join(lines, "\n")
+	prefix := []string{header}
 	if warning != "" {
-		if content != "" {
-			content = warning + "\n" + content
-		} else {
-			content = warning
-		}
+		prefix = append(prefix, warning)
 	}
-	return header + "\n" + content
+	if statusLine != "" {
+		prefix = append(prefix, statusLine)
+	}
+	if content != "" {
+		prefix = append(prefix, content)
+	}
+	return strings.Join(prefix, "\n")
 }

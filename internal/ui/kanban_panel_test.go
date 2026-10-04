@@ -712,6 +712,9 @@ func TestTaskStatusWritesUseExplicitProfilePath(t *testing.T) {
 	if err := writeTaskToChatStatus(profile, sessionID, "Build", "/tmp/build.md"); err != nil {
 		t.Fatal(err)
 	}
+	if schema, err := paths.ReadSessionSchemaVersion(profile, sessionID); err != nil || schema != paths.CurrentSessionSchemaVersion {
+		t.Fatalf("new task session schema = %d, error = %v", schema, err)
+	}
 	statusPath := filepath.Join(paths.SessionDir(profile, sessionID), "status.json")
 	data, err := os.ReadFile(statusPath)
 	if err != nil {
@@ -733,6 +736,28 @@ func TestTaskStatusWritesUseExplicitProfilePath(t *testing.T) {
 	}
 	if strings.Contains(string(data), `"task_path"`) {
 		t.Fatalf("removed status retained stale task_path: %s", data)
+	}
+}
+
+func TestTaskStatusWritersPreserveLegacySessionSchema(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	profile := "legacy-task-status"
+	sessionID := "legacy-task-status__chat"
+	sessionDir := paths.SessionDir(profile, sessionID)
+	if err := os.MkdirAll(sessionDir, paths.PrivateDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTaskToChatStatus(profile, sessionID, "Build", "/tmp/build.md"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTaskRemovedFromChat(profile, sessionID, "Build"); err != nil {
+		t.Fatal(err)
+	}
+	if schema, err := paths.ReadSessionSchemaVersion(profile, sessionID); err != nil || schema != 0 {
+		t.Fatalf("legacy task session schema = %d, error = %v", schema, err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, "session.json")); !os.IsNotExist(err) {
+		t.Fatalf("task writer created legacy manifest: %v", err)
 	}
 }
 

@@ -2,11 +2,240 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/HumanHorizon/automata/internal/tree"
 	"github.com/Starframe/portalis"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
+
+func TestStopSessionRuntimeCommandPreservesStateUntilJobsFinish(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "success"},
+		{name: "failure", err: errors.New("injected job stop failure")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const sessionID = "async-stop__chat"
+			em := portalis.NewEmulator(sessionID, "chat", "/tmp", nil)
+			app := &App{
+				activeSessions:        map[string]struct{}{sessionID: {}},
+				runningSessions:       map[string]struct{}{sessionID: {}},
+				emulatorCache:         map[string]*portalis.Emulator{sessionID: em},
+				familiarEmulatorCache: make(map[string]*portalis.Emulator),
+			}
+			started := make(chan struct{})
+			release := make(chan struct{})
+			app.killSessionFn = func(_, got string) error {
+				if got != sessionID {
+					t.Fatalf("stopped session = %q, want %q", got, sessionID)
+				}
+				close(started)
+				<-release
+				return test.err
+			}
+			cmd, err := app.stopSessionRuntimeCmd(sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !app.runtimeOperationPending(sessionID) {
+				t.Fatal("runtime operation was not reserved before command start")
+			}
+			completion := make(chan sessionStopJobsCompletedMsg, 1)
+			go func() { completion <- cmd().(sessionStopJobsCompletedMsg) }()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				close(release)
+				t.Fatal("job stop command did not start")
+			}
+			if app.emulatorCache[sessionID] != em || !app.runtimeOperationPending(sessionID) {
+				close(release)
+				t.Fatal("runtime changed before job stop completed")
+			}
+			if _, exists := app.activeSessions[sessionID]; !exists {
+				close(release)
+				t.Fatal("active session was cleared before job stop completed")
+			}
+			close(release)
+			result := <-completion
+			app.Update(result)
+			if app.runtimeOperationPending(sessionID) {
+				t.Fatal("completion retained runtime operation reservation")
+			}
+			if test.err != nil {
+				if app.emulatorCache[sessionID] != em {
+					t.Fatal("failed job stop removed runtime emulator")
+				}
+				if _, exists := app.activeSessions[sessionID]; !exists {
+					t.Fatal("failed job stop cleared active session")
+				}
+				return
+			}
+			if app.emulatorCache[sessionID] != nil {
+				t.Fatal("successful job stop retained runtime emulator")
+			}
+			if _, exists := app.activeSessions[sessionID]; exists {
+				t.Fatal("successful job stop retained active session")
+			}
+		})
+	}
+}
+
+func TestAppUpdateReturnsBeforeBlockingStopCommandCompletes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	app := newApp("", "")
+	defer app.Close()
+	app.tree.AddChat("agent")
+	item := app.tree.AllItems()[0]
+	sessionID := app.tree.SessionKeyOf(item)
+	em := portalis.NewEmulator(sessionID, item.Name, "/bin/sh", nil)
+	app.activeSessions[sessionID] = struct{}{}
+	app.runningSessions[sessionID] = struct{}{}
+	app.emulatorCache[sessionID] = em
+	app.tree.SetActiveSessionsInMemory(app.activeSessions)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	app.killSessionFn = func(_, got string) error {
+		if got != sessionID {
+			t.Errorf("stopped session = %q, want %q", got, sessionID)
+		}
+		close(started)
+		<-release
+		return nil
+	}
+
+	app.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	app.View()
+	stopX, stopY := -1, -1
+	for y, line := range strings.Split(ansi.Strip(app.tree.View(30, 24)), "\n") {
+		index := strings.Index(line, "■")
+		if index >= 0 && strings.Contains(line, item.Name) {
+			stopX, stopY = ansi.StringWidth(line[:index]), y
+			break
+		}
+	}
+	if stopX < 0 {
+		t.Fatal("rendered Tree has no active-session stop button")
+	}
+
+	type updateResult struct{ cmd tea.Cmd }
+	updated := make(chan updateResult, 1)
+	go func() {
+		_, cmd := app.Update(tea.MouseMsg{
+			X: stopX, Y: stopY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress,
+		})
+		updated <- updateResult{cmd: cmd}
+	}()
+	var cmd tea.Cmd
+	select {
+	case result := <-updated:
+		cmd = result.cmd
+	case <-started:
+		close(release)
+		<-updated
+		t.Fatal("App.Update blocked on job shutdown")
+	case <-time.After(time.Second):
+		close(release)
+		<-updated
+		t.Fatal("App.Update did not return promptly")
+	}
+	if cmd == nil {
+		t.Fatal("Stop click returned no command")
+	}
+	if !app.runtimeOperationPending(sessionID) || app.emulatorCache[sessionID] != em {
+		t.Fatal("Stop click changed runtime state before its command completed")
+	}
+
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Stop click command result = %T, want tea.BatchMsg", cmd())
+	}
+	completed := make(chan sessionStopJobsCompletedMsg, 1)
+	for _, child := range batch {
+		go func(child tea.Cmd) {
+			if result, ok := child().(sessionStopJobsCompletedMsg); ok {
+				completed <- result
+			}
+		}(child)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("returned Stop command did not start the blocking job shutdown")
+	}
+	if app.emulatorCache[sessionID] != em {
+		t.Fatal("blocking job shutdown changed runtime before completion")
+	}
+	close(release)
+	select {
+	case result := <-completed:
+		app.Update(result)
+	case <-time.After(time.Second):
+		t.Fatal("blocking Stop command did not return its completion")
+	}
+	if app.emulatorCache[sessionID] != nil || app.runtimeOperationPending(sessionID) {
+		t.Fatal("Stop completion did not clear runtime and reservation")
+	}
+}
+
+func TestRuntimeOperationRejectsOverlapAndStaleCompletion(t *testing.T) {
+	app := &App{}
+	operationID, err := app.reserveRuntimeOperation([]string{"chat-a", "chat-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.reserveRuntimeOperation([]string{"chat-b", "chat-c"}); err == nil {
+		t.Fatal("overlapping runtime operation was accepted")
+	}
+	if app.runtimeOperationPending("chat-c") {
+		t.Fatal("rejected operation partially reserved its non-overlapping session")
+	}
+	app.handleRuntimeJobsCompleted(runtimeJobsCompletedMsg{
+		operationID: operationID + 1,
+		operation:   "stale completion",
+		sessionIDs:  []string{"chat-a", "chat-b"},
+	})
+	if !app.runtimeOperationOwned(operationID, "chat-a", "chat-b") {
+		t.Fatal("stale completion changed another operation's reservation")
+	}
+	app.handleRuntimeJobsCompleted(runtimeJobsCompletedMsg{
+		operationID: operationID,
+		sessionIDs:  []string{"chat-a", "chat-b"},
+		err:         errors.New("job stop failed"),
+	})
+	if app.runtimeOperationPending("chat-a") || app.runtimeOperationPending("chat-b") {
+		t.Fatal("failed completion retained runtime operation reservation")
+	}
+
+	created := 0
+	app.createChatEmulatorFn = func(sessionID string) *portalis.Emulator {
+		created++
+		return portalis.NewEmulator(sessionID, sessionID, "/tmp", nil)
+	}
+	operationID, err = app.reserveRuntimeOperation([]string{"chat-c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if em := app.newChatEmulator("chat-c"); em != nil || created != 0 {
+		t.Fatal("session start was not blocked by pending runtime operation")
+	}
+	app.releaseRuntimeOperation(operationID)
+}
 
 func TestStopSessionRuntimeClearsOwnerAndFamiliarState(t *testing.T) {
 	tr := tree.New()

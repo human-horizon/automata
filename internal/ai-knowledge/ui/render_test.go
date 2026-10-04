@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/HumanHorizon/automata/internal/ai-knowledge/actions"
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/context"
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	apptheme "github.com/HumanHorizon/automata/internal/theme"
@@ -157,7 +158,7 @@ func TestViewStatusOtherActionsOmitDescription(t *testing.T) {
 
 func TestViewEmpty(t *testing.T) {
 	out := View(40, 10, nil, nil, "")
-	for _, want := range []string{"(no status)", "(no plans)", "(no running jobs)"} {
+	for _, want := range []string{"(no status)", "(no actions)", "(no plans)", "(no running jobs)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
@@ -227,6 +228,56 @@ func TestContentWithThemeKeepsAllLinesAndCollapsesSections(t *testing.T) {
 		if !strings.Contains(collapsed, want) {
 			t.Errorf("collapsed section header missing %q: %s", want, collapsed)
 		}
+	}
+}
+
+func TestContentWithActionsPlacementCollapseAndSafety(t *testing.T) {
+	const width = 28
+	actionList := []actions.Action{{
+		ID:      strings.Repeat("a", 64),
+		Name:    "Open the local application preview",
+		Command: "open https://example.test",
+		CWD:     "/private/workspace",
+	}}
+	content := ContentWithActions(width, nil, nil, "Current task", actionList, apptheme.Default(), CollapseState{})
+	plain := content
+	positions := make(map[string]int)
+	for section, marker := range map[string]string{
+		"Status":  "── Status",
+		"Actions": "Actions",
+		"Task":    "── Task",
+		"Plans":   "Plans",
+		"Jobs":    "Jobs",
+	} {
+		positions[section] = strings.Index(plain, marker)
+		if positions[section] < 0 {
+			t.Fatalf("missing %s section: %s", section, plain)
+		}
+	}
+	if positions["Status"] >= positions["Actions"] || positions["Actions"] >= positions["Task"] || positions["Task"] >= positions["Plans"] || positions["Plans"] >= positions["Jobs"] {
+		t.Fatalf("section order is incorrect: %#v", positions)
+	}
+	if strings.Contains(plain, actionList[0].Command) || strings.Contains(plain, actionList[0].CWD) {
+		t.Fatalf("command details were exposed before confirmation: %s", plain)
+	}
+	lines := strings.Split(content, "\n")
+	actionHeader := -1
+	for index, line := range lines {
+		if strings.Contains(line, "Actions") {
+			actionHeader = index
+			break
+		}
+	}
+	if actionHeader < 0 || actionHeader+1 >= len(lines) || !strings.Contains(lines[actionHeader+1], "Open the local") {
+		t.Fatalf("action row is missing or wrapped into multiple hitbox rows: %q", lines)
+	}
+	if got := lipgloss.Width(lines[actionHeader+1]); got > width {
+		t.Fatalf("action row width = %d, viewport = %d", got, width)
+	}
+
+	collapsed := ContentWithActions(width, nil, nil, "", actionList, apptheme.Default(), CollapseState{Actions: true})
+	if strings.Contains(collapsed, actionList[0].Name) || !strings.Contains(collapsed, "── ▸ Actions") {
+		t.Fatalf("Actions did not collapse: %s", collapsed)
 	}
 }
 

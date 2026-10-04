@@ -16,6 +16,7 @@ import (
 	"time"
 	"unsafe"
 
+	akactions "github.com/HumanHorizon/automata/internal/ai-knowledge/actions"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/scrollback"
 	"github.com/HumanHorizon/automata/internal/status"
@@ -40,6 +41,24 @@ func installFakePi(t *testing.T) string {
 	return path
 }
 
+func runClearLifecycleForTest(t *testing.T, app *App, sessionID, cwd string, familiarIDs []string) (clearSessionJobsCompletedMsg, *clearSessionRestartCompletedMsg) {
+	t.Helper()
+	jobsMsg, ok := app.clearSessionCmd(sessionID, cwd, familiarIDs)().(clearSessionJobsCompletedMsg)
+	if !ok {
+		t.Fatalf("Clear jobs result has unexpected type")
+	}
+	_, restartCmd := app.Update(jobsMsg)
+	if restartCmd == nil {
+		return jobsMsg, nil
+	}
+	result, ok := restartCmd().(clearSessionRestartCompletedMsg)
+	if !ok {
+		t.Fatalf("Clear restart result has unexpected type")
+	}
+	app.Update(result)
+	return jobsMsg, &result
+}
+
 func TestAppViewModal(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	app := newApp("", "")
@@ -61,9 +80,36 @@ func TestAppViewModal(t *testing.T) {
 	}
 }
 
+func TestClearPreservesFolderActions(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	profile := "default"
+	domain := "default__workspace"
+	actionsDir, err := akactions.Directory(profile, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(actionsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	actionID := strings.Repeat("b", 64)
+	actionJSON := fmt.Sprintf(`{"id":%q,"name":"Build","command":"make test","cwd":"/work"}`, actionID)
+	if err := os.WriteFile(filepath.Join(actionsDir, actionID+".json"), []byte(actionJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clearSessionData(profile, domain+".chat", "/work", t.TempDir(), nil); err != nil {
+		t.Fatalf("clearSessionData: %v", err)
+	}
+	got, err := akactions.ReadForProfile(profile, domain)
+	if err != nil || len(got) != 1 || got[0].Command != "make test" {
+		t.Fatalf("folder action was not preserved by Clear: err=%v actions=%#v", err, got)
+	}
+}
+
 func TestClearRestartsChatWithConfiguredPiAgentDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
 	installFakePi(t)
 
 	const sessionID = "profile__chat"
@@ -83,15 +129,17 @@ func TestClearRestartsChatWithConfiguredPiAgentDir(t *testing.T) {
 
 	t.Log("Дано: чат запущен с каталогом агента ~/.ai/just/pi")
 	t.Log("Когда: пользователь нажимает Clear")
-	restartResult := app.clearSessionCmd(sessionID, "", nil)()
+	jobsResult, restartResult := runClearLifecycleForTest(t, app, sessionID, "", nil)
 
-	t.Log("Тогда: Clear синхронно запускает новый PTY и сообщает Automata продолжить Listen")
-	ready, ok := restartResult.(portalis.PtyReadyMsg)
-	if !ok {
-		t.Fatalf("Clear returned %T, want portalis.PtyReadyMsg", restartResult)
+	t.Log("Тогда: Clear asynchronously stops jobs and restarts the PTY through completion messages")
+	if jobsResult.err != nil {
+		t.Fatalf("Clear jobs phase failed: %v", jobsResult.err)
 	}
-	if ready.SessionID != sessionID {
-		t.Fatalf("restarted session = %q, want %q", ready.SessionID, sessionID)
+	if restartResult == nil || restartResult.err != nil {
+		t.Fatalf("Clear restart result = %+v, want success", restartResult)
+	}
+	if restartResult.sessionID != sessionID {
+		t.Fatalf("restarted session = %q, want %q", restartResult.sessionID, sessionID)
 	}
 	if restarted == nil || restarted.SessionID != sessionID {
 		t.Fatalf("started session = %v, want %q", restarted, sessionID)
@@ -99,17 +147,20 @@ func TestClearRestartsChatWithConfiguredPiAgentDir(t *testing.T) {
 
 	t.Log("И: эмулятор несёт PI_CODING_AGENT_DIR и canonical default profile в startEnv")
 	gotEnv := restarted.StartEnv()
-	for _, wantEnv := range []string{
+	requiredEnv := []string{
 		"PI_CODING_AGENT_DIR=" + piAgentDir,
 		"AI_PROFILE=default",
 		"AUTOMATA_PROFILE=default",
-	} {
+		"AI_DATA_HOME=" + home,
+		"AUTOMATA_HUMAN_EXPORT=1",
+	}
+	for _, wantEnv := range requiredEnv {
 		if !containsString(gotEnv, wantEnv) {
 			t.Fatalf("start environment = %#v, missing %q", gotEnv, wantEnv)
 		}
 	}
-	if len(gotEnv) != 3 {
-		t.Fatalf("start environment = %#v, want agent dir and both profile variables", gotEnv)
+	if len(gotEnv) != len(requiredEnv) {
+		t.Fatalf("start environment = %#v, want exactly %#v", gotEnv, requiredEnv)
 	}
 }
 
@@ -597,6 +648,7 @@ func TestClearSessionErrorMessageSurfacesOnCapturedChatPanel(t *testing.T) {
 }
 
 func TestClearRestartFailureDoesNotRestoreActiveSession(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
 	t.Setenv("PI_CMD", "/bin/sh")
 	const sessionID = "restart-failure"
 	app := &App{
@@ -609,16 +661,192 @@ func TestClearRestartFailureDoesNotRestoreActiveSession(t *testing.T) {
 		return fmt.Errorf("injected start failure")
 	}
 
-	msg := app.clearSessionCmd(sessionID, "", nil)()
-	clearErr, ok := msg.(clearSessionErrorMsg)
-	if !ok || clearErr.err == nil || !strings.Contains(clearErr.err.Error(), "injected start failure") {
-		t.Fatalf("failed restart result = %#v, want visible startup error", msg)
+	jobsResult, restartResult := runClearLifecycleForTest(t, app, sessionID, "", nil)
+	if jobsResult.err != nil {
+		t.Fatalf("Clear jobs phase failed unexpectedly: %v", jobsResult.err)
+	}
+	if restartResult == nil || restartResult.err == nil || !strings.Contains(restartResult.err.Error(), "injected start failure") {
+		t.Fatalf("failed restart result = %#v, want visible startup error", restartResult)
 	}
 	if _, ok := app.emulatorCache[sessionID]; ok {
 		t.Fatal("failed restart remained in emulator cache")
 	}
 	if _, ok := app.activeSessions[sessionID]; ok {
 		t.Fatal("failed restart remained active")
+	}
+}
+
+func TestClearPreflightFailurePreservesRuntimeAndData(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", filepath.Join(home, "data"))
+	installFakePi(t)
+	const (
+		profile    = "clear-preflight"
+		ownerID    = "clear-preflight__chat"
+		familiarID = "clear-preflight__chat__expert"
+		cwd        = "/workspace"
+	)
+	ownerHistory := writeJSONLFixture(t, home, cwd, ownerID, time.Now())
+	familiarHistory := writeJSONLFixture(t, home, cwd, familiarID, time.Now())
+	registryPath := paths.FamiliarsJSONLPath(profile, ownerID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registryData := []byte(`[{"id":"expert","sessionId":"` + familiarID + `"}]` + "\n")
+	if err := os.WriteFile(registryPath, registryData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ownerEm := portalis.NewEmulator(ownerID, "chat", "/bin/sh", nil)
+	familiarEm := portalis.NewEmulator(familiarID, "expert", "/bin/sh", nil)
+	app := &App{
+		profile:               profile,
+		piAgentDir:            filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:        map[string]struct{}{ownerID: {}, familiarID: {}},
+		runningSessions:       map[string]struct{}{ownerID: {}, familiarID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{ownerID: ownerEm},
+		familiarEmulatorCache: map[string]*portalis.Emulator{familiarID: familiarEm},
+	}
+	preflightErr := errors.New("injected jobs preflight failure")
+	app.prepareJobSessionFn = func(_, _ string) error { return preflightErr }
+	app.killSessionFn = func(string, string) error {
+		t.Fatal("job execution started after preflight failure")
+		return nil
+	}
+	restarted := false
+	app.startEmulatorSyncFn = func(*portalis.Emulator, []string) error {
+		restarted = true
+		return nil
+	}
+
+	result, ok := app.clearSessionCmd(ownerID, cwd, []string{familiarID})().(clearSessionJobsCompletedMsg)
+	if !ok || result.err == nil || !errors.Is(result.err, preflightErr) || result.runtimeCommitted {
+		t.Fatalf("Clear preflight result = %+v, want uncommitted preflight error", result)
+	}
+	app.Update(result)
+	if app.runtimeOperationPending(ownerID) || app.runtimeOperationPending(familiarID) {
+		t.Fatal("preflight error retained runtime reservations")
+	}
+	if app.emulatorCache[ownerID] != ownerEm || app.familiarEmulatorCache[familiarID] != familiarEm {
+		t.Fatal("preflight error changed cached runtime")
+	}
+	for _, sessionID := range []string{ownerID, familiarID} {
+		if _, active := app.activeSessions[sessionID]; !active {
+			t.Fatalf("preflight error cleared active session %q", sessionID)
+		}
+		if _, running := app.runningSessions[sessionID]; !running {
+			t.Fatalf("preflight error cleared running session %q", sessionID)
+		}
+	}
+	for _, historyPath := range []string{ownerHistory, familiarHistory} {
+		if _, err := os.Stat(historyPath); err != nil {
+			t.Errorf("preflight error changed history %s: %v", historyPath, err)
+		}
+	}
+	gotRegistry, err := os.ReadFile(registryPath)
+	if err != nil || string(gotRegistry) != string(registryData) {
+		t.Fatalf("preflight error changed registry: got=%q err=%v", gotRegistry, err)
+	}
+	if restarted {
+		t.Fatal("Clear restarted Pi after preflight failure")
+	}
+}
+
+func TestClearReservesRuntimeTargetsUntilRestartCompletion(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const (
+		ownerID    = "clear-reservation__chat"
+		familiarID = "clear-reservation__chat__expert"
+	)
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	var stopped []string
+	emulatorCreated, emulatorStarted := false, false
+	app := &App{
+		piAgentDir: filepath.Join(t.TempDir(), ".ai", "just", "pi"),
+		activeSessions: map[string]struct{}{
+			ownerID: {}, familiarID: {},
+		},
+		emulatorCache: map[string]*portalis.Emulator{
+			ownerID: portalis.NewEmulator(ownerID, "chat", "/bin/sh", nil),
+		},
+		familiarEmulatorCache: map[string]*portalis.Emulator{
+			familiarID: portalis.NewEmulator(familiarID, "expert", "/bin/sh", nil),
+		},
+		createChatEmulatorFn: func(sessionID string) *portalis.Emulator {
+			emulatorCreated = true
+			return portalis.NewEmulator(sessionID, sessionID, "/bin/sh", nil)
+		},
+		startEmulatorSyncFn: func(*portalis.Emulator, []string) error {
+			emulatorStarted = true
+			return nil
+		},
+		killSessionFn: func(_, sessionID string) error {
+			started <- struct{}{}
+			<-release
+			stopped = append(stopped, sessionID)
+			return nil
+		},
+	}
+
+	clearCmd := app.clearSessionCmd(ownerID, "", []string{familiarID})
+	if !app.runtimeOperationPending(ownerID) || !app.runtimeOperationPending(familiarID) {
+		t.Fatal("Clear did not reserve owner and familiar sessions before returning its command")
+	}
+	duplicate, ok := app.clearSessionCmd(ownerID, "", []string{familiarID})().(clearSessionErrorMsg)
+	if !ok || duplicate.err == nil {
+		t.Fatalf("duplicate Clear result = %#v, want reservation error", duplicate)
+	}
+	if lateEm, _ := app.createFamiliarEmulator(ownerID + "__late"); lateEm != nil {
+		t.Fatal("Clear reservation allowed a new familiar session under the owner")
+	}
+
+	resultCh := make(chan tea.Msg, 1)
+	go func() { resultCh <- clearCmd() }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Clear did not enter its blocking job-stop phase")
+	}
+	if len(app.emulatorCache) != 1 || app.emulatorCache[ownerID] == nil {
+		t.Fatal("Clear command mutated App runtime cache before completion")
+	}
+	close(release)
+	jobsMsg, ok := (<-resultCh).(clearSessionJobsCompletedMsg)
+	if !ok || jobsMsg.err != nil {
+		t.Fatalf("Clear jobs result = %+v, want success", jobsMsg)
+	}
+	if len(stopped) != 2 {
+		t.Fatalf("job stop calls = %d, want one for each session: %v", len(stopped), stopped)
+	}
+
+	_, restartCmd := app.Update(jobsMsg)
+	if restartCmd == nil {
+		t.Fatal("Clear did not return restart command after successful host cleanup")
+	}
+	if !emulatorCreated || emulatorStarted {
+		t.Fatalf("Clear restart state after Update: created=%v started=%v, want constructed but not started", emulatorCreated, emulatorStarted)
+	}
+	if !app.runtimeOperationPending(ownerID) || !app.runtimeOperationPending(familiarID) {
+		t.Fatal("Clear released reservations before restart completion")
+	}
+	restartMsg, ok := restartCmd().(clearSessionRestartCompletedMsg)
+	if !ok || restartMsg.err != nil {
+		t.Fatalf("Clear restart result = %+v, want success", restartMsg)
+	}
+	if !emulatorStarted {
+		t.Fatal("restart command did not start the emulator")
+	}
+	app.Update(restartMsg)
+	if app.runtimeOperationPending(ownerID) || app.runtimeOperationPending(familiarID) {
+		t.Fatal("Clear retained reservations after restart completion")
 	}
 }
 
@@ -675,13 +903,15 @@ func TestClearPreservesHistoryWhenCommittedJobStopFails(t *testing.T) {
 		return nil
 	}
 
-	msg := app.clearSessionCmd(ownerID, "", []string{familiarID})()
-	clearErr, ok := msg.(clearSessionErrorMsg)
-	if !ok || clearErr.err == nil {
-		t.Fatalf("Clear result = %#v, want job-stop error", msg)
+	clearResult, restartResult := runClearLifecycleForTest(t, app, ownerID, "", []string{familiarID})
+	if clearResult.err == nil {
+		t.Fatalf("Clear result = %#v, want job-stop error", clearResult)
 	}
-	if !strings.Contains(clearErr.err.Error(), "injected job stop failure") {
-		t.Fatalf("Clear error = %q, want job-stop failure", clearErr.err)
+	if !strings.Contains(clearResult.err.Error(), "injected job stop failure") {
+		t.Fatalf("Clear error = %q, want job-stop failure", clearResult.err)
+	}
+	if restartResult != nil {
+		t.Fatalf("Clear unexpectedly restarted after a job-stop failure: %+v", restartResult)
 	}
 	if restarted {
 		t.Fatal("Clear restarted Pi after a job-stop failure")
@@ -837,6 +1067,7 @@ func TestWindowResizeDoesNotSchedulePeriodicWork(t *testing.T) {
 func TestClearKillsFamiliarsOfThisSession(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
 	installFakePi(t)
 
 	const (
@@ -881,10 +1112,17 @@ func TestClearKillsFamiliarsOfThisSession(t *testing.T) {
 		return nil
 	}
 
-	// 4. Act: Clear with the two familiar session ids.
-	msg := app.clearSessionCmd(mainSID, cwd, []string{fam1SID, fam2SID})()
+	// 4. Clear stops host jobs and deletes files before applying runtime state.
+	jobsMsg, ok := app.clearSessionCmd(mainSID, cwd, []string{fam1SID, fam2SID})().(clearSessionJobsCompletedMsg)
+	if !ok || jobsMsg.err != nil {
+		t.Fatalf("Clear jobs result = %+v, want success", jobsMsg)
+	}
+	_, restartCmd := app.Update(jobsMsg)
+	if restartCmd == nil {
+		t.Fatal("Clear did not schedule the chat restart")
+	}
 
-	// 5. Familiars removed from emulator cache.
+	// 5. Familiars are removed from emulator cache after the jobs completion.
 	if _, ok := app.emulatorCache[fam1SID]; ok {
 		t.Errorf("familiar %q still in emulatorCache", fam1SID)
 	}
@@ -909,30 +1147,26 @@ func TestClearKillsFamiliarsOfThisSession(t *testing.T) {
 		t.Errorf("familiars.json = %q, want %q", got, "[]")
 	}
 
-	// 8. Main session is cached but becomes active only when Bubble Tea routes
-	// the ready message returned by the restart command.
-	if _, ok := app.emulatorCache[mainSID]; !ok {
-		t.Error("main emulator missing from emulatorCache after restart")
+	// 8. The restart result is routed on the UI thread before the session is active.
+	if _, ok := app.emulatorCache[mainSID]; ok {
+		t.Error("main emulator was cached before restart completion")
 	}
 	if _, ok := app.activeSessions[mainSID]; ok {
-		t.Error("main became active before PtyReadyMsg was routed")
+		t.Error("main became active before restart completion")
 	}
-	if _, handled := app.routeCachedEmulatorMessage(msg); !handled {
-		t.Fatal("restart PtyReadyMsg was not routed to the cached emulator")
+	restartMsg, ok := restartCmd().(clearSessionRestartCompletedMsg)
+	if !ok || restartMsg.err != nil {
+		t.Fatalf("Clear restart result = %+v, want success", restartMsg)
 	}
+	_, _ = app.Update(restartMsg)
 	if _, ok := app.activeSessions[mainSID]; !ok {
-		t.Error("main not in activeSessions after PtyReadyMsg")
+		t.Error("main not in activeSessions after PtyReadyMsg routing")
 	}
 	if _, ok := app.activeSessions[fam1SID]; ok {
 		t.Errorf("familiar %q still in activeSessions", fam1SID)
 	}
 	if _, ok := app.activeSessions[fam2SID]; ok {
 		t.Errorf("familiar %q still in activeSessions", fam2SID)
-	}
-
-	// 9. Return value is PtyReadyMsg so Warp starts Listen on the new PTY.
-	if _, ok := msg.(portalis.PtyReadyMsg); !ok {
-		t.Errorf("clearSession returned %T, want portalis.PtyReadyMsg", msg)
 	}
 }
 
@@ -1115,6 +1349,159 @@ func TestCleanupExternallyRemovedFamiliarPreflightFailurePreservesRuntime(t *tes
 	}
 }
 
+func TestAsyncFamiliarCleanupFailurePreservesHostStateAndData(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
+	const (
+		profile = "async-familiar-failure"
+		mainSID = "async-familiar-failure__chat"
+		famSID  = "async-familiar-failure__chat__expert"
+		cwd     = "/tmp"
+	)
+	jsonlPath := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	registryPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registryContents := []byte(`[{"id":"expert","sessionId":"` + famSID + `"}]`)
+	if err := os.WriteFile(registryPath, registryContents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
+	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	panel := ui.NewChatPanel(mainEm, mainSID, profile)
+	stopErr := errors.New("unknown job PID identity")
+	app := &App{
+		profile:               profile,
+		piAgentDir:            filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:        map[string]struct{}{famSID: {}},
+		runningSessions:       map[string]struct{}{famSID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{famSID: familiarEm},
+		familiarEmulatorCache: map[string]*portalis.Emulator{famSID: familiarEm},
+		killSessionFn:         func(string, string) error { return stopErr },
+	}
+	beforeView := familiarEm.View(80, 12)
+	cmd := app.requestFamiliarCleanup(panel, famSID, familiarEm, ui.FamiliarCloseCleanup)
+	if cmd == nil {
+		t.Fatal("cleanup command is nil")
+	}
+	result := cmd().(ui.FamiliarCleanupResultMsg)
+	if result.Committed || !errors.Is(result.Err, stopErr) {
+		t.Fatalf("job failure result = committed:%v err:%v", result.Committed, result.Err)
+	}
+	if _, completion := app.Update(result); completion != nil {
+		t.Fatal("failed cleanup unexpectedly returned a follow-up command")
+	}
+	if app.emulatorCache[famSID] != familiarEm || app.familiarEmulatorCache[famSID] != familiarEm {
+		t.Fatal("job failure changed emulator caches")
+	}
+	if _, exists := app.activeSessions[famSID]; !exists {
+		t.Fatal("job failure changed active session state")
+	}
+	if _, exists := app.runningSessions[famSID]; !exists {
+		t.Fatal("job failure changed running session state")
+	}
+	if familiarEm.View(80, 12) != beforeView {
+		t.Fatal("job failure stopped the familiar emulator")
+	}
+	if _, err := os.Stat(jsonlPath); err != nil {
+		t.Fatalf("job failure changed familiar history: %v", err)
+	}
+	gotRegistry, err := os.ReadFile(registryPath)
+	if err != nil || string(gotRegistry) != string(registryContents) {
+		t.Fatalf("job failure changed registry: contents=%q err=%v", gotRegistry, err)
+	}
+	if app.runtimeOperationPending(mainSID) || app.runtimeOperationPending(famSID) {
+		t.Fatal("failed cleanup retained runtime operation reservation")
+	}
+}
+
+func TestAsyncFamiliarCloseCommitsInContractOrder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
+	const (
+		profile = "async-familiar-success"
+		mainSID = "async-familiar-success__chat"
+		famSID  = "async-familiar-success__chat__expert"
+		cwd     = "/tmp"
+	)
+	jsonlPath := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	registryPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, []byte(`[{"id":"expert","sessionId":"`+famSID+`"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
+	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	panel := ui.NewChatPanel(mainEm, mainSID, profile)
+	killCalls := 0
+	app := &App{
+		profile:               profile,
+		piAgentDir:            filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:        map[string]struct{}{famSID: {}},
+		runningSessions:       map[string]struct{}{famSID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{famSID: familiarEm},
+		familiarEmulatorCache: map[string]*portalis.Emulator{famSID: familiarEm},
+		killSessionFn: func(string, string) error {
+			killCalls++
+			return nil
+		},
+	}
+	cmd := app.requestFamiliarCleanup(panel, famSID, familiarEm, ui.FamiliarCloseCleanup)
+	if cmd == nil {
+		t.Fatal("cleanup command is nil")
+	}
+	jobsResult := cmd().(ui.FamiliarCleanupResultMsg)
+	if !jobsResult.Committed || jobsResult.Phase != ui.FamiliarJobsStopped || killCalls != 1 {
+		t.Fatalf("jobs completion = %+v calls=%d", jobsResult, killCalls)
+	}
+	if app.emulatorCache[famSID] != familiarEm || app.familiarEmulatorCache[famSID] != familiarEm {
+		t.Fatal("background command mutated runtime caches before App.Update")
+	}
+	if _, err := os.Stat(jsonlPath); err != nil {
+		t.Fatalf("history was removed before runtime cleanup: %v", err)
+	}
+	var entries []paths.FamiliarEntry
+	registryData, err := os.ReadFile(registryPath)
+	if err != nil || json.Unmarshal(registryData, &entries) != nil || len(entries) != 0 {
+		t.Fatalf("registry was not committed after jobs: data=%q err=%v", registryData, err)
+	}
+
+	_, historyCmd := app.Update(jobsResult)
+	if app.emulatorCache[famSID] != nil || app.familiarEmulatorCache[famSID] != nil {
+		t.Fatal("App.Update did not clear runtime caches after registry commit")
+	}
+	if _, exists := app.activeSessions[famSID]; exists {
+		t.Fatal("App.Update did not clear active-session state")
+	}
+	if _, exists := app.runningSessions[famSID]; exists {
+		t.Fatal("App.Update did not clear running-session state")
+	}
+	if _, err := os.Stat(jsonlPath); err != nil {
+		t.Fatalf("history was removed before host runtime cleanup completed: %v", err)
+	}
+	if historyCmd == nil {
+		t.Fatal("committed close did not schedule history cleanup")
+	}
+	historyResult, ok := historyCmd().(ui.FamiliarCleanupResultMsg)
+	if !ok || historyResult.Phase != ui.FamiliarHistoryRemoved || !historyResult.Committed {
+		t.Fatalf("history completion = %#v", historyResult)
+	}
+	app.Update(historyResult)
+	if _, err := os.Stat(jsonlPath); !os.IsNotExist(err) {
+		t.Fatalf("history still exists after final cleanup: %v", err)
+	}
+	if app.runtimeOperationPending(mainSID) || app.runtimeOperationPending(famSID) {
+		t.Fatal("successful cleanup retained runtime operation reservation")
+	}
+}
+
 func TestCloseFamiliarRegistryPrecommitFailureRemainsRetryable(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -1238,6 +1625,7 @@ func TestCloseFamiliarCompletesHostCleanupAfterCommittedPersistenceFailure(t *te
 func TestClearKillsFamiliarsRespectsProfile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
 	installFakePi(t)
 
 	const (
@@ -1269,7 +1657,10 @@ func TestClearKillsFamiliarsRespectsProfile(t *testing.T) {
 	}
 	app.startEmulatorSyncFn = func(em *portalis.Emulator, env []string) error { return nil }
 
-	app.clearSessionCmd(mainSID, cwd, []string{famSID})()
+	jobsResult, restartResult := runClearLifecycleForTest(t, app, mainSID, cwd, []string{famSID})
+	if jobsResult.err != nil || restartResult == nil || restartResult.err != nil {
+		t.Fatalf("Clear lifecycle failed: jobs=%+v restart=%+v", jobsResult, restartResult)
+	}
 
 	if _, err := os.Stat(famJSONL); !os.IsNotExist(err) {
 		t.Errorf("familiar JSONL still exists: %v", err)
@@ -1316,6 +1707,7 @@ func TestClearReplacesPanelEmulator(t *testing.T) {
 	t.Setenv("PI_CMD", "/bin/sh")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
 
 	const sessionID = "humanhorizon__chat"
 
@@ -1342,9 +1734,10 @@ func TestClearReplacesPanelEmulator(t *testing.T) {
 		t.Fatalf("precondition: cp.sessions[0].em != origEm")
 	}
 
-	// 5. Act: Clear.
-	if msg := app.clearSessionCmd(sessionID, "", nil)(); msg == nil {
-		t.Fatalf("clearSessionCmd returned nil")
+	// 5. Act: Clear through both asynchronous completion stages.
+	jobsResult, restartResult := runClearLifecycleForTest(t, app, sessionID, "", nil)
+	if jobsResult.err != nil || restartResult == nil || restartResult.err != nil {
+		t.Fatalf("Clear lifecycle failed: jobs=%+v restart=%+v", jobsResult, restartResult)
 	}
 
 	// 6. emulatorCache holds a new emulator (different object).

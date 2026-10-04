@@ -46,8 +46,9 @@ type Container struct {
 	onTaskAssigned func(sessionID, taskTitle string) (tea.Cmd, error)
 
 	// Cached dimensions for border calculations.
-	width  int
-	height int
+	width           int
+	height          int
+	localResizeSeen bool
 
 	// Callbacks.
 	onPlanWidthChange func(int) // called when user drags the knowledge border
@@ -363,6 +364,9 @@ func (c *Container) Update(msg tea.Msg) tea.Cmd {
 		return c.applyChatResize()
 
 	case tea.WindowSizeMsg:
+		if c.localResizeSeen {
+			return nil
+		}
 		c.cancelPlanDrag()
 		c.width = msg.Width
 		c.height = msg.Height
@@ -371,6 +375,7 @@ func (c *Container) Update(msg tea.Msg) tea.Cmd {
 		return c.innerTab.Update(msg)
 
 	case warp.ResizeMsg:
+		c.localResizeSeen = true
 		c.cancelPlanDrag()
 		c.width = msg.Width
 		c.height = msg.Height

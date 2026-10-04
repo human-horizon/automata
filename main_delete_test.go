@@ -109,6 +109,18 @@ func TestTreeDeletePreflightsThenRunsCleanupOnlyAfterStateCommit(t *testing.T) {
 	if err := app.tree.DeleteItem(item); err != nil {
 		t.Fatalf("DeleteItem after restoring persistence: %v", err)
 	}
+	if stopCalls != 0 || app.emulatorCache[sessionID] != em || app.currentSessionID != sessionID {
+		t.Fatal("delete mutated runtime before asynchronous completion")
+	}
+	if _, exists := app.activeSessions[sessionID]; !exists {
+		t.Fatal("delete cleared active state before asynchronous completion")
+	}
+	if len(app.pendingBubbleTeaCmds) != 1 {
+		t.Fatalf("delete completion commands = %d, want 1", len(app.pendingBubbleTeaCmds))
+	}
+	completionCmd := app.pendingBubbleTeaCmds[0]
+	app.pendingBubbleTeaCmds = nil
+	app.Update(completionCmd())
 	if stopCalls != 1 {
 		t.Fatalf("post-commit runtime stop calls = %d, want 1", stopCalls)
 	}

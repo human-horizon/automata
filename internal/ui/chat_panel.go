@@ -26,6 +26,33 @@ type FamiliarState struct {
 	Created   string `json:"created"`
 }
 
+type FamiliarCleanupKind uint8
+
+const (
+	FamiliarCloseCleanup FamiliarCleanupKind = iota + 1
+	FamiliarExternalRemovalCleanup
+)
+
+type FamiliarCleanupPhase uint8
+
+const (
+	FamiliarJobsStopped FamiliarCleanupPhase = iota + 1
+	FamiliarHistoryRemoved
+)
+
+// FamiliarCleanupResultMsg returns an asynchronous familiar cleanup stage to App.Update.
+type FamiliarCleanupResultMsg struct {
+	Panel             *ChatPanel
+	OwnerSessionID    string
+	FamiliarSessionID string
+	Emulator          *portalis.Emulator
+	Kind              FamiliarCleanupKind
+	Phase             FamiliarCleanupPhase
+	OperationID       uint64
+	Committed         bool
+	Err               error
+}
+
 // CommittedCleanupError reports a cleanup warning after the familiar runtime
 // has already been stopped. The tab can be removed while the caller logs it.
 type CommittedCleanupError struct {
@@ -44,11 +71,6 @@ func (e *CommittedCleanupError) Unwrap() error {
 		return nil
 	}
 	return e.Err
-}
-
-func isCommittedCleanupError(err error) bool {
-	var committedErr *CommittedCleanupError
-	return errors.As(err, &committedErr)
 }
 
 // CommittedActionError reports a warning after the requested action has
@@ -73,10 +95,12 @@ func (e *CommittedActionError) Unwrap() error {
 
 // chatSession represents one tab in the chat panel.
 type chatSession struct {
-	name       string
-	panel      warp.Panel
-	em         *portalis.Emulator
-	familiarID string // empty for main session
+	name         string
+	panel        warp.Panel
+	em           *portalis.Emulator
+	familiarID   string // empty for main session
+	humanEnabled bool
+	human        *humanChat
 }
 
 // ChatPanel manages multiple terminal sessions (main + familiars) with a tab
@@ -94,6 +118,7 @@ type ChatPanel struct {
 	known                map[string]bool // familiar IDs we already have tabs for
 	familiarSessions     map[string]string
 	removalPending       map[string]bool
+	cleanupPending       map[string]bool
 	familiarError        string
 	familiarWatchError   string
 	familiarCleanupError string
@@ -105,28 +130,19 @@ type ChatPanel struct {
 	familiarWatchPending bool
 
 	// Cached dimensions for tab bar rendering.
-	width  int
-	height int
+	width           int
+	height          int
+	localResizeSeen bool
 
 	// onClearSession is called when the user clicks the "× Clear" button in the tab bar.
 	// The handler is responsible for stopping the emulator, deleting the .jsonl file,
 	// and restarting pi. Returning a non-nil cmd lets the panel chain after clear.
 	onClearSession func(sessionID, cwd string) tea.Cmd
 
-	// onCloseFamiliar is called when the user confirms closing a familiar via the
-	// × button on a familiar tab. It also removes the JSONL and registry entry.
-	// An uncommitted cleanup error keeps the tab; CommittedCleanupError removes it.
-	//
-	// Synchronous (no tea.Cmd return) on purpose: Modal.Action callbacks and
-	// the Y-key path both fire the close, and Modal.Action is a plain
-	// `func()` — there's no way to surface a returned cmd from inside it.
-	// Doing the cleanup synchronously here means both mouse and keyboard
-	// confirm paths work identically. See Anya's report 2026-08-25.
-	onCloseFamiliar func(familiarID string, em *portalis.Emulator) error
-
-	// onRemoveFamiliar cleans runtime state after the registry is externally
-	// changed. It must not delete the already-updated registry or session JSONL.
-	onRemoveFamiliar func(familiarID string, em *portalis.Emulator) error
+	// Familiar callbacks start asynchronous host cleanup. Completion messages
+	// are applied only from App.Update.
+	onCloseFamiliar  func(familiarID string, em *portalis.Emulator) tea.Cmd
+	onRemoveFamiliar func(familiarID string, em *portalis.Emulator) tea.Cmd
 
 	// pendingCloseFamiliar holds the familiarID awaiting y/n confirmation.
 	// When non-empty, View draws a confirm overlay on top of the terminal area.
@@ -134,7 +150,8 @@ type ChatPanel struct {
 
 	// closeFamiliarModal is the Warp modal shown for pendingCloseFamiliar.
 	// Built lazily when pendingCloseFamiliar is set, dropped after confirm/cancel.
-	closeFamiliarModal *warp.Modal
+	closeFamiliarModal     *warp.Modal
+	confirmedCloseFamiliar string
 
 	// createFamiliarEmulator creates a portalis.Emulator for a new familiar tab.
 	// Returns the emulator and optional extra env vars for StartWithEnv.
@@ -159,6 +176,7 @@ func NewChatPanel(mainEm *portalis.Emulator, sessionID, profile string) *ChatPan
 		known:            make(map[string]bool),
 		familiarSessions: make(map[string]string),
 		removalPending:   make(map[string]bool),
+		cleanupPending:   make(map[string]bool),
 	}
 }
 
@@ -179,19 +197,13 @@ func (cp *ChatPanel) SetActionWarning(message string) {
 	cp.actionWarning = strings.ReplaceAll(message, "\n", "; ")
 }
 
-// SetOnCloseFamiliar sets the handler invoked when the user confirms closing
-// a familiar via the × button on a familiar tab. The handler stops the
-// emulator, deletes the familiar's JSONL, and removes the entry from
-// familiars.json. A non-nil error keeps the tab in place.
-//
-// Synchronous by design — see the comment on ChatPanel.onCloseFamiliar.
-func (cp *ChatPanel) SetOnCloseFamiliar(fn func(familiarID string, em *portalis.Emulator) error) {
+// SetOnCloseFamiliar sets the asynchronous host cleanup for a confirmed familiar close.
+func (cp *ChatPanel) SetOnCloseFamiliar(fn func(familiarID string, em *portalis.Emulator) tea.Cmd) {
 	cp.onCloseFamiliar = fn
 }
 
-// SetOnRemoveFamiliar sets host cleanup for an externally removed familiar.
-// This callback must preserve the updated registry and session JSONL.
-func (cp *ChatPanel) SetOnRemoveFamiliar(fn func(familiarID string, em *portalis.Emulator) error) {
+// SetOnRemoveFamiliar sets asynchronous cleanup for an externally removed familiar.
+func (cp *ChatPanel) SetOnRemoveFamiliar(fn func(familiarID string, em *portalis.Emulator) tea.Cmd) {
 	cp.onRemoveFamiliar = fn
 }
 
@@ -222,6 +234,7 @@ func (cp *ChatPanel) SessionID() string {
 // external tree rename. Emulators are already stopped by the caller, so
 // changing their routing IDs cannot leave an old PTY event in flight.
 func (cp *ChatPanel) RenameSessionIDs(mapping map[string]string) tea.Cmd {
+	cp.deactivateHuman()
 	ownerChanged := false
 	if newID, ok := mapping[cp.sessionID]; ok {
 		cp.sessionID = newID
@@ -243,12 +256,13 @@ func (cp *ChatPanel) RenameSessionIDs(mapping map[string]string) tea.Cmd {
 		}
 	}
 	if !ownerChanged || !cp.active {
-		return nil
+		return cp.activateHuman()
 	}
 
 	cp.closeFamiliarWatcher()
 	cp.setupFamiliarWatcher()
 	cmds := cp.checkFamiliars()
+	cmds = append(cmds, cp.activateHuman())
 	if watchCmd := cp.armFamiliarWatcher(); watchCmd != nil {
 		cmds = append(cmds, watchCmd)
 	}
@@ -274,6 +288,9 @@ func (s *chatSession) Em() *portalis.Emulator {
 // restarted PTY so the UI no longer renders the stopped emulator.
 // Safe when panel is nil (defensive — shouldn't happen in practice).
 func (s *chatSession) SetEm(em *portalis.Emulator) {
+	if s.human != nil && s.em != em {
+		s.human.reset()
+	}
 	s.em = em
 	if s.panel != nil {
 		if tp, ok := s.panel.(*TermPanel); ok {
@@ -299,13 +316,14 @@ func (cp *ChatPanel) FamiliarSessionIDs() []string {
 // Activate starts familiar detection without discarding tab or selection state.
 func (cp *ChatPanel) Activate() tea.Cmd {
 	if cp.active {
-		return cp.armFamiliarWatcher()
+		return tea.Batch(cp.armFamiliarWatcher(), cp.activateHuman())
 	}
 	cp.active = true
 	cp.familiarGeneration++
 	cp.reconcilePendingFamiliarMessages()
 	cp.setupFamiliarWatcher()
 	cmds := cp.checkFamiliars()
+	cmds = append(cmds, cp.activateHuman())
 	if watchCmd := cp.armFamiliarWatcher(); watchCmd != nil {
 		cmds = append(cmds, watchCmd)
 	}
@@ -331,6 +349,7 @@ func (cp *ChatPanel) reconcilePendingFamiliarMessages() {
 
 // Deactivate closes filesystem resources while preserving visible and runtime state.
 func (cp *ChatPanel) Deactivate() {
+	cp.deactivateHuman()
 	if !cp.active && cp.familiarWatcher == nil {
 		return
 	}
@@ -504,6 +523,9 @@ func (cp *ChatPanel) checkFamiliars() []tea.Cmd {
 	if cp.removalPending == nil {
 		cp.removalPending = make(map[string]bool)
 	}
+	if cp.cleanupPending == nil {
+		cp.cleanupPending = make(map[string]bool)
+	}
 
 	// Build set of currently-alive familiar session IDs in this chat.
 	liveSessionIDs := make(map[string]bool)
@@ -535,7 +557,7 @@ func (cp *ChatPanel) checkFamiliars() []tea.Cmd {
 		})
 	}
 	for id := range cp.known {
-		if !seen[id] && !cp.removalPending[id] {
+		if !seen[id] && !cp.removalPending[id] && !cp.cleanupPending[cp.familiarSessions[id]] {
 			cp.removalPending[id] = true
 			familiarID := cp.familiarSessions[id]
 			generation := cp.familiarGeneration
@@ -605,6 +627,9 @@ func (cp *ChatPanel) removeSessionAt(index int) {
 	if index < 0 || index >= len(cp.sessions) {
 		return
 	}
+	if session := cp.sessions[index]; session != nil && session.human != nil {
+		session.human.deactivate()
+	}
 	if st, ok := cp.sessions[index].panel.(stopper); ok {
 		st.Stop()
 	}
@@ -647,12 +672,12 @@ func (cp *ChatPanel) openCloseFamiliarModal(name string) {
 	fid := cp.pendingCloseFamiliar
 	cp.closeFamiliarModal = warp.NewModal(
 		"Close familiar",
-		fmt.Sprintf("Close %q?\nThis kills the PTY and deletes the session JSONL.", name),
+		fmt.Sprintf("Close %q?\nThe session closes after its jobs stop.", name),
 		[]warp.ModalButton{
 			{Label: "Yes", Action: func() {
 				cp.closeFamiliarModal = nil
 				cp.pendingCloseFamiliar = ""
-				cp.closeFamiliarByID(fid)
+				cp.confirmedCloseFamiliar = fid
 			}},
 			{Label: "No", Action: func() {
 				cp.closeFamiliarModal = nil
@@ -666,10 +691,8 @@ func (cp *ChatPanel) openCloseFamiliarModal(name string) {
 	)
 }
 
-// closeFamiliarByID asks the host (main.go via onCloseFamiliar) to clean up
-// the underlying emulator, JSONL, and familiars.json entry before removing
-// the tab. An uncommitted host failure leaves the tab and emulator untouched.
-func (cp *ChatPanel) closeFamiliarByID(familiarID string) {
+// closeFamiliarByID starts host cleanup and leaves tab removal to its completion message.
+func (cp *ChatPanel) closeFamiliarByID(familiarID string) tea.Cmd {
 	var (
 		idx  = -1
 		name string
@@ -684,24 +707,31 @@ func (cp *ChatPanel) closeFamiliarByID(familiarID string) {
 		}
 	}
 	if idx < 0 {
-		return
+		return nil
 	}
 	if err := paths.ValidateFamiliarSessionID(cp.sessionID, familiarID); err != nil {
 		cp.familiarError = err.Error()
 		log.Printf("automata: reject familiar close %q for owner %q: %v", familiarID, cp.sessionID, err)
-		return
+		return nil
 	}
-	if cp.onCloseFamiliar != nil {
-		if err := cp.onCloseFamiliar(familiarID, em); err != nil && !isCommittedCleanupError(err) {
-			return
-		}
+	if cp.cleanupPending == nil {
+		cp.cleanupPending = make(map[string]bool)
 	}
-	delete(cp.known, name)
-	delete(cp.familiarSessions, name)
-	delete(cp.removalPending, name)
-	// Stop the panel synchronously after host cleanup succeeds so a failed
-	// destructive preflight cannot orphan a hidden familiar runtime.
-	cp.removeSessionAt(idx)
+	if cp.cleanupPending[familiarID] {
+		return nil
+	}
+	if cp.onCloseFamiliar == nil {
+		cp.familiarCleanupError = "host cleanup for familiar close is unavailable"
+		return nil
+	}
+	cp.cleanupPending[familiarID] = true
+	cp.familiarCleanupError = ""
+	cmd := cp.onCloseFamiliar(familiarID, em)
+	if cmd == nil {
+		delete(cp.cleanupPending, familiarID)
+		cp.familiarCleanupError = fmt.Sprintf("host cleanup for familiar %q did not start", name)
+	}
+	return cmd
 }
 
 func (cp *ChatPanel) removeFamiliar(id string) {
@@ -713,13 +743,13 @@ func (cp *ChatPanel) removeFamiliar(id string) {
 	}
 }
 
-func (cp *ChatPanel) handleExternalFamiliarRemoval(msg familiarRemovedMsg) {
+func (cp *ChatPanel) handleExternalFamiliarRemoval(msg familiarRemovedMsg) tea.Cmd {
 	familiars, err := cp.loadFamiliars()
 	if err != nil {
 		cp.familiarError = err.Error()
 		delete(cp.removalPending, msg.id)
 		log.Printf("automata: familiar registry for %q: %v", cp.sessionID, err)
-		return
+		return nil
 	}
 	cp.familiarError = ""
 	for _, familiar := range familiars {
@@ -727,7 +757,7 @@ func (cp *ChatPanel) handleExternalFamiliarRemoval(msg familiarRemovedMsg) {
 			cp.familiarSessions[msg.id] = familiar.SessionID
 			delete(cp.removalPending, msg.id)
 			cp.familiarCleanupError = ""
-			return
+			return nil
 		}
 	}
 
@@ -749,38 +779,107 @@ func (cp *ChatPanel) handleExternalFamiliarRemoval(msg familiarRemovedMsg) {
 		cp.familiarCleanupError = "host cleanup for externally removed familiar is unavailable"
 		delete(cp.removalPending, msg.id)
 		log.Printf("automata: %s %q", cp.familiarCleanupError, familiarID)
-		return
+		return nil
 	}
 	if familiarID == "" {
 		cp.familiarCleanupError = "externally removed familiar has no session ID"
 		delete(cp.removalPending, msg.id)
 		log.Printf("automata: %s %q", cp.familiarCleanupError, msg.id)
-		return
+		return nil
 	}
 	if err := paths.ValidateFamiliarSessionID(cp.sessionID, familiarID); err != nil {
 		cp.familiarCleanupError = err.Error()
 		delete(cp.removalPending, msg.id)
 		log.Printf("automata: reject externally removed familiar %q for owner %q: %v", familiarID, cp.sessionID, err)
+		return nil
+	}
+	if cp.cleanupPending == nil {
+		cp.cleanupPending = make(map[string]bool)
+	}
+	if cp.cleanupPending[familiarID] {
+		return nil
+	}
+	cp.cleanupPending[familiarID] = true
+	cp.familiarCleanupError = ""
+	cmd := cp.onRemoveFamiliar(familiarID, em)
+	if cmd == nil {
+		delete(cp.cleanupPending, familiarID)
+		delete(cp.removalPending, msg.id)
+		cp.familiarCleanupError = "host cleanup for externally removed familiar did not start"
+	}
+	return cmd
+}
+
+// HandleSessionClear removes familiar tabs after the owner registry is committed empty.
+func (cp *ChatPanel) HandleSessionClear() {
+	cp.familiarGeneration++
+	for index := len(cp.sessions) - 1; index >= 0; index-- {
+		session := cp.sessions[index]
+		if session != nil && session.familiarID != "" {
+			cp.removeSessionAt(index)
+		}
+	}
+	cp.known = make(map[string]bool)
+	cp.familiarSessions = make(map[string]string)
+	cp.removalPending = make(map[string]bool)
+	cp.cleanupPending = make(map[string]bool)
+	cp.pendingCloseFamiliar = ""
+	cp.confirmedCloseFamiliar = ""
+	cp.closeFamiliarModal = nil
+	cp.familiarCleanupError = ""
+}
+
+// HandleFamiliarCleanupResult applies a host completion on the UI thread.
+func (cp *ChatPanel) HandleFamiliarCleanupResult(msg FamiliarCleanupResultMsg) {
+	if msg.Panel != nil && msg.Panel != cp {
+		return
+	}
+	if msg.Kind == FamiliarCloseCleanup && msg.Phase == FamiliarJobsStopped && msg.Committed {
 		return
 	}
 
-	cleanupErr := cp.onRemoveFamiliar(familiarID, em)
-	if cleanupErr != nil && !isCommittedCleanupError(cleanupErr) {
-		cp.familiarCleanupError = cleanupErr.Error()
-		delete(cp.removalPending, msg.id)
-		log.Printf("automata: cleanup for externally removed familiar %q: %v", familiarID, cleanupErr)
+	var (
+		name string
+		idx  = -1
+	)
+	for index, session := range cp.sessions {
+		if session != nil && session.familiarID == msg.FamiliarSessionID {
+			name = session.name
+			idx = index
+			break
+		}
+	}
+	if name == "" {
+		for familiarName, sessionID := range cp.familiarSessions {
+			if sessionID == msg.FamiliarSessionID {
+				name = familiarName
+				break
+			}
+		}
+	}
+	if !msg.Committed {
+		delete(cp.cleanupPending, msg.FamiliarSessionID)
+		delete(cp.removalPending, name)
+		if msg.Err != nil {
+			cp.familiarCleanupError = msg.Err.Error()
+		} else {
+			cp.familiarCleanupError = "familiar cleanup did not commit"
+		}
 		return
 	}
-	if cleanupErr != nil {
-		cp.familiarCleanupError = cleanupErr.Error()
-		log.Printf("automata: committed cleanup warning for externally removed familiar %q: %v", familiarID, cleanupErr)
+
+	if msg.Err != nil {
+		cp.familiarCleanupError = msg.Err.Error()
 	} else {
 		cp.familiarCleanupError = ""
 	}
-	delete(cp.known, msg.id)
-	delete(cp.familiarSessions, msg.id)
-	delete(cp.removalPending, msg.id)
-	cp.removeFamiliar(msg.id)
+	delete(cp.cleanupPending, msg.FamiliarSessionID)
+	delete(cp.known, name)
+	delete(cp.familiarSessions, name)
+	delete(cp.removalPending, name)
+	if idx >= 0 {
+		cp.removeSessionAt(idx)
+	}
 }
 
 // View renders the chat panel.
@@ -802,7 +901,14 @@ func (cp *ChatPanel) View(width, height int) string {
 	}
 
 	active := cp.sessions[cp.activeIdx]
-	termView := active.panel.View(width, termHeight)
+	termView := ""
+	humanRendered := false
+	if active.humanEnabled && active.human != nil && active.human.active {
+		termView, humanRendered = active.human.render(width, termHeight, cp.palette)
+	}
+	if !humanRendered {
+		termView = active.panel.View(width, termHeight)
+	}
 	out := cp.joinWithBar(termView, termHeight, width)
 	if cp.closeFamiliarModal != nil {
 		lines := cp.closeFamiliarModal.Overlay(strings.Split(out, "\n"), width, height)
@@ -828,6 +934,10 @@ func (cp *ChatPanel) joinWithBar(termView string, termHeight, width int) string 
 
 func (cp *ChatPanel) tabBarWarning() string {
 	var warnings []string
+	humanWarning := cp.humanWarning()
+	if humanWarning != "" {
+		warnings = append(warnings, "Human: "+humanWarning)
+	}
 	if cp.actionWarning != "" {
 		warnings = append(warnings, "action: "+cp.actionWarning)
 	}
@@ -844,7 +954,7 @@ func (cp *ChatPanel) tabBarWarning() string {
 		return ""
 	}
 	prefix := "! "
-	if cp.actionWarning == "" {
+	if cp.actionWarning == "" && humanWarning == "" {
 		prefix += "familiar "
 	}
 	return prefix + strings.Join(warnings, "; ") + " "
@@ -925,8 +1035,17 @@ func (cp *ChatPanel) renderTabBar(width int) string {
 	// Use lipgloss.Width for tabs (matches terminal cell count after styling).
 	visibleWidth := lipgloss.Width(bar)
 
+	humanBtn := ""
+	if label := cp.humanButtonLabel(width); label != "" {
+		style := familiarTabInactiveStyle
+		if cp.sessions[cp.activeIdx].humanEnabled {
+			style = familiarTabActiveStyle
+		}
+		humanBtn = style.Render(label)
+	}
+
 	// If not enough room for tabs + buttons, truncate tabs to fit.
-	buttonsW := clearW
+	buttonsW := clearW + ansi.StringWidth(humanBtn)
 	availableForTabs := width - buttonsW
 	if availableForTabs < 0 {
 		availableForTabs = 0
@@ -941,12 +1060,15 @@ func (cp *ChatPanel) renderTabBar(width int) string {
 	if padCount < 0 {
 		padCount = 0
 	}
-	bar += strings.Repeat(" ", padCount) + clearBtn
-	return bar
+	bar += strings.Repeat(" ", padCount) + humanBtn + clearBtn
+	return ansi.Truncate(bar, width, "")
 }
 
 // Update handles messages for the ChatPanel.
 func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
+	if cmd, handled := cp.handleHumanMessage(msg); handled {
+		return tea.Batch(cmd, cp.armFamiliarWatcher(), cp.activateHuman())
+	}
 	if cmd, handled := cp.handlePendingCloseMessage(msg); handled {
 		return cmd
 	}
@@ -963,22 +1085,27 @@ func (cp *ChatPanel) Update(msg tea.Msg) tea.Cmd {
 		}
 	case familiarRemovedMsg:
 		if cp.active && msg.generation == cp.familiarGeneration {
-			cp.handleExternalFamiliarRemoval(msg)
+			forwardCmd = cp.handleExternalFamiliarRemoval(msg)
 		}
 	case tea.MouseMsg:
 		forwardCmd = cp.handleMouse(msg)
 	case tea.KeyMsg:
-		forwardCmd = cp.updateActiveSession(msg)
+		if !cp.activeFamiliarCleanupPending() {
+			forwardCmd = cp.updateActiveSession(msg)
+		}
 	case warp.ResizeMsg:
+		cp.localResizeSeen = true
 		forwardCmd = cp.resize(msg.Width, msg.Height)
 	case tea.WindowSizeMsg:
-		forwardCmd = cp.resize(msg.Width, msg.Height)
+		if !cp.localResizeSeen {
+			forwardCmd = cp.resize(msg.Width, msg.Height)
+		}
 	case portalis.PtyExitMsg:
 		forwardCmd = cp.handlePtyExit(msg)
 	default:
 		forwardCmd = cp.routeOrUpdateActive(msg)
 	}
-	return tea.Batch(forwardCmd, cp.armFamiliarWatcher())
+	return tea.Batch(forwardCmd, cp.armFamiliarWatcher(), cp.activateHuman())
 }
 
 func (cp *ChatPanel) handlePendingCloseMessage(msg tea.Msg) (tea.Cmd, bool) {
@@ -987,20 +1114,23 @@ func (cp *ChatPanel) handlePendingCloseMessage(msg tea.Msg) (tea.Cmd, bool) {
 	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		var closeCmd tea.Cmd
 		switch msg.String() {
 		case "y", "Y":
 			id := cp.pendingCloseFamiliar
 			cp.pendingCloseFamiliar = ""
 			cp.closeFamiliarModal = nil
-			cp.closeFamiliarByID(id)
+			closeCmd = cp.closeFamiliarByID(id)
 		case "n", "N", "esc":
 			cp.pendingCloseFamiliar = ""
 			cp.closeFamiliarModal = nil
 		}
-		return cp.armFamiliarWatcher(), true
+		return tea.Batch(closeCmd, cp.armFamiliarWatcher()), true
 	case tea.MouseMsg:
 		if cp.closeFamiliarModal != nil && cp.closeFamiliarModal.HandleMouse(msg) {
-			return cp.armFamiliarWatcher(), true
+			id := cp.confirmedCloseFamiliar
+			cp.confirmedCloseFamiliar = ""
+			return tea.Batch(cp.closeFamiliarByID(id), cp.armFamiliarWatcher()), true
 		}
 		// An unconsumed click is outside the modal. Dismiss the
 		// confirmation without forwarding the event to the tab bar or
@@ -1051,6 +1181,14 @@ func (cp *ChatPanel) updateActiveSession(msg tea.Msg) tea.Cmd {
 	return cp.sessions[cp.activeIdx].panel.Update(msg)
 }
 
+func (cp *ChatPanel) activeFamiliarCleanupPending() bool {
+	if cp.activeIdx < 0 || cp.activeIdx >= len(cp.sessions) {
+		return false
+	}
+	session := cp.sessions[cp.activeIdx]
+	return session != nil && session.familiarID != "" && cp.cleanupPending[session.familiarID]
+}
+
 func (cp *ChatPanel) resize(width, height int) tea.Cmd {
 	cp.width = width
 	cp.height = height
@@ -1058,6 +1196,9 @@ func (cp *ChatPanel) resize(width, height int) tea.Cmd {
 }
 
 func (cp *ChatPanel) handlePtyExit(msg portalis.PtyExitMsg) tea.Cmd {
+	if cp.cleanupPending[msg.SessionID] {
+		return cp.routeBySessionID(msg)
+	}
 	if cp.removeDeadFamiliar(msg.SessionID) {
 		if cp.active {
 			return tea.Batch(cp.checkFamiliars()...)
@@ -1107,6 +1248,15 @@ func (cp *ChatPanel) handleMouse(msg tea.Msg) tea.Cmd {
 	if !ok {
 		return nil
 	}
+	if cp.activeFamiliarCleanupPending() && int(m.Y) < cp.height-1 {
+		return nil
+	}
+	if cp.activeIdx >= 0 && cp.activeIdx < len(cp.sessions) {
+		active := cp.sessions[cp.activeIdx]
+		if active.humanEnabled && active.human != nil && active.human.handleMouse(m) {
+			return nil
+		}
+	}
 	if cp.shouldForwardMouse(m) {
 		return cp.updateActiveSession(msg)
 	}
@@ -1127,13 +1277,17 @@ func (cp *ChatPanel) shouldForwardMouse(msg tea.MouseMsg) bool {
 }
 
 func (cp *ChatPanel) handleTabBarClick(msg tea.MouseMsg) tea.Cmd {
-	const clearBtnWidth = 9
+	clearBtnWidth := ansi.StringWidth(" × Clear ")
 	clearStart := max(0, cp.width-clearBtnWidth)
 	if int(msg.X) >= clearStart && cp.onClearSession != nil {
 		return cp.handleClearClick()
 	}
+	humanWidth := ansi.StringWidth(cp.humanButtonLabel(cp.width))
+	if humanWidth > 0 && int(msg.X) >= clearStart-humanWidth && int(msg.X) < clearStart {
+		return cp.toggleHuman()
+	}
 
-	availableForTabs := max(0, cp.width-clearBtnWidth)
+	availableForTabs := max(0, cp.width-clearBtnWidth-humanWidth)
 	x := ansi.StringWidth(cp.tabBarWarning())
 	if x > availableForTabs {
 		return nil
@@ -1178,9 +1332,10 @@ func (cp *ChatPanel) handleSessionTabClick(index int, session *chatSession, clic
 	if index == cp.activeIdx || session.panel == nil {
 		return nil
 	}
+	cp.deactivateHuman()
 	cp.activeIdx = index
 	termHeight := max(1, cp.height-1)
-	return session.panel.Update(warp.ResizeMsg{Width: cp.width, Height: termHeight})
+	return tea.Batch(session.panel.Update(warp.ResizeMsg{Width: cp.width, Height: termHeight}), cp.activateHuman())
 }
 
 // resizeActivePanel sends a fresh warp.ResizeMsg to all sessions so their

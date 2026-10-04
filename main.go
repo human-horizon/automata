@@ -109,6 +109,9 @@ type App struct {
 	// return directly into Bubble Tea's command pipeline.
 	pendingBubbleTeaCmds []tea.Cmd
 
+	pendingRuntimeOperations   map[string]uint64
+	runtimeOperationGeneration uint64
+
 	metadataSaveDirty      bool
 	metadataSavePending    bool
 	metadataSaveGeneration uint64
@@ -167,6 +170,10 @@ func newApp(profile, piAgentDir string) (a *App) {
 		if profile != "" {
 			sessionID = paths.ProfileSlug(profile) + "__" + sessionID
 		}
+		if a.runtimeOperationPending(sessionID) {
+			a.recordRuntimeWarning(fmt.Errorf("session %q has a pending runtime operation", sessionID))
+			return
+		}
 		a.currentSessionID = sessionID
 
 		// Reuse existing emulator if available.
@@ -183,19 +190,11 @@ func newApp(profile, piAgentDir string) (a *App) {
 		cp.SetOnClearSession(func(sid, cwd string) tea.Cmd {
 			return a.clearSessionCmdForPanel(sid, cwd, cp.FamiliarSessionIDs(), cp)
 		})
-		cp.SetOnCloseFamiliar(func(familiarID string, em *portalis.Emulator) error {
-			if err := a.closeFamiliar(familiarID, em); err != nil {
-				log.Printf("closeFamiliar: cleanup warning for %q: %v", familiarID, err)
-				return err
-			}
-			return nil
+		cp.SetOnCloseFamiliar(func(familiarID string, em *portalis.Emulator) tea.Cmd {
+			return a.requestFamiliarCleanup(cp, familiarID, em, ui.FamiliarCloseCleanup)
 		})
-		cp.SetOnRemoveFamiliar(func(familiarID string, em *portalis.Emulator) error {
-			err := a.cleanupExternallyRemovedFamiliar(familiarID, em)
-			if err != nil {
-				log.Printf("external familiar removal cleanup for %q: %v", familiarID, err)
-			}
-			return err
+		cp.SetOnRemoveFamiliar(func(familiarID string, em *portalis.Emulator) tea.Cmd {
+			return a.requestFamiliarCleanup(cp, familiarID, em, ui.FamiliarExternalRemovalCleanup)
 		})
 		cp.SetCreateFamiliarEmulator(func(familiarID string) (*portalis.Emulator, []string) {
 			return a.createFamiliarEmulator(familiarID)
@@ -217,8 +216,16 @@ func newApp(profile, piAgentDir string) (a *App) {
 		if err != nil {
 			return nil, err
 		}
-		rollback, err := a.applyRenamePlan(plan)
+		if err := a.prepareRenamePlan(plan); err != nil {
+			return nil, err
+		}
+		plan.operationID, err = a.reserveRuntimeOperation(renamePlanOperationIDs(plan))
 		if err != nil {
+			return nil, err
+		}
+		rollback, err := a.applyPreparedRenamePlan(plan)
+		if err != nil {
+			a.releaseRuntimeOperation(plan.operationID)
 			return nil, err
 		}
 		if a.pendingMovePlans == nil {
@@ -227,15 +234,20 @@ func newApp(profile, piAgentDir string) (a *App) {
 		a.pendingMovePlans[item] = plan
 		return func() error {
 			delete(a.pendingMovePlans, item)
-			return rollback()
+			rollbackErr := rollback()
+			if rollbackErr == nil {
+				a.releaseRuntimeOperation(plan.operationID)
+			}
+			return rollbackErr
 		}, nil
 	})
 	t.SetOnItemMoved(func(item *tree.Item, _, _ string) {
 		plan := a.pendingMovePlans[item]
 		delete(a.pendingMovePlans, item)
 		if plan != nil {
-			a.applyRenameMappings(plan)
-			_ = a.finalizeRenamePlan(plan)
+			if err := a.scheduleFinalizeRenamePlan(plan); err != nil {
+				a.recordRuntimeWarning(err)
+			}
 		}
 	})
 
@@ -244,8 +256,16 @@ func newApp(profile, piAgentDir string) (a *App) {
 		if err != nil {
 			return nil, err
 		}
-		rollback, err := a.applyRenamePlan(plan)
+		if err := a.prepareRenamePlan(plan); err != nil {
+			return nil, err
+		}
+		plan.operationID, err = a.reserveRuntimeOperation(renamePlanOperationIDs(plan))
 		if err != nil {
+			return nil, err
+		}
+		rollback, err := a.applyPreparedRenamePlan(plan)
+		if err != nil {
+			a.releaseRuntimeOperation(plan.operationID)
 			return nil, err
 		}
 		if a.pendingRenamePlans == nil {
@@ -254,7 +274,11 @@ func newApp(profile, piAgentDir string) (a *App) {
 		a.pendingRenamePlans[item] = plan
 		return func() error {
 			delete(a.pendingRenamePlans, item)
-			return rollback()
+			rollbackErr := rollback()
+			if rollbackErr == nil {
+				a.releaseRuntimeOperation(plan.operationID)
+			}
+			return rollbackErr
 		}, nil
 	})
 	t.SetOnRenameCommitted(func(item *tree.Item, _, _ string) {
@@ -263,8 +287,9 @@ func newApp(profile, piAgentDir string) (a *App) {
 		if plan == nil {
 			return
 		}
-		a.applyRenameMappings(plan)
-		_ = a.finalizeRenamePlan(plan)
+		if err := a.scheduleFinalizeRenamePlan(plan); err != nil {
+			a.recordRuntimeWarning(err)
+		}
 	})
 
 	t.SetOnStopSession(func(item *tree.Item) {
@@ -272,55 +297,59 @@ func newApp(profile, piAgentDir string) (a *App) {
 		if profile != "" {
 			sessionID = paths.ProfileSlug(profile) + "__" + sessionID
 		}
-		if err := a.stopSessionRuntime(sessionID, stopSessionOptions{
-			stopJobs:        true,
-			stopFamiliars:   true,
-			persistInactive: true,
-		}); err != nil {
-			warning := fmt.Errorf("stop session %s: %w", sessionID, err)
-			log.Printf("automata: %v", warning)
-			if a.tree != nil {
-				a.tree.RecordActionWarning(warning)
-			}
+		cmd, err := a.stopSessionRuntimeCmd(sessionID)
+		if err != nil {
+			a.recordRuntimeWarning(fmt.Errorf("stop session %s: %w", sessionID, err))
+			return
 		}
-		a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, a.syncSessionWatchers()...)
+		a.pendingBubbleTeaCmds = append(a.pendingBubbleTeaCmds, cmd)
 	})
 
 	pendingDeleteCleanup := make(map[*tree.Item]*preparedDeleteRuntime)
 	t.SetOnBeforeDelete(func(item *tree.Item) error {
 		plan, err := a.prepareDeletedTreeRuntime(item)
-		if err == nil {
-			pendingDeleteCleanup[item] = plan
+		if err != nil {
+			return err
 		}
-		return err
+		plan.operationID, err = a.reserveRuntimeOperation(plan.sessionIDs)
+		if err != nil {
+			return err
+		}
+		pendingDeleteCleanup[item] = plan
+		return nil
 	})
 	t.SetOnDeleteAborted(func(item *tree.Item) {
+		plan := pendingDeleteCleanup[item]
 		delete(pendingDeleteCleanup, item)
+		if plan != nil {
+			a.releaseRuntimeOperation(plan.operationID)
+		}
 	})
 	t.SetOnDeleteCommitted(func(item *tree.Item) error {
 		plan := pendingDeleteCleanup[item]
 		delete(pendingDeleteCleanup, item)
-		return a.commitDeletedTreeRuntime(plan)
+		return a.commitDeletedTreeRuntimeAsync(plan)
 	})
 
 	a = &App{
-		warp:                  w,
-		tree:                  t,
-		container:             container,
-		sm:                    sm,
-		mouseEnabled:          true,
-		activeSessions:        make(map[string]struct{}),
-		emulatorCache:         make(map[string]*portalis.Emulator),
-		familiarEmulatorCache: make(map[string]*portalis.Emulator),
-		runningSessions:       make(map[string]struct{}),
-		profile:               profile,
-		scrollbackLines:       scrollback.DefaultLines,
-		piAgentDir:            piAgentDir,
-		statusReader:          status.NewCachedReader(profile),
-		sessionWatchers:       make(map[string]struct{}),
-		statusSessionDirs:     make(map[string]string),
-		pendingMovePlans:      make(map[*tree.Item]*renamePlan),
-		pendingRenamePlans:    make(map[*tree.Item]*renamePlan),
+		warp:                     w,
+		tree:                     t,
+		container:                container,
+		sm:                       sm,
+		mouseEnabled:             true,
+		activeSessions:           make(map[string]struct{}),
+		emulatorCache:            make(map[string]*portalis.Emulator),
+		familiarEmulatorCache:    make(map[string]*portalis.Emulator),
+		runningSessions:          make(map[string]struct{}),
+		pendingRuntimeOperations: make(map[string]uint64),
+		profile:                  profile,
+		scrollbackLines:          scrollback.DefaultLines,
+		piAgentDir:               piAgentDir,
+		statusReader:             status.NewCachedReader(profile),
+		sessionWatchers:          make(map[string]struct{}),
+		statusSessionDirs:        make(map[string]string),
+		pendingMovePlans:         make(map[*tree.Item]*renamePlan),
+		pendingRenamePlans:       make(map[*tree.Item]*renamePlan),
 	}
 	container.SetOnPlanWidthChange(a.handlePlanWidthChange)
 	t.SetOnOpenHelp(a.openHelpOverlay)
@@ -450,7 +479,25 @@ func (a *App) Update(msg tea.Msg) (model tea.Model, command tea.Cmd) {
 		return a, a.handleMouseMsg(msg)
 
 	case clearSessionErrorMsg:
+		a.releaseRuntimeOperation(msg.operationID)
 		return a, a.handleClearSessionErrorMsg(msg)
+
+	case clearSessionJobsCompletedMsg:
+		return a, a.handleClearSessionJobsCompleted(msg)
+
+	case clearSessionRestartCompletedMsg:
+		return a, a.handleClearSessionRestartCompleted(msg)
+
+	case ui.FamiliarCleanupResultMsg:
+		return a, a.handleFamiliarCleanupResult(msg)
+
+	case sessionStopJobsCompletedMsg:
+		a.handleSessionStopJobsCompleted(msg)
+		return a, nil
+
+	case runtimeJobsCompletedMsg:
+		a.handleRuntimeJobsCompleted(msg)
+		return a, nil
 
 	case treeMetadataSaveMsg:
 		return a, a.handleTreeMetadataSaveMsg(msg)
@@ -555,7 +602,12 @@ func (a *App) restoreSessions() tea.Cmd {
 // to a shell for pi sessions.
 func (a *App) piLaunch(sessionID string) (cmd string, args []string, env []string) {
 	profile := paths.ProfileSlug(a.profile)
-	env = append(env, "AI_PROFILE="+profile, "AUTOMATA_PROFILE="+profile)
+	env = append(env,
+		"AI_PROFILE="+profile,
+		"AUTOMATA_PROFILE="+profile,
+		"AI_DATA_HOME="+paths.BaseDir(),
+		"AUTOMATA_HUMAN_EXPORT=1",
+	)
 	if configured := strings.TrimSpace(os.Getenv("PI_CMD")); configured != "" {
 		path, err := exec.LookPath(configured)
 		if err != nil {
@@ -580,6 +632,16 @@ func (a *App) piLaunch(sessionID string) (cmd string, args []string, env []strin
 // recorded via SetStartEnv so any later Start variant keeps it. Returns nil
 // when no pi command is available.
 func (a *App) newChatEmulator(sessionID string) *portalis.Emulator {
+	if a.runtimeOperationBlocksSession(sessionID) {
+		a.recordRuntimeWarning(fmt.Errorf("cannot start session %q during a runtime operation", sessionID))
+		return nil
+	}
+	return a.newChatEmulatorForPendingOperation(sessionID)
+}
+
+// newChatEmulatorForPendingOperation constructs without checking reservations.
+// Use it only after the caller has validated or owns the session reservation.
+func (a *App) newChatEmulatorForPendingOperation(sessionID string) *portalis.Emulator {
 	if a.createChatEmulatorFn != nil {
 		return a.createChatEmulatorFn(sessionID)
 	}
@@ -696,6 +758,10 @@ func (a *App) startAssignedTaskSession(sessionID string) (tea.Cmd, error) {
 // Returns the emulator and its launch env for StartWithEnv (ChatPanel
 // appends PI_OWNER_SESSION before starting).
 func (a *App) createFamiliarEmulator(sessionID string) (*portalis.Emulator, []string) {
+	if a.runtimeOperationBlocksSession(sessionID) {
+		a.recordRuntimeWarning(fmt.Errorf("cannot start familiar %q during a runtime operation", sessionID))
+		return nil, nil
+	}
 	if err := paths.ValidateSessionID(sessionID); err != nil {
 		log.Printf("automata: reject familiar session %q: %v", sessionID, err)
 		return nil, nil
@@ -810,9 +876,28 @@ func (a *App) startEmulatorSync(em *portalis.Emulator, env []string) error {
 }
 
 type clearSessionErrorMsg struct {
-	sessionID string
-	panel     *ui.ChatPanel
-	err       error
+	sessionID   string
+	panel       *ui.ChatPanel
+	operationID uint64
+	err         error
+}
+
+type clearSessionJobsCompletedMsg struct {
+	sessionID        string
+	panel            *ui.ChatPanel
+	operationID      uint64
+	sessionIDs       []string
+	registryCleared  bool
+	runtimeCommitted bool
+	err              error
+}
+
+type clearSessionRestartCompletedMsg struct {
+	sessionID   string
+	panel       *ui.ChatPanel
+	operationID uint64
+	emulator    *portalis.Emulator
+	err         error
 }
 
 func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.Cmd {
@@ -820,85 +905,75 @@ func (a *App) clearSessionCmd(sessionID, cwd string, familiarSIDs []string) tea.
 }
 
 func (a *App) clearSessionCmdForPanel(sessionID, cwd string, familiarSIDs []string, panel *ui.ChatPanel) tea.Cmd {
-	return func() tea.Msg {
-		fail := func(err error) tea.Msg {
+	agentDir := a.piAgentDir
+	if agentDir == "" {
+		return func() tea.Msg {
+			return clearSessionErrorMsg{sessionID: sessionID, panel: panel, err: fmt.Errorf("refuse to clear %q without piAgentDir", sessionID)}
+		}
+	}
+
+	opts := stopSessionOptions{stopFamiliars: true, familiarSessionIDs: familiarSIDs}
+	sessionIDs := a.expandRuntimeSessionIDs([]string{sessionID}, opts)
+	operationID, err := a.reserveRuntimeOperation(sessionIDs)
+	if err != nil {
+		return func() tea.Msg {
 			return clearSessionErrorMsg{sessionID: sessionID, panel: panel, err: err}
 		}
-		agentDir := a.piAgentDir
-		if agentDir == "" {
-			return fail(fmt.Errorf("refuse to clear %q without piAgentDir", sessionID))
-		}
-
-		stopErr := a.stopSessionRuntime(sessionID, stopSessionOptions{
-			stopJobs:           true,
-			stopFamiliars:      true,
-			persistInactive:    true,
-			familiarSessionIDs: familiarSIDs,
-		})
-		if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
-			return fail(fmt.Errorf("stop runtime before Clear: %w", stopErr))
-		}
-		if runtimeStopJobsFailed(stopErr) {
-			return fail(fmt.Errorf("stop jobs before Clear: %w", stopErr))
-		}
-
-		var failures []error
-		if stopErr != nil {
-			failures = append(failures, fmt.Errorf("stop runtime: %w", stopErr))
-		}
-		seen := make(map[string]struct{}, len(familiarSIDs))
-		for _, sid := range familiarSIDs {
-			if _, exists := seen[sid]; exists {
-				continue
-			}
-			seen[sid] = struct{}{}
-			deleted, err := paths.DeleteSessionJSONLIfPresent(sid, cwd, agentDir)
-			if err != nil {
-				failures = append(failures, fmt.Errorf("clear familiar %q history: %w", sid, err))
-			} else if deleted != "" {
-				log.Printf("clearSession: familiar %q deleted %s", sid, deleted)
-			}
-		}
-		if err := paths.ClearFamiliarsJSONL(a.profile, sessionID); err != nil {
-			failures = append(failures, fmt.Errorf("clear familiars.json: %w", err))
-		}
-		if deleted, err := paths.DeleteSessionJSONLIfPresent(sessionID, cwd, agentDir); err != nil {
-			failures = append(failures, fmt.Errorf("clear session history: %w", err))
-		} else if deleted != "" {
-			log.Printf("clearSession: deleted %s", deleted)
-		}
-		if err := errors.Join(failures...); err != nil {
-			return fail(err)
-		}
-
-		newEm := a.newChatEmulator(sessionID)
-		if newEm == nil {
-			return fail(fmt.Errorf("cannot restart chat %q: no Pi emulator is available", sessionID))
-		}
-		if err := a.startEmulatorSync(newEm, nil); err != nil {
-			newEm.Stop()
-			return fail(fmt.Errorf("restart chat %q: %w", sessionID, err))
-		}
-		if a.emulatorCache == nil {
-			a.emulatorCache = make(map[string]*portalis.Emulator)
-		}
-		a.emulatorCache[sessionID] = newEm
-
-		if panel == nil && a.container != nil {
-			if active := a.container.Active(); active != nil {
-				panel, _ = active.(*ui.ChatPanel)
-			}
-		}
-		if panel != nil {
-			for _, session := range panel.Sessions() {
-				if session.Em() != nil && session.Em().SessionID == sessionID {
-					session.SetEm(newEm)
-					break
-				}
-			}
-		}
-		return portalis.PtyReadyMsg{SessionID: sessionID}
 	}
+	sessionIDs = append([]string(nil), sessionIDs...)
+	familiarSIDs = append([]string(nil), familiarSIDs...)
+	profile := a.profile
+
+	return func() tea.Msg {
+		prepared, err := a.prepareSessionJobs(sessionIDs)
+		if err != nil {
+			return clearSessionJobsCompletedMsg{
+				sessionID: sessionID, panel: panel, operationID: operationID,
+				sessionIDs: sessionIDs, err: fmt.Errorf("prepare jobs before Clear: %w", err),
+			}
+		}
+		if err := a.executePreparedSessionJobs(prepared); err != nil {
+			return clearSessionJobsCompletedMsg{
+				sessionID: sessionID, panel: panel, operationID: operationID,
+				sessionIDs: sessionIDs, runtimeCommitted: true,
+				err: fmt.Errorf("stop jobs before Clear: %w", err),
+			}
+		}
+		registryCleared, cleanupErr := clearSessionData(profile, sessionID, cwd, agentDir, familiarSIDs)
+		return clearSessionJobsCompletedMsg{
+			sessionID: sessionID, panel: panel, operationID: operationID,
+			sessionIDs: sessionIDs, registryCleared: registryCleared,
+			runtimeCommitted: true, err: cleanupErr,
+		}
+	}
+}
+
+func clearSessionData(profile, sessionID, cwd, agentDir string, familiarSIDs []string) (bool, error) {
+	var failures []error
+	seen := make(map[string]struct{}, len(familiarSIDs))
+	for _, familiarID := range familiarSIDs {
+		if _, exists := seen[familiarID]; exists {
+			continue
+		}
+		seen[familiarID] = struct{}{}
+		deleted, err := paths.DeleteSessionJSONLIfPresent(familiarID, cwd, agentDir)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("clear familiar %q history: %w", familiarID, err))
+		} else if deleted != "" {
+			log.Printf("clearSession: familiar %q deleted %s", familiarID, deleted)
+		}
+	}
+	registryCleared := true
+	if err := paths.ClearFamiliarsJSONL(profile, sessionID); err != nil {
+		registryCleared = false
+		failures = append(failures, fmt.Errorf("clear familiars.json: %w", err))
+	}
+	if deleted, err := paths.DeleteSessionJSONLIfPresent(sessionID, cwd, agentDir); err != nil {
+		failures = append(failures, fmt.Errorf("clear session history: %w", err))
+	} else if deleted != "" {
+		log.Printf("clearSession: deleted %s", deleted)
+	}
+	return registryCleared, errors.Join(failures...)
 }
 
 func deletedSessionIDs(t *tree.Tree, item *tree.Item) map[string]struct{} {
@@ -937,28 +1012,20 @@ func (a *App) cleanupDeletedTreeItem(item *tree.Item) error {
 	return nil
 }
 
-// cleanupExternallyRemovedFamiliar stops host runtime state after the familiar
-// registry has already been changed. It preserves both the registry and JSONL.
+// cleanupExternallyRemovedFamiliar synchronously exercises the same fail-closed
+// order as the asynchronous UI path. Production ChatPanel callbacks use tea.Cmd.
 func (a *App) cleanupExternallyRemovedFamiliar(familiarID string, em *portalis.Emulator) error {
 	if err := paths.ValidateSessionID(familiarID); err != nil {
 		return fmt.Errorf("invalid familiar session ID: %w", err)
 	}
-	stopErr := a.stopSessionRuntime(familiarID, stopSessionOptions{
-		stopJobs:        true,
-		persistInactive: true,
-	})
-	if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
-		return stopErr
+	prepared, err := a.prepareSessionJobs([]string{familiarID})
+	if err != nil {
+		return err
 	}
-
-	var failures []error
-	if stopErr != nil {
-		failures = append(failures, stopErr)
+	if err := a.executePreparedSessionJobs(prepared); err != nil {
+		return fmt.Errorf("stop familiar jobs: %w", err)
 	}
-	if em != nil {
-		em.Stop()
-	}
-	if err := errors.Join(failures...); err != nil {
+	if _, err := a.commitFamiliarRuntimeCleanup(familiarID, em); err != nil {
 		return &ui.CommittedCleanupError{Err: err}
 	}
 	return nil
@@ -974,44 +1041,30 @@ func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 	if err := paths.ValidateFamiliarSessionID(ownerSessionID, familiarID); err != nil {
 		return fmt.Errorf("invalid familiar session ID: %w", err)
 	}
-	log.Printf("closeFamiliar: start familiarID=%q em=%v profile=%q activeChat=%q",
-		familiarID, em != nil, a.profile, ownerSessionID)
-	stopErr := a.stopSessionRuntime(familiarID, stopSessionOptions{
-		stopJobs:        true,
-		persistInactive: true,
-	})
-	if stopErr != nil && !runtimeStopWasCommitted(stopErr) {
-		return stopErr
+	prepared, err := a.prepareSessionJobs([]string{familiarID})
+	if err != nil {
+		return err
+	}
+	if err := a.executePreparedSessionJobs(prepared); err != nil {
+		return fmt.Errorf("stop familiar jobs: %w", err)
 	}
 
 	var cleanupFailures []error
-	if stopErr != nil {
-		cleanupFailures = append(cleanupFailures, stopErr)
-		log.Printf("closeFamiliar: committed stop warning for %q: %v", familiarID, stopErr)
-	}
-	if em != nil {
-		em.Stop()
-		cwd := em.CWD()
-		historyPath, findErr := paths.FindSessionJSONLChecked(familiarID, cwd, a.piAgentDir)
-		if findErr != nil {
-			cleanupFailures = append(cleanupFailures, fmt.Errorf("inspect familiar JSONL %q: %w", familiarID, findErr))
-		} else if historyPath != "" {
-			if _, err := paths.DeleteSessionJSONL(familiarID, cwd, a.piAgentDir); err != nil {
-				cleanupFailures = append(cleanupFailures, fmt.Errorf("delete familiar JSONL %q: %w", familiarID, err))
-			}
-		}
-	}
 	if err := removeFamiliarRegistry(a.profile, ownerSessionID, familiarID); err != nil {
 		registryErr := fmt.Errorf("remove familiar %q from registry: %w", familiarID, err)
 		if !atomicfile.IsCommitted(err) {
-			// Runtime cleanup may already be committed, but the registry still
-			// owns this familiar. Keep the tab visible so the user can retry
-			// instead of letting the watcher resurrect it behind their back.
-			return errors.Join(append(cleanupFailures, registryErr)...)
+			return registryErr
 		}
 		cleanupFailures = append(cleanupFailures, registryErr)
 	}
 
+	cwd, runtimeErr := a.commitFamiliarRuntimeCleanup(familiarID, em)
+	if runtimeErr != nil {
+		cleanupFailures = append(cleanupFailures, runtimeErr)
+	}
+	if err := deleteFamiliarSessionHistory(familiarID, cwd, a.piAgentDir); err != nil {
+		cleanupFailures = append(cleanupFailures, err)
+	}
 	if err := errors.Join(cleanupFailures...); err != nil {
 		log.Printf("closeFamiliar: committed cleanup warning for %q: %v", familiarID, err)
 		return &ui.CommittedCleanupError{Err: err}

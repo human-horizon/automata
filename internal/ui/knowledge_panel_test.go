@@ -5,10 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	akactions "github.com/HumanHorizon/automata/internal/ai-knowledge/actions"
 	akcontext "github.com/HumanHorizon/automata/internal/ai-knowledge/context"
 	akjobs "github.com/HumanHorizon/automata/internal/ai-knowledge/jobs"
 	"github.com/HumanHorizon/automata/internal/kanban"
@@ -245,6 +247,9 @@ func TestKnowledgeSettingsPreserveUnknownNestedKeys(t *testing.T) {
 	k.profile, k.sessionID = profile, sessionID
 	k.readSettings()
 	k.handleMouse(tea.MouseMsg{X: 1, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if schema, err := paths.ReadSessionSchemaVersion(profile, sessionID); err != nil || schema != 0 {
+		t.Fatalf("legacy settings session schema = %d, error = %v", schema, err)
+	}
 	if !k.autoContinue || k.dual || k.settingsError != "" {
 		t.Fatalf("settings after toggle: auto=%v dual=%v error=%q", k.autoContinue, k.dual, k.settingsError)
 	}
@@ -340,6 +345,9 @@ func TestKnowledgeSettingsNewFileAndMutuallyExclusiveToggle(t *testing.T) {
 	k.profile, k.sessionID = profile, sessionID
 	k.readSettings()
 	k.handleMouse(tea.MouseMsg{X: 11, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if schema, err := paths.ReadSessionSchemaVersion(profile, sessionID); err != nil || schema != paths.CurrentSessionSchemaVersion {
+		t.Fatalf("new settings session schema = %d, error = %v", schema, err)
+	}
 	if k.dual == false || k.autoContinue || k.settingsError != "" {
 		t.Fatalf("new settings toggle = auto=%v dual=%v error=%q", k.autoContinue, k.dual, k.settingsError)
 	}
@@ -564,6 +572,21 @@ func TestKnowledgePanelEmpty(t *testing.T) {
 	}
 }
 
+func TestKnowledgePanelWithoutFolderHasNoActionsWarning(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile("no-folder-actions")
+	k.SetSession("no-folder-actions__chat")
+	k.Activate()
+	if k.actionsError != "" || k.actionsWatchError != "" {
+		t.Fatalf("missing folder scope surfaced an Actions error: read=%q watcher=%q", k.actionsError, k.actionsWatchError)
+	}
+	if strings.Contains(strip(k.View(80, 24)), "Actions read warning") {
+		t.Fatal("missing folder scope rendered an Actions read warning")
+	}
+}
+
 // TestKnowledgePanelViewSize ensures View updates cached size when given one.
 func TestKnowledgePanelViewSize(t *testing.T) {
 	k := NewKnowledgePanel()
@@ -583,5 +606,236 @@ func TestKnowledgePanelUpdateWindowSize(t *testing.T) {
 	}
 	if k.width != 100 || k.height != 30 {
 		t.Fatalf("size not updated: w=%d h=%d", k.width, k.height)
+	}
+}
+
+func TestKnowledgePanelActionButtonsRequireConfirmationAndCanBeCancelled(t *testing.T) {
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile("folder-actions")
+	k.SetDomain("folder-actions__project")
+	action := akactions.Action{
+		ID:      strings.Repeat("a", 64),
+		Name:    "Open preview",
+		Command: "printf '\x1b[31m'",
+		CWD:     "/workspace",
+	}
+	k.actions = []akactions.Action{action}
+	var ran int
+	var received akactions.Action
+	k.actionRunner = func(got akactions.Action) error {
+		ran++
+		received = got
+		return nil
+	}
+
+	plain := strip(k.View(60, 24))
+	if !strings.Contains(plain, "── ▾ Actions") || !strings.Contains(plain, "Open preview") || k.actionsHeaderY < 0 {
+		t.Fatalf("Actions section is missing or not collapsible: %q", plain)
+	}
+	if strings.Index(plain, "Status") >= strings.Index(plain, "Actions") || strings.Index(plain, "Actions") >= strings.Index(plain, "Plans") {
+		t.Fatalf("Actions section is out of order: %q", plain)
+	}
+	k.Update(tea.MouseMsg{Y: k.actionsHeaderY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	plain = strip(k.View(60, 24))
+	if !k.actionsCollapsed || strings.Contains(plain, "Open preview") || !strings.Contains(plain, "── ▸ Actions") {
+		t.Fatalf("Actions section did not collapse: %q", plain)
+	}
+	k.Update(tea.MouseMsg{Y: k.actionsHeaderY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	k.View(60, 24)
+	var actionY int
+	for y := range k.actionRows {
+		actionY = y
+	}
+	if actionY == 0 {
+		t.Fatal("visible action row has no mouse hitbox")
+	}
+
+	clickAction := func() {
+		k.Update(tea.MouseMsg{Y: actionY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+		if k.pendingAction == nil {
+			t.Fatal("clicking an action did not request confirmation")
+		}
+	}
+	clickAction()
+	confirmation := strip(k.View(60, 24))
+	if !strings.Contains(confirmation, "Exact command") || !strings.Contains(confirmation, `printf '\x1b[31m'`) || !strings.Contains(confirmation, strconv.QuoteToGraphic(action.CWD)) {
+		t.Fatalf("confirmation omitted the exact safely quoted command or cwd: %q", confirmation)
+	}
+	if strings.Contains(confirmation, "\x1b") {
+		t.Fatal("confirmation rendered a raw terminal control character")
+	}
+	k.Update(tea.MouseMsg{Y: k.actionConfirmButtonY, X: k.actionConfirmNoRange.start, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if k.pendingAction != nil || ran != 0 {
+		t.Fatalf("Cancel executed or retained the action: pending=%v ran=%d", k.pendingAction, ran)
+	}
+
+	k.View(60, 24)
+	clickAction()
+	k.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if k.pendingAction != nil || ran != 0 {
+		t.Fatalf("Escape executed or retained the action: pending=%v ran=%d", k.pendingAction, ran)
+	}
+
+	k.View(60, 24)
+	clickAction()
+	cmd := k.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil || ran != 0 {
+		t.Fatalf("confirmation did not return an unstarted command: cmd=%v ran=%d", cmd != nil, ran)
+	}
+	result := cmd()
+	completion, ok := result.(actionRunCompletedMsg)
+	if !ok {
+		t.Fatalf("action command returned %T", result)
+	}
+	if ran != 1 || received != action {
+		t.Fatalf("confirmed runner received %#v, want %#v; calls=%d", received, action, ran)
+	}
+	k.Update(completion)
+	if !strings.Contains(strip(k.View(60, 24)), "Completed: Open preview") {
+		t.Fatal("successful action completion was not shown")
+	}
+}
+
+func TestKnowledgePanelRunsConfirmedActionInTeaCommandAndShowsFailure(t *testing.T) {
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile("async-folder-actions")
+	k.SetDomain("async-folder-actions__project")
+	action := akactions.Action{ID: strings.Repeat("b", 64), Name: "Build", Command: "make test", CWD: t.TempDir()}
+	k.actions = []akactions.Action{action}
+	started := make(chan akactions.Action, 1)
+	release := make(chan struct{})
+	k.actionRunner = func(got akactions.Action) error {
+		started <- got
+		<-release
+		return errors.New("synthetic runner failure")
+	}
+	k.View(60, 24)
+	var actionY int
+	for y := range k.actionRows {
+		actionY = y
+	}
+	k.Update(tea.MouseMsg{Y: actionY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	k.View(60, 24)
+	cmd := k.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("confirmation returned no tea.Cmd")
+	}
+	select {
+	case <-started:
+		t.Fatal("KnowledgePanel.Update executed the action instead of returning a command")
+	default:
+	}
+	result := make(chan tea.Msg, 1)
+	go func() { result <- cmd() }()
+	select {
+	case got := <-started:
+		if got != action {
+			t.Fatalf("runner received %#v, want %#v", got, action)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("confirmed tea.Cmd did not start the injected runner")
+	}
+	select {
+	case msg := <-result:
+		t.Fatalf("runner completed before release: %#v", msg)
+	default:
+	}
+	close(release)
+	var completion tea.Msg
+	select {
+	case completion = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("confirmed action did not return its completion")
+	}
+	k.Update(completion)
+	if !strings.Contains(strip(k.View(60, 24)), "Failed: Build: synthetic runner failure") {
+		t.Fatal("runner failure was not shown in the Actions panel")
+	}
+}
+
+func TestKnowledgePanelActionsWatcherTracksFolderAndRejectsStaleEvents(t *testing.T) {
+	profile, domain := "folder-action-watch", "folder-action-watch__project"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile(profile)
+	k.SetDomain(domain)
+	k.Activate()
+	domainDir := paths.DomainDir(profile, domain)
+	actionsDir, err := akactions.Directory(profile, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k.actionsWatcher == nil || k.actionsWatcherPath != domainDir {
+		t.Fatalf("missing-actions watcher = %q, want domain directory %q", k.actionsWatcherPath, domainDir)
+	}
+	watchCmd := k.watchActionsCmd()
+	if watchCmd == nil {
+		t.Fatal("initial folder-actions watch command is nil")
+	}
+	messages := make(chan tea.Msg, 1)
+	go func() { messages <- watchCmd() }()
+	if err := os.MkdirAll(actionsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	action := akactions.Action{ID: strings.Repeat("c", 64), Name: "Build", Command: "make test", CWD: t.TempDir()}
+	data, err := json.Marshal(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(actionsDir, action.ID+".json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-messages:
+		if _, ok := msg.(actionsChangedMsg); !ok {
+			t.Fatalf("actions directory creation message = %T", msg)
+		}
+		k.Update(msg)
+	case <-time.After(2 * time.Second):
+		t.Fatal("domain watcher did not observe the late Actions directory")
+	}
+	if k.actionsWatcherPath != actionsDir || len(k.actions) != 1 || k.actions[0].Name != "Build" {
+		t.Fatalf("late action was not loaded and watched: path=%q actions=%#v", k.actionsWatcherPath, k.actions)
+	}
+
+	watchCmd = k.watchActionsCmd()
+	if watchCmd == nil {
+		t.Fatal("folder action file watcher command is nil")
+	}
+	go func() { messages <- watchCmd() }()
+	action.Command = "make lint"
+	data, err = json.Marshal(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(actionsDir, action.ID+".json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-messages:
+		k.Update(msg)
+	case <-time.After(2 * time.Second):
+		t.Fatal("folder action watcher did not observe an action update")
+	}
+	if len(k.actions) != 1 || k.actions[0].Command != "make lint" {
+		t.Fatalf("updated action was not loaded: %#v", k.actions)
+	}
+
+	oldWatcher, oldGeneration := k.actionsWatcher, k.actionsGeneration
+	k.SetSession("folder-action-watch__first.chat")
+	if len(k.actions) != 1 || k.actions[0].Name != "Build" {
+		t.Fatalf("action was not shared with a chat in the folder: %#v", k.actions)
+	}
+	k.SetSession("folder-action-watch__second.chat")
+	if len(k.actions) != 1 || k.actions[0].Command != "make lint" {
+		t.Fatalf("action did not persist across same-folder chats: %#v", k.actions)
+	}
+	k.SetDomain("folder-action-watch__other")
+	k.Update(actionsChangedMsg{generation: oldGeneration, watcher: oldWatcher})
+	if k.domain != "folder-action-watch__other" || len(k.actions) != 0 {
+		t.Fatalf("stale old-domain event changed folder actions: domain=%q actions=%#v", k.domain, k.actions)
 	}
 }
