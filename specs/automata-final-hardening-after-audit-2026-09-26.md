@@ -54,3 +54,14 @@
 - [ ] `.github/workflows/ci.yml` по-прежнему использует `actions/checkout@v4`, `actions/setup-go@v5`, `golangci/golangci-lint-action@v8`, не immutable SHA pins. Проверенные official release SHAs документированы в `specs/github-actions-sha-pinning.md`. Workflow не меняла: требуется отдельное разрешение владельца и доступ `workflow`.
 
 `govulncheck -show verbose` на текущем baseline: нет уязвимостей в вызываемых символах/пакетах; module-only `GO-2026-5024` затрагивает `golang.org/x/sys@v0.38.0` Windows API (`NewNTUnicodeString`), исправлено в v0.44.0, Windows не поддерживается и affected symbol не вызывается. PR #6 обновляет ansi/display dependencies, но не x/sys; отдельный x/sys update не вносился без проверенного PR/release review.
+
+## Актуальный статус на 2026-10-05
+
+Исторические live-проверки выше фиксируют состояние на дату каждой записи; их результаты не переписываются как будто более позднее состояние существовало раньше.
+
+- Проверенный `origin/main`: `35fc8181375c0156a9afbbb3fabb9503e9ce1ed6`. GitHub Actions run [#142](https://github.com/human-horizon/automata/actions/runs/37151909329) завершился успешно на этом exact HEAD; required check `quality` — success.
+- Read-only GitHub API подтверждает, что `main` protected, required check — `quality`, strict mode и enforcement для admins включены, force-push и deletion запрещены.
+- GitHub API подтверждает, что Dependabot PR #4–#7 merged; workflow использует `actions/checkout@v7`, `actions/setup-go@v7` и `golangci/golangci-lint-action@v9`. Старые записи о незакрытых #4/#5/#7 выше — только исторический снимок 2026-09-30.
+- Локальный checkout `main` находится на `f044ac9b8c67130e8466ab18987ee6c0267dd224`, на один коммит впереди `origin/main`; этот локальный коммит не опубликован. CI #142 проверяет `35fc8181`, не локальный HEAD. Не заявлять GitHub CI для `f044ac9` или последующих незакоммиченных изменений.
+- Immutable SHA pinning действий остаётся отдельным необязательным P3; текущие version tags сохранены. LICENSE не добавлялась без решения владельца.
+- На рабочем дереве (`HEAD f044ac9b8...` плюс незакоммиченные follow-up изменения) полный локальный gate на Go 1.26.6 прошёл: `go mod verify`, gofmt, vet, golangci-lint (0 issues), полный `go test ./...`, отдельный полный E2E, race suite, Linux amd64 и macOS arm64 cross-build, `git diff --check`. `govulncheck` сообщил 0 reachable vulnerabilities; осталась одна module-only advisory `GO-2026-5024` для Windows API `x/sys@v0.38.0`, не вызываемого проектом. Новые изменения не закоммичены и не опубликованы, поэтому GitHub CI для них не запускался.

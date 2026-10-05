@@ -426,7 +426,7 @@ func (a *App) handleFamiliarCleanupResult(result ui.FamiliarCleanupResultMsg) te
 
 	result.Phase = ui.FamiliarHistoryRemoved
 	return func() tea.Msg {
-		if err := deleteFamiliarSessionHistory(result.FamiliarSessionID, cwd, a.piAgentDir); err != nil {
+		if err := deleteFamiliarSessionHistoryFn(result.FamiliarSessionID, cwd, a.piAgentDir); err != nil {
 			result.Err = errors.Join(result.Err, err)
 		}
 		return result

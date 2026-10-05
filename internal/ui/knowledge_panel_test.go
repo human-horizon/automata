@@ -364,6 +364,44 @@ func TestKnowledgeSettingsNewFileAndMutuallyExclusiveToggle(t *testing.T) {
 	}
 }
 
+func TestKnowledgeSettingsWriterPreservesLegacySessionSchema(t *testing.T) {
+	profile := "legacy-settings"
+	sessionID := "legacy-settings__chat"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	sessionDir := paths.SessionDir(profile, sessionID)
+	if err := os.MkdirAll(sessionDir, paths.PrivateDirMode); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(sessionDir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"autoContinue":false,"dual":false,"future":"keep"}`), paths.PrivateFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	panel := NewKnowledgePanel()
+	panel.profile, panel.sessionID = profile, sessionID
+	panel.autoContinue = true
+	if err := panel.writeSettings(); err != nil {
+		t.Fatal(err)
+	}
+	if schema, err := paths.ReadSessionSchemaVersion(profile, sessionID); err != nil || schema != 0 {
+		t.Fatalf("legacy settings session schema = %d, error = %v", schema, err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, "session.json")); !os.IsNotExist(err) {
+		t.Fatalf("settings writer created a manifest for a legacy session: %v", err)
+	}
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if string(settings["future"]) != `"keep"` || string(settings["autoContinue"]) != "true" {
+		t.Fatalf("legacy settings after write = %s", data)
+	}
+}
+
 func TestKnowledgeHeaderHitboxesMatchRenderedCells(t *testing.T) {
 	for _, test := range []struct {
 		name  string

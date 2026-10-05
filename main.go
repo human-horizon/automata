@@ -1034,7 +1034,10 @@ func (a *App) cleanupExternallyRemovedFamiliar(familiarID string, em *portalis.E
 // closeFamiliar cleans up after the user confirms closing a familiar. An
 // uncommitted runtime preflight failure leaves host data and the tab intact;
 // committed cleanup warnings are returned after every host cleanup is tried.
-var removeFamiliarRegistry = paths.RemoveFamiliar
+var (
+	removeFamiliarRegistry         = paths.RemoveFamiliar
+	deleteFamiliarSessionHistoryFn = deleteFamiliarSessionHistory
+)
 
 func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 	ownerSessionID := a.activeChatSessionID()
@@ -1062,7 +1065,7 @@ func (a *App) closeFamiliar(familiarID string, em *portalis.Emulator) error {
 	if runtimeErr != nil {
 		cleanupFailures = append(cleanupFailures, runtimeErr)
 	}
-	if err := deleteFamiliarSessionHistory(familiarID, cwd, a.piAgentDir); err != nil {
+	if err := deleteFamiliarSessionHistoryFn(familiarID, cwd, a.piAgentDir); err != nil {
 		cleanupFailures = append(cleanupFailures, err)
 	}
 	if err := errors.Join(cleanupFailures...); err != nil {

@@ -22,4 +22,4 @@ Thanks for helping improve Automata. Keep changes focused, preserve existing use
 4. For changes to terminal behavior, also run the relevant E2E tests and include any required environment setup from `.github/workflows/ci.yml`.
 5. Describe user-visible behavior, compatibility or migration impact, and the tests actually run. Do not claim checks that were not run.
 
-The supported development platforms and Go version are documented in `README.md`. Do not commit user session data, credentials, build output, or unrelated worktree changes.
+The supported development platforms and Go version are documented in `README.md`. Do not commit user session data, credentials, build output, or unrelated worktree changes. Never commit machine-specific absolute paths, live job IDs, private session filenames, or operational incident identifiers to public documentation.

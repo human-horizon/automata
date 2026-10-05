@@ -1360,6 +1360,10 @@ func TestAsyncFamiliarCleanupFailurePreservesHostStateAndData(t *testing.T) {
 		cwd     = "/tmp"
 	)
 	jsonlPath := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	historyBefore, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	registryPath := paths.FamiliarsJSONLPath(profile, mainSID)
 	if err := os.MkdirAll(filepath.Dir(registryPath), 0o700); err != nil {
 		t.Fatal(err)
@@ -1406,8 +1410,12 @@ func TestAsyncFamiliarCleanupFailurePreservesHostStateAndData(t *testing.T) {
 	if familiarEm.View(80, 12) != beforeView {
 		t.Fatal("job failure stopped the familiar emulator")
 	}
-	if _, err := os.Stat(jsonlPath); err != nil {
+	gotHistory, err := os.ReadFile(jsonlPath)
+	if err != nil {
 		t.Fatalf("job failure changed familiar history: %v", err)
+	}
+	if !bytes.Equal(gotHistory, historyBefore) {
+		t.Fatal("job failure changed familiar JSONL contents")
 	}
 	gotRegistry, err := os.ReadFile(registryPath)
 	if err != nil || string(gotRegistry) != string(registryContents) {
@@ -1512,6 +1520,11 @@ func TestCloseFamiliarRegistryPrecommitFailureRemainsRetryable(t *testing.T) {
 		famSID  = "close-familiar-retry__chat__expert"
 		cwd     = "/tmp"
 	)
+	historyPath := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	historyBefore, err := os.ReadFile(historyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
 	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
 	panel := ui.NewChatPanel(mainEm, mainSID, profile)
@@ -1541,7 +1554,7 @@ func TestCloseFamiliarRegistryPrecommitFailureRemainsRetryable(t *testing.T) {
 	removeFamiliarRegistry = func(string, string, string) error { return registryErr }
 	t.Cleanup(func() { removeFamiliarRegistry = previousRemove })
 
-	err := app.closeFamiliar(famSID, familiarEm)
+	err = app.closeFamiliar(famSID, familiarEm)
 	if !errors.Is(err, registryErr) {
 		t.Fatalf("close familiar error = %v, want registry failure", err)
 	}
@@ -1555,6 +1568,180 @@ func TestCloseFamiliarRegistryPrecommitFailureRemainsRetryable(t *testing.T) {
 	}
 	if string(gotRegistry) != string(registryBefore) {
 		t.Fatalf("registry changed after precommit failure: %s", gotRegistry)
+	}
+	gotHistory, err := os.ReadFile(historyPath)
+	if err != nil {
+		t.Fatalf("history after registry precommit failure: %v", err)
+	}
+	if !bytes.Equal(gotHistory, historyBefore) {
+		t.Fatal("registry precommit failure changed familiar JSONL history")
+	}
+	if app.emulatorCache[famSID] != familiarEm || app.familiarEmulatorCache[famSID] != familiarEm {
+		t.Fatal("registry precommit failure changed familiar runtime caches")
+	}
+	if _, ok := app.activeSessions[famSID]; !ok {
+		t.Fatal("registry precommit failure cleared familiar active state")
+	}
+}
+
+func TestCloseFamiliarHistoryDeletionFailureReturnsCommittedWarning(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
+	const (
+		profile = "close-familiar-history-warning"
+		mainSID = "close-familiar-history-warning__chat"
+		famSID  = "close-familiar-history-warning__chat__expert"
+		cwd     = "/tmp"
+	)
+
+	historyPath := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	historyBefore, err := os.ReadFile(historyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registryPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, []byte(`[{"id":"expert","sessionId":"`+famSID+`"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	historyErr := errors.New("injected JSONL cleanup failure")
+	previousDelete := deleteFamiliarSessionHistoryFn
+	deleteFamiliarSessionHistoryFn = func(string, string, string) error { return historyErr }
+	t.Cleanup(func() { deleteFamiliarSessionHistoryFn = previousDelete })
+
+	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
+	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	panel := ui.NewChatPanel(mainEm, mainSID, profile)
+	app := &App{
+		container:             ui.NewContainer(panel),
+		tree:                  tree.New(),
+		profile:               profile,
+		piAgentDir:            filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:        map[string]struct{}{famSID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{famSID: familiarEm},
+		familiarEmulatorCache: map[string]*portalis.Emulator{famSID: familiarEm},
+	}
+	app.tree.Profile = profile
+
+	err = app.closeFamiliar(famSID, familiarEm)
+	var committedErr *ui.CommittedCleanupError
+	if !errors.As(err, &committedErr) || !errors.Is(err, historyErr) {
+		t.Fatalf("close error = %v, want committed JSONL cleanup warning", err)
+	}
+	gotRegistry, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []paths.FamiliarEntry
+	if err := json.Unmarshal(gotRegistry, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("registry after committed close = %#v, want no familiar", entries)
+	}
+	gotHistory, err := os.ReadFile(historyPath)
+	if err != nil {
+		t.Fatalf("history after failed cleanup: %v", err)
+	}
+	if !bytes.Equal(gotHistory, historyBefore) {
+		t.Fatal("failed JSONL cleanup changed familiar history")
+	}
+	if app.emulatorCache[famSID] != nil || app.familiarEmulatorCache[famSID] != nil {
+		t.Fatal("committed close retained familiar emulator state")
+	}
+	if _, ok := app.activeSessions[famSID]; ok {
+		t.Fatal("committed close retained familiar active state")
+	}
+}
+
+func TestAsyncFamiliarCloseHistoryDeletionFailurePreservesHistory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AI_DATA_HOME", home)
+	const (
+		profile = "async-familiar-history-warning"
+		mainSID = "async-familiar-history-warning__chat"
+		famSID  = "async-familiar-history-warning__chat__expert"
+		cwd     = "/tmp"
+	)
+
+	historyPath := writeJSONLFixture(t, home, cwd, famSID, time.Now())
+	historyBefore, err := os.ReadFile(historyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registryPath := paths.FamiliarsJSONLPath(profile, mainSID)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, []byte(`[{"id":"expert","sessionId":"`+famSID+`"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	historyErr := errors.New("injected async JSONL cleanup failure")
+	previousDelete := deleteFamiliarSessionHistoryFn
+	deleteFamiliarSessionHistoryFn = func(string, string, string) error { return historyErr }
+	t.Cleanup(func() { deleteFamiliarSessionHistoryFn = previousDelete })
+
+	mainEm := portalis.NewEmulator(mainSID, "chat", cwd, nil)
+	familiarEm := portalis.NewEmulator(famSID, "expert", cwd, nil)
+	panel := ui.NewChatPanel(mainEm, mainSID, profile)
+	tr := tree.New()
+	tr.Profile = profile
+	app := &App{
+		tree:                  tr,
+		profile:               profile,
+		piAgentDir:            filepath.Join(home, ".ai", "just", "pi"),
+		activeSessions:        map[string]struct{}{famSID: {}},
+		runningSessions:       map[string]struct{}{famSID: {}},
+		emulatorCache:         map[string]*portalis.Emulator{famSID: familiarEm},
+		familiarEmulatorCache: map[string]*portalis.Emulator{famSID: familiarEm},
+	}
+
+	cmd := app.requestFamiliarCleanup(panel, famSID, familiarEm, ui.FamiliarCloseCleanup)
+	if cmd == nil {
+		t.Fatal("familiar close command is nil")
+	}
+	stopped := cmd().(ui.FamiliarCleanupResultMsg)
+	if !stopped.Committed || stopped.Phase != ui.FamiliarJobsStopped {
+		t.Fatalf("jobs completion = %+v, want committed stop", stopped)
+	}
+	_, historyCmd := app.Update(stopped)
+	if historyCmd == nil {
+		t.Fatal("committed close did not schedule history cleanup")
+	}
+	historyResult := historyCmd().(ui.FamiliarCleanupResultMsg)
+	if !historyResult.Committed || historyResult.Phase != ui.FamiliarHistoryRemoved || !errors.Is(historyResult.Err, historyErr) {
+		t.Fatalf("history completion = %+v, want committed warning", historyResult)
+	}
+	app.Update(historyResult)
+	if !errors.Is(app.tree.LastActionError(), historyErr) {
+		t.Fatalf("observable cleanup warning = %v, want %v", app.tree.LastActionError(), historyErr)
+	}
+	gotHistory, err := os.ReadFile(historyPath)
+	if err != nil {
+		t.Fatalf("history after committed cleanup warning: %v", err)
+	}
+	if !bytes.Equal(gotHistory, historyBefore) {
+		t.Fatal("failed async history cleanup changed familiar JSONL")
+	}
+	gotRegistry, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []paths.FamiliarEntry
+	if err := json.Unmarshal(gotRegistry, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("registry after committed close = %#v, want no familiar", entries)
+	}
+	if app.emulatorCache[famSID] != nil || app.familiarEmulatorCache[famSID] != nil {
+		t.Fatal("committed async close retained familiar emulator state")
 	}
 }
 

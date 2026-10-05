@@ -561,6 +561,39 @@ func TestAssignTaskToChatReturnsListenCommandAndWritesBothRecords(t *testing.T) 
 	}
 }
 
+func TestAssignTaskToUnopenedChatCreatesVersionOneManifest(t *testing.T) {
+	profile := "Unopened Chat Assignment"
+	domain := "unopened-assignment"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	taskDir := kanban.KanbanDir(domain, profile)
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	taskPath := filepath.Join(taskDir, "task.md")
+	if err := os.WriteFile(taskPath, []byte("---\ntitle: Build\nstatus: todo\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "unopened-chat-assignment__chat"
+	sessionDir := paths.SessionDir(profile, sessionID)
+	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+		t.Fatalf("fixture session directory already exists: %v", err)
+	}
+	task, err := kanban.ReadTask(taskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	panel := NewKanbanPanel(profile)
+	if _, err := panel.assignTaskToChat(task, ChatInfo{SessionID: sessionID}, "progress"); err != nil {
+		t.Fatal(err)
+	}
+	if schema, err := paths.ReadSessionSchemaVersion(profile, sessionID); err != nil || schema != paths.CurrentSessionSchemaVersion {
+		t.Fatalf("assigned chat schema = %d, error = %v", schema, err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, "status.json")); err != nil {
+		t.Fatalf("assignment status was not written: %v", err)
+	}
+}
+
 func TestAssignTaskToChatRollsBackWhenPTYStartFails(t *testing.T) {
 	profile := "Assignment Rollback"
 	domain := "assignment-rollback"
