@@ -55,7 +55,7 @@
 
 `govulncheck -show verbose` на текущем baseline: нет уязвимостей в вызываемых символах/пакетах; module-only `GO-2026-5024` затрагивает `golang.org/x/sys@v0.38.0` Windows API (`NewNTUnicodeString`), исправлено в v0.44.0, Windows не поддерживается и affected symbol не вызывается. PR #6 обновляет ansi/display dependencies, но не x/sys; отдельный x/sys update не вносился без проверенного PR/release review.
 
-## Актуальный статус на 2026-10-05
+## Снимок до публикации — 2026-10-05
 
 Исторические live-проверки выше фиксируют состояние на дату каждой записи; их результаты не переписываются как будто более позднее состояние существовало раньше.
 
@@ -64,4 +64,11 @@
 - GitHub API подтверждает, что Dependabot PR #4–#7 merged; workflow использует `actions/checkout@v7`, `actions/setup-go@v7` и `golangci/golangci-lint-action@v9`. Старые записи о незакрытых #4/#5/#7 выше — только исторический снимок 2026-09-30.
 - Локальный checkout `main` находится на `f044ac9b8c67130e8466ab18987ee6c0267dd224`, на один коммит впереди `origin/main`; этот локальный коммит не опубликован. CI #142 проверяет `35fc8181`, не локальный HEAD. Не заявлять GitHub CI для `f044ac9` или последующих незакоммиченных изменений.
 - Immutable SHA pinning действий остаётся отдельным необязательным P3; текущие version tags сохранены. LICENSE не добавлялась без решения владельца.
-- На рабочем дереве (`HEAD f044ac9b8...` плюс незакоммиченные follow-up изменения) полный локальный gate на Go 1.26.6 прошёл: `go mod verify`, gofmt, vet, golangci-lint (0 issues), полный `go test ./...`, отдельный полный E2E, race suite, Linux amd64 и macOS arm64 cross-build, `git diff --check`. `govulncheck` сообщил 0 reachable vulnerabilities; осталась одна module-only advisory `GO-2026-5024` для Windows API `x/sys@v0.38.0`, не вызываемого проектом. Новые изменения не закоммичены и не опубликованы, поэтому GitHub CI для них не запускался.
+
+## Статус после публикации — 2026-10-05
+
+- Коммиты `f044ac9` и `c0098b2` опубликованы в `main`; удалённый и локальный HEAD — `c0098b21c00ef395352dedb6e2c84cac39f25b1c`.
+- Первая попытка push в защищённый `main` была корректно отклонена GH006 до появления required check. Тот же commit прошёл `quality` на topic branch; после этого обычный fast-forward push прошёл. Branch protection не меняли и не обходили; PR approval правилом не требуется.
+- GitHub Actions run [#144, `quality`](https://github.com/human-horizon/automata/actions/runs/37338386876) завершился успешно на exact HEAD `c0098b2` (attempt 2). Первый запуск на `main` упал по timeout в `TestHumanMainFamiliarTabsAndResize`; повтор этого запуска прошёл полный tests, self-building E2E, race, reproducible builds и остальные quality steps. Первопричина единичного timeout не установлена; шесть отдельных локальных запусков этого теста прошли.
+- После push в рабочем дереве оставлены локальные незакоммиченные записи о GH006/E2E диагностике в `CONTEXT.md`; они не входят в опубликованный SHA. Новых коммитов после `c0098b2` не создавалось.
+- На рабочем дереве (`HEAD f044ac9b8...` плюс незакоммиченные follow-up изменения) полный локальный gate на Go 1.26.6 прошёл: `go mod verify`, gofmt, vet, golangci-lint (0 issues), полный `go test ./...`, отдельный полный E2E, race suite, Linux amd64 и macOS arm64 cross-build, `git diff --check`. `govulncheck` сообщил 0 reachable vulnerabilities; осталась одна module-only advisory `GO-2026-5024` для Windows API `x/sys@v0.38.0`, не вызываемого проектом. На момент этого снимка follow-up ещё не был закоммичен или опубликован.
