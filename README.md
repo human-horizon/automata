@@ -12,7 +12,7 @@ The platform-specific file opener includes a Windows command, but that alone doe
 
 ## Requirements
 
-- Go **1.26.6** or newer compatible 1.26.x toolchain.
+- Go **1.26.9** or newer compatible 1.26.x toolchain.
 - A supported terminal on macOS or Linux.
 - `pi` or `just-pi` on `PATH` for AI chat sessions, unless `PI_CMD` points to the executable.
 
