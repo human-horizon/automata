@@ -239,7 +239,7 @@ func TestContentWithActionsPlacementCollapseAndSafety(t *testing.T) {
 		Command: "open https://example.test",
 		CWD:     "/private/workspace",
 	}}
-	content := ContentWithActions(width, nil, nil, "Current task", actionList, apptheme.Default(), CollapseState{})
+	content := ContentWithActions(width, nil, nil, "Current task", actionList, nil, apptheme.Default(), CollapseState{})
 	plain := content
 	positions := make(map[string]int)
 	for section, marker := range map[string]string{
@@ -275,9 +275,103 @@ func TestContentWithActionsPlacementCollapseAndSafety(t *testing.T) {
 		t.Fatalf("action row width = %d, viewport = %d", got, width)
 	}
 
-	collapsed := ContentWithActions(width, nil, nil, "", actionList, apptheme.Default(), CollapseState{Actions: true})
+	collapsed := ContentWithActions(width, nil, nil, "", actionList, nil, apptheme.Default(), CollapseState{Actions: true})
 	if strings.Contains(collapsed, actionList[0].Name) || !strings.Contains(collapsed, "── ▸ Actions") {
 		t.Fatalf("Actions did not collapse: %s", collapsed)
+	}
+}
+
+func TestContentWithActionsMarksOnlyRunningActions(t *testing.T) {
+	const width = 60
+	actionList := []actions.Action{
+		{ID: strings.Repeat("a", 64), Name: "Build", Command: "make", CWD: "/w"},
+		{ID: strings.Repeat("b", 64), Name: "Serve", Command: "serve", CWD: "/w"},
+	}
+	content := ContentWithActions(width, nil, nil, "", actionList, map[string]bool{strings.Repeat("a", 64): true}, apptheme.Default(), CollapseState{})
+	plain := content
+	if !strings.Contains(plain, "\u25cf Build \u00b7 running") {
+		t.Fatalf("running action is not marked: %q", plain)
+	}
+	if strings.Contains(plain, "Serve \u00b7 running") || !strings.Contains(plain, "\u2197 Serve") {
+		t.Fatalf("idle action was marked as running: %q", plain)
+	}
+}
+
+func TestActionButtonNameWrapsWithHangingIndentAndMatchesRowHeights(t *testing.T) {
+	const width = 24
+	longName := "Open the very long local application preview"
+	actionList := []actions.Action{
+		{ID: strings.Repeat("a", 64), Name: longName, Command: "open", CWD: "/w"},
+		{ID: strings.Repeat("b", 64), Name: "Short", Command: "true", CWD: "/w"},
+	}
+	content := ContentWithActions(width, nil, nil, "", actionList, map[string]bool{strings.Repeat("b", 64): true}, apptheme.Default(), CollapseState{})
+	lines := strings.Split(content, "\n")
+
+	start := -1
+	for index, line := range lines {
+		if strings.Contains(line, "\u2197 Open") {
+			start = index
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatalf("long action name is missing: %q", lines)
+	}
+	var wrapped []string
+	for index := start; index < len(lines) && strings.TrimSpace(lines[index]) != ""; index++ {
+		if strings.Contains(lines[index], "Short") {
+			break
+		}
+		wrapped = append(wrapped, lines[index])
+	}
+	if len(wrapped) < 2 {
+		t.Fatalf("long action name did not wrap: %q", wrapped)
+	}
+	for index, line := range wrapped {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("wrapped action line %d width = %d, viewport = %d: %q", index, got, width, line)
+		}
+		if index > 0 && !strings.HasPrefix(line, "    ") {
+			t.Fatalf("continuation line is not aligned under the name: %q", line)
+		}
+	}
+	rebuilt := strings.Join(wrapped, " ")
+	for _, word := range []string{"Open", "very", "long", "local", "application", "preview"} {
+		if !strings.Contains(rebuilt, word) {
+			t.Fatalf("action word %q was truncated: %q", word, rebuilt)
+		}
+	}
+
+	heights := ActionRowHeights(width, actionList, map[string]bool{strings.Repeat("b", 64): true})
+	if len(heights) != 2 || heights[0] != len(wrapped) || heights[1] != 1 {
+		t.Fatalf("row heights = %v, rendered long action has %d lines", heights, len(wrapped))
+	}
+}
+
+func TestPlanTitleWrapsWithinViewport(t *testing.T) {
+	const width = 20
+	const title = "Very long plan name that must wrap"
+	data := &context.Data{Plans: map[string][]context.PlanStep{title: {{Text: "step"}}}}
+	content := ContentWithActions(width, data, nil, "", nil, nil, apptheme.Default(), CollapseState{})
+	var titleLines []string
+	for _, line := range strings.Split(content, "\n") {
+		if strings.Contains(line, "Very") || strings.Contains(line, "plan") || strings.Contains(line, "wrap") || strings.Contains(line, "name") || strings.Contains(line, "must") {
+			titleLines = append(titleLines, line)
+		}
+	}
+	joined := strings.Join(titleLines, " ")
+	for _, word := range []string{"Very", "long", "plan", "name", "that", "must", "wrap"} {
+		if !strings.Contains(joined, word) {
+			t.Fatalf("plan title word %q was truncated: %q", word, content)
+		}
+	}
+	if len(titleLines) < 2 {
+		t.Fatalf("plan title did not wrap onto several lines: %q", titleLines)
+	}
+	for _, line := range titleLines {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("plan title line width = %d, viewport = %d: %q", got, width, line)
+		}
 	}
 }
 

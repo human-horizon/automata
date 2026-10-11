@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/actions"
 	"github.com/HumanHorizon/automata/internal/ai-knowledge/context"
@@ -22,6 +21,7 @@ type renderStyles struct {
 	title   lipgloss.Style
 	section lipgloss.Style
 	item    lipgloss.Style
+	running lipgloss.Style
 	done    lipgloss.Style
 	empty   lipgloss.Style
 	path    lipgloss.Style
@@ -32,6 +32,7 @@ func newRenderStyles(palette apptheme.Theme) renderStyles {
 		title:   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(palette.TextStrong)),
 		section: lipgloss.NewStyle().Foreground(lipgloss.Color(palette.TextMuted)),
 		item:    lipgloss.NewStyle().Foreground(lipgloss.Color(palette.Text)),
+		running: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(palette.Success)),
 		done:    lipgloss.NewStyle().Foreground(lipgloss.Color(palette.Lime)),
 		empty:   lipgloss.NewStyle().Foreground(lipgloss.Color(palette.TextDim)).Italic(true),
 		path:    lipgloss.NewStyle().Foreground(lipgloss.Color(palette.TextDim)),
@@ -99,11 +100,12 @@ func ViewWithTheme(width, height int, ctx *context.Data, js []jobs.Job, currentT
 // ContentWithTheme renders all content without clipping it to a viewport. The
 // embedding panel owns scrolling and can collapse selected sections.
 func ContentWithTheme(width int, ctx *context.Data, js []jobs.Job, currentTask string, palette apptheme.Theme, collapsed CollapseState) string {
-	return ContentWithActions(width, ctx, js, currentTask, nil, palette, collapsed)
+	return ContentWithActions(width, ctx, js, currentTask, nil, nil, palette, collapsed)
 }
 
 // ContentWithActions renders knowledge content and folder-scoped action buttons.
-func ContentWithActions(width int, ctx *context.Data, js []jobs.Job, currentTask string, actionList []actions.Action, palette apptheme.Theme, collapsed CollapseState) string {
+// runningActionIDs marks actions whose command is currently in flight.
+func ContentWithActions(width int, ctx *context.Data, js []jobs.Job, currentTask string, actionList []actions.Action, runningActionIDs map[string]bool, palette apptheme.Theme, collapsed CollapseState) string {
 	styles := newRenderStyles(palette)
 	if width <= 0 {
 		width = 80
@@ -136,9 +138,14 @@ func ContentWithActions(width int, ctx *context.Data, js []jobs.Job, currentTask
 	writeCollapsibleSection(&b, "Actions", collapsed.Actions, styles.section)
 	if !collapsed.Actions && len(actionList) > 0 {
 		for _, action := range actionList {
-			line := ansi.Truncate("  ↗ "+action.Name, width, "…")
-			b.WriteString(styles.item.Render(line))
-			b.WriteString("\n")
+			style := styles.item
+			if runningActionIDs[action.ID] {
+				style = styles.running
+			}
+			for _, line := range actionLines(width, action, runningActionIDs[action.ID]) {
+				b.WriteString(style.Render(line))
+				b.WriteString("\n")
+			}
 		}
 	} else if !collapsed.Actions {
 		b.WriteString(styles.empty.Render("  (no actions)"))
@@ -162,8 +169,10 @@ func ContentWithActions(width int, ctx *context.Data, js []jobs.Job, currentTask
 		sort.Strings(names)
 		for _, name := range names {
 			steps := ctx.Plans[name]
-			b.WriteString(styles.title.Render("  " + name))
-			b.WriteString("\n")
+			for _, line := range wrapPrefixed("  ", name, width) {
+				b.WriteString(styles.title.Render(line))
+				b.WriteString("\n")
+			}
 			for _, s := range steps {
 				mark := "[ ]"
 				text := s.Text
@@ -203,6 +212,28 @@ func ContentWithActions(width int, ctx *context.Data, js []jobs.Job, currentTask
 	}
 
 	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// actionLines wraps one folder action button to the panel width. Continuation
+// lines are indented under the action name.
+func actionLines(width int, action actions.Action, running bool) []string {
+	if width <= 0 {
+		width = 80
+	}
+	if running {
+		return wrapPrefixed("  ● ", action.Name+" · running", width)
+	}
+	return wrapPrefixed("  ↗ ", action.Name, width)
+}
+
+// ActionRowHeights reports how many panel rows each action button occupies, in
+// the same order as actionList. The panel maps mouse rows with these heights.
+func ActionRowHeights(width int, actionList []actions.Action, runningActionIDs map[string]bool) []int {
+	heights := make([]int, len(actionList))
+	for index, action := range actionList {
+		heights[index] = len(actionLines(width, action, runningActionIDs[action.ID]))
+	}
+	return heights
 }
 
 func fitHeight(content string, height int) string {

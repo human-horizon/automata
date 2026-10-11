@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,11 +74,10 @@ type actionsWatcherErrorMsg struct {
 }
 
 type actionRunCompletedMsg struct {
-	generation uint64
-	profile    string
-	domain     string
-	name       string
-	err        error
+	token uint64
+	key   actionRunKey
+	name  string
+	err   error
 }
 
 // sessionDataPath returns the per-session directory that owns status.json,
@@ -119,6 +119,7 @@ type KnowledgePanel struct {
 	actions             []akactions.Action
 	actionStatus        string
 	actionStatusIsError bool
+	actionRuns          map[actionRunKey]*actionRun
 
 	// Cached readers prevent re-reading unchanged files across watcher events.
 	contextReader *akcontext.CachedReader
@@ -129,7 +130,7 @@ type KnowledgePanel struct {
 	dual           bool
 	settingsError  string
 	settingsWriter func(path string, data []byte) error
-	actionRunner   func(akactions.Action) error
+	actionRunner   func(context.Context, akactions.Action) error
 
 	pendingAction         *akactions.Action
 	actionConfirmScroll   int
@@ -169,7 +170,7 @@ type KnowledgePanel struct {
 	jobsGeneration      uint64
 	kanbanGeneration    uint64
 	actionsGeneration   uint64
-	actionRunGeneration uint64
+	actionRunToken      uint64
 
 	// Pending flags guarantee at most one blocking reader per watcher.
 	knowledgeWatchPending bool
@@ -211,7 +212,6 @@ func (k *KnowledgePanel) SetProfile(profile string) {
 	k.actionStatus = ""
 	k.actionStatusIsError = false
 	k.pendingAction = nil
-	k.actionRunGeneration++
 	k.readSettings()
 	if k.active {
 		k.setupWatchers()
@@ -240,7 +240,6 @@ func (k *KnowledgePanel) SetDomain(domain string) {
 	k.actionStatus = ""
 	k.actionStatusIsError = false
 	k.pendingAction = nil
-	k.actionRunGeneration++
 	k.refreshCurrentTask()
 	if k.active {
 		k.attachKanbanWatcherIfMissing()
@@ -327,6 +326,7 @@ func (k *KnowledgePanel) Deactivate() {
 
 // Close releases all filesystem watchers owned by the panel.
 func (k *KnowledgePanel) Close() {
+	k.cancelActionRuns()
 	k.Deactivate()
 }
 
@@ -630,15 +630,7 @@ func (k *KnowledgePanel) Update(msg tea.Msg) tea.Cmd {
 			k.refreshActionsData()
 		}
 	case actionRunCompletedMsg:
-		if msg.generation == k.actionRunGeneration && msg.profile == k.profile && msg.domain == k.domain {
-			k.actionStatusIsError = msg.err != nil
-			if msg.err != nil {
-				k.actionStatus = fmt.Sprintf("Failed: %s: %v", msg.name, msg.err)
-				log.Printf("automata: folder action %q failed: %v", msg.name, msg.err)
-			} else {
-				k.actionStatus = fmt.Sprintf("Completed: %s", msg.name)
-			}
-		}
+		k.handleActionRunCompleted(msg)
 	}
 
 	return tea.Batch(baseCmd, k.armWatchers())
@@ -1187,7 +1179,11 @@ func (k *KnowledgePanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil
 		}
 		if action, ok := k.actionRows[msg.Y]; ok {
-			k.openActionConfirmation(action)
+			if k.isActionRunning(action) {
+				k.stopAction(action)
+			} else {
+				k.openActionConfirmation(action)
+			}
 			return nil
 		}
 		if msg.Y == k.plansHeaderY {
@@ -1373,7 +1369,7 @@ func (k *KnowledgePanel) View(width, height int) string {
 	sectionBody := ""
 	sectionLines := [3]int{-1, -1, -1}
 	if bodyHeight > 0 {
-		sectionBody = akui.ContentWithActions(k.width, k.data, k.jobs, k.currentTask, k.actions, k.palette, akui.CollapseState{
+		sectionBody = akui.ContentWithActions(k.width, k.data, k.jobs, k.currentTask, k.actions, k.runningActionIDs(), k.palette, akui.CollapseState{
 			Actions: k.actionsCollapsed,
 			Plans:   k.plansCollapsed,
 			Jobs:    k.jobsCollapsed,
@@ -1424,11 +1420,16 @@ func (k *KnowledgePanel) View(width, height int) string {
 		}
 	}
 	if sectionLines[0] >= 0 && !k.actionsCollapsed {
+		heights := akui.ActionRowHeights(k.width, k.actions, k.runningActionIDs())
+		line := sectionLines[0] + 1
 		for index, action := range k.actions {
-			visibleLine := sectionLines[0] + index + 1 - k.scrollOffset
-			if visibleLine >= 0 && visibleLine < bodyHeight {
-				k.actionRows[sectionBaseY+visibleLine] = action
+			for offset := 0; offset < heights[index]; offset++ {
+				visibleLine := line + offset - k.scrollOffset
+				if visibleLine >= 0 && visibleLine < bodyHeight {
+					k.actionRows[sectionBaseY+visibleLine] = action
+				}
 			}
+			line += heights[index]
 		}
 	}
 	for len(lines) < bodyHeight {

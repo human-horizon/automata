@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -661,7 +662,7 @@ func TestKnowledgePanelActionButtonsRequireConfirmationAndCanBeCancelled(t *test
 	k.actions = []akactions.Action{action}
 	var ran int
 	var received akactions.Action
-	k.actionRunner = func(got akactions.Action) error {
+	k.actionRunner = func(_ context.Context, got akactions.Action) error {
 		ran++
 		received = got
 		return nil
@@ -744,7 +745,7 @@ func TestKnowledgePanelRunsConfirmedActionInTeaCommandAndShowsFailure(t *testing
 	k.actions = []akactions.Action{action}
 	started := make(chan akactions.Action, 1)
 	release := make(chan struct{})
-	k.actionRunner = func(got akactions.Action) error {
+	k.actionRunner = func(_ context.Context, got akactions.Action) error {
 		started <- got
 		<-release
 		return errors.New("synthetic runner failure")
@@ -790,6 +791,179 @@ func TestKnowledgePanelRunsConfirmedActionInTeaCommandAndShowsFailure(t *testing
 	k.Update(completion)
 	if !strings.Contains(strip(k.View(60, 24)), "Failed: Build: synthetic runner failure") {
 		t.Fatal("runner failure was not shown in the Actions panel")
+	}
+}
+
+func TestKnowledgePanelWrappedActionRowsAllOpenTheirAction(t *testing.T) {
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile("wrapped-actions")
+	k.SetDomain("wrapped-actions__project")
+	long := akactions.Action{ID: strings.Repeat("f", 64), Name: "Open the very long local application preview", Command: "open", CWD: t.TempDir()}
+	short := akactions.Action{ID: strings.Repeat("g", 64), Name: "Short", Command: "true", CWD: t.TempDir()}
+	k.actions = []akactions.Action{long, short}
+	k.View(30, 40)
+
+	var longRows []int
+	shortRow := -1
+	for y, action := range k.actionRows {
+		switch action.ID {
+		case long.ID:
+			longRows = append(longRows, y)
+		case short.ID:
+			shortRow = y
+		}
+	}
+	if len(longRows) < 2 || shortRow < 0 {
+		t.Fatalf("wrapped action rows = %v, short row = %d; want several rows for the long action", longRows, shortRow)
+	}
+
+	for _, y := range longRows {
+		k.pendingAction = nil
+		k.Update(tea.MouseMsg{Y: y, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+		if k.pendingAction == nil || k.pendingAction.ID != long.ID {
+			t.Fatalf("click on wrapped row %d did not confirm the long action: %#v", y, k.pendingAction)
+		}
+		k.cancelPendingAction()
+		k.View(30, 40)
+	}
+
+	k.Update(tea.MouseMsg{Y: shortRow, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if k.pendingAction == nil || k.pendingAction.ID != short.ID {
+		t.Fatalf("click after the wrapped action did not hit the short action: %#v", k.pendingAction)
+	}
+}
+
+func TestKnowledgePanelHighlightsRunningActionAndStopsOnSecondClick(t *testing.T) {
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile("stop-actions")
+	k.SetDomain("stop-actions__project")
+	action := akactions.Action{ID: strings.Repeat("d", 64), Name: "Serve", Command: "serve", CWD: t.TempDir()}
+	k.actions = []akactions.Action{action}
+	started := make(chan struct{}, 1)
+	k.actionRunner = func(ctx context.Context, _ akactions.Action) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	clickRow := func() {
+		k.View(60, 24)
+		var actionY int
+		for y := range k.actionRows {
+			actionY = y
+		}
+		k.Update(tea.MouseMsg{Y: actionY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	}
+
+	clickRow()
+	if k.pendingAction == nil {
+		t.Fatal("first click did not request confirmation")
+	}
+	cmd := k.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("confirmation returned no command")
+	}
+	result := make(chan tea.Msg, 1)
+	go func() { result <- cmd() }()
+	<-started
+
+	if !k.isActionRunning(action) {
+		t.Fatal("running action is not tracked")
+	}
+	if plain := strip(k.View(60, 24)); !strings.Contains(plain, "Serve \u00b7 running") {
+		t.Fatalf("running action is not highlighted: %q", plain)
+	}
+
+	clickRow()
+	if k.pendingAction != nil {
+		t.Fatal("clicking a running action requested confirmation again")
+	}
+	if !k.actionRuns[actionRunKey{profile: "stop-actions", domain: "stop-actions__project", actionID: action.ID}].stopping {
+		t.Fatal("second click did not request the stop")
+	}
+	if k.actionStatus != "Stopping: Serve" {
+		t.Fatalf("stop status = %q", k.actionStatus)
+	}
+
+	var completion tea.Msg
+	select {
+	case completion = <-result:
+	case <-time.After(actionStopGracePeriod + 3*time.Second):
+		t.Fatal("stopped action did not return a completion")
+	}
+	k.Update(completion)
+	if k.isActionRunning(action) {
+		t.Fatal("stopped action remained tracked as running")
+	}
+	if k.actionStatus != "Stopped: Serve" || k.actionStatusIsError {
+		t.Fatalf("stopped status = %q error=%v", k.actionStatus, k.actionStatusIsError)
+	}
+	if plain := strip(k.View(60, 24)); strings.Contains(plain, "Serve \u00b7 running") {
+		t.Fatalf("stopped action is still highlighted: %q", plain)
+	}
+}
+
+func TestKnowledgePanelCloseCancelsRunningActions(t *testing.T) {
+	k := NewKnowledgePanel()
+	k.SetProfile("close-actions")
+	k.SetDomain("close-actions__project")
+	action := akactions.Action{ID: strings.Repeat("e", 64), Name: "Watch", Command: "watch", CWD: t.TempDir()}
+	k.actions = []akactions.Action{action}
+	canceled := make(chan struct{})
+	started := make(chan struct{}, 1)
+	k.actionRunner = func(ctx context.Context, _ akactions.Action) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		close(canceled)
+		return ctx.Err()
+	}
+	k.View(60, 24)
+	k.openActionConfirmation(action)
+	cmd := k.confirmPendingAction()
+	go cmd()
+	<-started
+
+	k.Close()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel the running action")
+	}
+	if len(k.actionRuns) != 0 {
+		t.Fatalf("Close left running actions tracked: %d", len(k.actionRuns))
+	}
+}
+
+// TestKnowledgePanelWatchersStayQuietWithoutExternalChanges guards against the
+// watcher feedback loop: attaching a watcher must not touch the directory it
+// observes, otherwise every event schedules another one and burns a CPU core.
+func TestKnowledgePanelWatchersStayQuietWithoutExternalChanges(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile("quiet-watchers")
+	k.SetSession("quiet-watchers__chat")
+	k.SetDomain("quiet-watchers__project")
+	k.Activate()
+
+	watchers := map[string]func() tea.Cmd{
+		"kanban":    k.watchKanbanCmd,
+		"knowledge": k.watchKnowledgeCmd,
+	}
+	for name, next := range watchers {
+		cmd := next()
+		if cmd == nil {
+			t.Fatalf("%s watcher was not attached", name)
+		}
+		messages := make(chan tea.Msg, 1)
+		go func() { messages <- cmd() }()
+		select {
+		case msg := <-messages:
+			t.Errorf("%s watcher produced %T without any external change", name, msg)
+		case <-time.After(300 * time.Millisecond):
+		}
 	}
 }
 
