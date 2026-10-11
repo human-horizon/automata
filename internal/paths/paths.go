@@ -67,6 +67,23 @@ const (
 	PrivateFileMode os.FileMode = 0o600
 )
 
+// privateDirModeMask selects every permission-related bit that os.Chmod sets.
+const privateDirModeMask = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+
+// ensureDirMode applies PrivateDirMode only when the directory differs from it.
+// A redundant chmod still raises a filesystem event on the directory, which
+// makes watchers observing it re-trigger themselves in an endless loop.
+func ensureDirMode(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&privateDirModeMask == PrivateDirMode {
+		return nil
+	}
+	return os.Chmod(path, PrivateDirMode)
+}
+
 // EnsurePrivateDir creates an Automata-owned directory and tightens the
 // complete path below BaseDir so legacy 0755 directories are hardened too.
 func EnsurePrivateDir(path string) error {
@@ -78,13 +95,13 @@ func EnsurePrivateDir(path string) error {
 	rel, err := filepath.Rel(base, target)
 	insideBase := err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 	if !insideBase {
-		if err := os.Chmod(target, PrivateDirMode); err != nil {
+		if err := ensureDirMode(target); err != nil {
 			return fmt.Errorf("harden private directory %q: %w", target, err)
 		}
 		return nil
 	}
 	current := base
-	if err := os.Chmod(current, PrivateDirMode); err != nil {
+	if err := ensureDirMode(current); err != nil {
 		return fmt.Errorf("harden private directory %q: %w", current, err)
 	}
 	if rel == "." {
@@ -95,7 +112,7 @@ func EnsurePrivateDir(path string) error {
 			continue
 		}
 		current = filepath.Join(current, part)
-		if err := os.Chmod(current, PrivateDirMode); err != nil {
+		if err := ensureDirMode(current); err != nil {
 			return fmt.Errorf("harden private directory %q: %w", current, err)
 		}
 	}
