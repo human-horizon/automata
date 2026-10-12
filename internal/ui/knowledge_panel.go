@@ -74,10 +74,11 @@ type actionsWatcherErrorMsg struct {
 }
 
 type actionRunCompletedMsg struct {
-	token uint64
-	key   actionRunKey
-	name  string
-	err   error
+	token  uint64
+	key    actionRunKey
+	name   string
+	err    error
+	logErr error
 }
 
 // sessionDataPath returns the per-session directory that owns status.json,

@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,14 +21,14 @@ func TestExecuteSystemActionRequiresValidCommandAndAbsoluteDirectory(t *testing.
 	const command = "printf '%s\\n' 'must not be executed by this test'"
 	action := akactions.Action{Name: "Test", Command: command, CWD: cwd}
 	called := false
-	runner := func(_ context.Context, gotCommand, gotCWD string, args []string) error {
+	runner := func(_ context.Context, gotCommand, gotCWD string, args []string, _ io.Writer) error {
 		called = true
 		if gotCommand != "/bin/sh" || gotCWD != cwd || !reflect.DeepEqual(args, []string{"-c", command}) {
 			t.Fatalf("runner received command=%q cwd=%q args=%#v", gotCommand, gotCWD, args)
 		}
 		return nil
 	}
-	if err := executeSystemAction(context.Background(), action, runner); err != nil {
+	if _, err := executeSystemAction(context.Background(), action, "", runner); err != nil {
 		t.Fatal(err)
 	}
 	if !called {
@@ -41,7 +42,7 @@ func TestExecuteSystemActionRequiresValidCommandAndAbsoluteDirectory(t *testing.
 		{Name: "missing cwd", Command: "true", CWD: filepath.Join(cwd, "missing")},
 	} {
 		runnerCalled := false
-		err := executeSystemAction(context.Background(), invalid, func(context.Context, string, string, []string) error {
+		_, err := executeSystemAction(context.Background(), invalid, "", func(context.Context, string, string, []string, io.Writer) error {
 			runnerCalled = true
 			return nil
 		})
@@ -54,18 +55,90 @@ func TestExecuteSystemActionRequiresValidCommandAndAbsoluteDirectory(t *testing.
 	if err := os.WriteFile(filePath, []byte("file"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := executeSystemAction(context.Background(), akactions.Action{Command: "true", CWD: filePath}, runner); err == nil {
+	if _, err := executeSystemAction(context.Background(), akactions.Action{Command: "true", CWD: filePath}, "", runner); err == nil {
 		t.Fatal("file working directory was accepted")
 	}
 }
 
 func TestExecuteSystemActionReturnsRunnerFailure(t *testing.T) {
 	failure := errors.New("synthetic process error")
-	err := executeSystemAction(context.Background(), akactions.Action{Command: "false", CWD: t.TempDir()}, func(context.Context, string, string, []string) error {
+	_, err := executeSystemAction(context.Background(), akactions.Action{Command: "false", CWD: t.TempDir()}, "", func(context.Context, string, string, []string, io.Writer) error {
 		return failure
 	})
 	if !errors.Is(err, failure) {
 		t.Fatalf("runner failure = %v, want %v", err, failure)
+	}
+}
+
+func TestExecuteSystemActionOverwritesFixedLogWithHeaderAndOutput(t *testing.T) {
+	cwd := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "logs", "id.log")
+	action := akactions.Action{Name: "Build", Command: "make test", CWD: cwd}
+	write := func(text string) func(context.Context, string, string, []string, io.Writer) error {
+		return func(_ context.Context, _, _ string, _ []string, output io.Writer) error {
+			_, err := io.WriteString(output, text)
+			return err
+		}
+	}
+
+	if logErr, err := executeSystemAction(context.Background(), action, logPath, write("first run\n")); logErr != nil || err != nil {
+		t.Fatalf("first run logErr=%v err=%v", logErr, err)
+	}
+	if logErr, err := executeSystemAction(context.Background(), action, logPath, write("second run\n")); logErr != nil || err != nil {
+		t.Fatalf("second run logErr=%v err=%v", logErr, err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "first run") || !strings.Contains(text, "second run") {
+		t.Fatalf("log was not overwritten by the second run: %q", text)
+	}
+	for _, want := range []string{"action: Build", "command: make test", "cwd: " + cwd, "---\n"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("log header misses %q: %q", want, text)
+		}
+	}
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("log mode = %o, want 600", got)
+	}
+}
+
+func TestExecuteSystemActionRunsWhenLogCannotBeWritten(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.log")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlinkLog := filepath.Join(root, "link.log")
+	if err := os.Symlink(target, symlinkLog); err != nil {
+		t.Fatal(err)
+	}
+	action := akactions.Action{Name: "Build", Command: "true", CWD: root}
+	for _, logPath := range []string{"", symlinkLog} {
+		ran := false
+		logErr, err := executeSystemAction(context.Background(), action, logPath, func(_ context.Context, _, _ string, _ []string, output io.Writer) error {
+			ran = true
+			if output == nil {
+				t.Fatal("runner received a nil output")
+			}
+			return nil
+		})
+		if logErr == nil {
+			t.Fatalf("log path %q produced no log error", logPath)
+		}
+		if err != nil || !ran {
+			t.Fatalf("log path %q blocked the run: ran=%v err=%v", logPath, ran, err)
+		}
+	}
+	if data, err := os.ReadFile(target); err != nil || len(data) != 0 {
+		t.Fatalf("symlink target was written: data=%q err=%v", data, err)
 	}
 }
 
@@ -80,7 +153,7 @@ func TestRunShellActionCancelStopsProcessGroup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)
-	go func() { result <- runShellAction(ctx, "/bin/sh", cwd, []string{"-c", script}) }()
+	go func() { result <- runShellAction(ctx, "/bin/sh", cwd, []string{"-c", script}, io.Discard) }()
 
 	childPID := waitForPIDFile(t, pidFile)
 	cancel()
@@ -103,7 +176,7 @@ func TestRunShellActionCancelStopsProcessGroup(t *testing.T) {
 }
 
 func TestRunShellActionReturnsCompletionWithoutCancel(t *testing.T) {
-	if err := runShellAction(context.Background(), "/bin/sh", t.TempDir(), []string{"-c", "exit 0"}); err != nil {
+	if err := runShellAction(context.Background(), "/bin/sh", t.TempDir(), []string{"-c", "exit 0"}, io.Discard); err != nil {
 		t.Fatalf("successful command error = %v", err)
 	}
 }

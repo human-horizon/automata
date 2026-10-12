@@ -164,6 +164,43 @@ func TestReadForProfileUsesFolderDomainAndIgnoresNeighborData(t *testing.T) {
 	}
 }
 
+func TestLogPathIsFixedPerActionAndIgnoredByReader(t *testing.T) {
+	profile, domain := "log-profile", "log-profile__project"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	id := repeatedID('c')
+	logPath, err := LogPath(profile, domain, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir, err := Directory(profile, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(wantDir, "logs", id+".log"); logPath != want {
+		t.Fatalf("log path = %q, want %q", logPath, want)
+	}
+	again, err := LogPath(profile, domain, id)
+	if err != nil || again != logPath {
+		t.Fatalf("log path changed between calls: %q %v", again, err)
+	}
+	if _, err := LogPath(profile, domain, "not-an-id"); err == nil {
+		t.Fatal("invalid action ID produced a log path")
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadForProfile(profile, domain)
+	if err != nil {
+		t.Fatalf("logs directory was reported as a malformed action: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("log file was read as an action: %#v", got)
+	}
+}
+
 func TestReadForProfileRejectsSymlinkedActionDirectory(t *testing.T) {
 	dataHome := t.TempDir()
 	t.Setenv("AI_DATA_HOME", dataHome)

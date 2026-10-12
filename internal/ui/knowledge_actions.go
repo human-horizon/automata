@@ -57,12 +57,11 @@ func (k *KnowledgePanel) confirmPendingAction() tea.Cmd {
 		k.cancelPendingAction()
 		return nil
 	}
-	runner := k.actionRunner
-	if runner == nil {
-		runner = func(ctx context.Context, action akactions.Action) error {
-			return executeSystemAction(ctx, action, runShellAction)
-		}
+	logPath, logPathErr := akactions.LogPath(k.profile, k.domain, action.ID)
+	if logPathErr != nil {
+		logPath = ""
 	}
+	injectedRunner := k.actionRunner
 	k.cancelPendingAction()
 	if k.actionRuns == nil {
 		k.actionRuns = make(map[actionRunKey]*actionRun)
@@ -74,11 +73,19 @@ func (k *KnowledgePanel) confirmPendingAction() tea.Cmd {
 	k.actionStatus = "Running: " + action.Name
 	k.actionStatusIsError = false
 	return func() tea.Msg {
+		var err error
+		var logErr error
+		if injectedRunner == nil {
+			logErr, err = executeSystemAction(ctx, action, logPath, runShellAction)
+		} else {
+			err = injectedRunner(ctx, action)
+		}
 		return actionRunCompletedMsg{
-			token: token,
-			key:   key,
-			name:  action.Name,
-			err:   runner(ctx, action),
+			token:  token,
+			key:    key,
+			name:   action.Name,
+			err:    err,
+			logErr: logErr,
 		}
 	}
 }
@@ -136,6 +143,11 @@ func (k *KnowledgePanel) handleActionRunCompleted(msg actionRunCompletedMsg) {
 		log.Printf("automata: folder action %q failed: %v", msg.name, msg.err)
 	default:
 		k.actionStatus = fmt.Sprintf("Completed: %s", msg.name)
+	}
+	if msg.logErr != nil {
+		k.actionStatusIsError = true
+		k.actionStatus += "; log not written: " + msg.logErr.Error()
+		log.Printf("automata: folder action %q log failed: %v", msg.name, msg.logErr)
 	}
 }
 

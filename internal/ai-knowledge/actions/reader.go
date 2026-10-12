@@ -15,7 +15,10 @@ import (
 	"github.com/HumanHorizon/automata/internal/paths"
 )
 
-const directoryName = "actions"
+const (
+	directoryName    = "actions"
+	logDirectoryName = "logs"
+)
 
 // Action is one user-confirmed command button registered by the Pi Automata extension.
 type Action struct {
@@ -31,6 +34,19 @@ func Directory(profile, domain string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(paths.DomainDir(profile, domain), directoryName), nil
+}
+
+// LogPath returns the fixed log file of one action. Every run of the action
+// overwrites this file, so the path never changes between runs.
+func LogPath(profile, domain, actionID string) (string, error) {
+	directory, err := Directory(profile, domain)
+	if err != nil {
+		return "", err
+	}
+	if !validActionID(actionID) {
+		return "", fmt.Errorf("invalid action ID %q", actionID)
+	}
+	return filepath.Join(directory, logDirectoryName, actionID+".log"), nil
 }
 
 // ReadForProfile reads the actions registered in one canonical profile and folder-domain.
