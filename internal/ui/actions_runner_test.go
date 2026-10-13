@@ -14,7 +14,53 @@ import (
 	"time"
 
 	akactions "github.com/HumanHorizon/automata/internal/ai-knowledge/actions"
+	"github.com/HumanHorizon/automata/internal/paths"
 )
+
+func TestExecuteSystemActionCancelsWhenPiPublishesSharedStopRequest(t *testing.T) {
+	profile, domain := "runner-stop", "runner-stop__project"
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	if err := paths.EnsureDomainDir(profile, domain); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(paths.DomainDir(profile, domain), "actions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	action := akactions.Action{ID: strings.Repeat("e", 64), Name: "Server", Command: "server", CWD: t.TempDir()}
+	runID := strings.Repeat("f", 32)
+	if _, err := akactions.ClaimRun(profile, domain, action.ID, runID, "automata-ui"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := akactions.FinishRun(profile, domain, action.ID, runID); err != nil {
+			t.Errorf("finish run: %v", err)
+		}
+	}()
+	ctx := withActionRuntime(context.Background(), profile, domain, action.ID, runID)
+	result := make(chan error, 1)
+	go func() {
+		_, err := executeSystemAction(ctx, action, "", func(ctx context.Context, _, _ string, _ []string, _ io.Writer) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		result <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := akactions.RequestStop(profile, domain, action.ID, runID); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shared Pi stop request did not cancel the UI-owned runner")
+	}
+}
 
 func TestExecuteSystemActionRequiresValidCommandAndAbsoluteDirectory(t *testing.T) {
 	cwd := t.TempDir()

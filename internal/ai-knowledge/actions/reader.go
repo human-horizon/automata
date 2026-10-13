@@ -26,6 +26,7 @@ type Action struct {
 	Name    string `json:"name"`
 	Command string `json:"command"`
 	CWD     string `json:"cwd"`
+	Running bool   `json:"-"`
 }
 
 // Directory returns the folder-domain action directory after validating its path component.
@@ -70,7 +71,18 @@ func ReadForProfile(profile, domain string) ([]Action, error) {
 			return nil, fmt.Errorf("action path %q is not a real directory", candidate)
 		}
 	}
-	return readFS(os.DirFS(directory))
+	actions, readErr := readFS(os.DirFS(directory))
+	for index := range actions {
+		_, _, runErr := ReadRun(profile, domain, actions[index].ID)
+		if runErr == nil {
+			actions[index].Running = true
+			continue
+		}
+		if !errors.Is(runErr, fs.ErrNotExist) {
+			readErr = errors.Join(readErr, fmt.Errorf("read runtime for action %q: %w", actions[index].Name, runErr))
+		}
+	}
+	return actions, readErr
 }
 
 // readFS loads action records from a filesystem rooted at its actions directory.
