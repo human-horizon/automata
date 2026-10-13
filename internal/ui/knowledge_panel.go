@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/HumanHorizon/automata/internal/atomicfile"
@@ -74,11 +73,12 @@ type actionsWatcherErrorMsg struct {
 }
 
 type actionRunCompletedMsg struct {
-	token  uint64
-	key    actionRunKey
-	name   string
-	err    error
-	logErr error
+	token      uint64
+	key        actionRunKey
+	name       string
+	err        error
+	logErr     error
+	cleanupErr error
 }
 
 // sessionDataPath returns the per-session directory that owns status.json,
@@ -947,7 +947,21 @@ func (k *KnowledgePanel) attachActionsWatcherIfMissing() {
 		k.actionsWatchError = "folder actions path is not a real directory"
 		return
 	}
+	runtimeWatchPath := ""
+	if watchPath == actionsDir {
+		runtimeWatchPath, err = akactions.EnsureRuntimeDirectory(k.profile, k.domain)
+		if err != nil {
+			k.actionsWatchError = fmt.Sprintf("prepare folder action runtime watcher: %v", err)
+			return
+		}
+	}
 	if k.actionsWatcher != nil && k.actionsWatcherPath == watchPath {
+		if runtimeWatchPath != "" {
+			if err := k.actionsWatcher.Add(runtimeWatchPath); err != nil {
+				k.actionsWatchError = fmt.Sprintf("watch folder action runtime: %v", err)
+				return
+			}
+		}
 		k.actionsWatchError = ""
 		return
 	}
@@ -961,6 +975,13 @@ func (k *KnowledgePanel) attachActionsWatcherIfMissing() {
 		_ = watcher.Close()
 		k.actionsWatchError = fmt.Sprintf("watch folder actions: %v", err)
 		return
+	}
+	if runtimeWatchPath != "" {
+		if err := watcher.Add(runtimeWatchPath); err != nil {
+			_ = watcher.Close()
+			k.actionsWatchError = fmt.Sprintf("watch folder action runtime: %v", err)
+			return
+		}
 	}
 	k.actionsWatcher = watcher
 	k.actionsWatcherPath = watchPath
@@ -1352,17 +1373,6 @@ func (k *KnowledgePanel) View(width, height int) string {
 		)
 		bodyHeight--
 	}
-	statusLine := ""
-	if k.actionStatus != "" && bodyHeight > 0 {
-		color := k.palette.Success
-		if k.actionStatusIsError {
-			color = k.palette.Error
-		}
-		statusLine = lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(
-			ansi.Truncate("Action: "+strconv.QuoteToGraphic(k.actionStatus), k.width, "…"),
-		)
-		bodyHeight--
-	}
 	if bodyHeight < 0 {
 		bodyHeight = 0
 	}
@@ -1402,9 +1412,6 @@ func (k *KnowledgePanel) View(width, height int) string {
 	if warning != "" {
 		sectionBaseY++
 	}
-	if statusLine != "" {
-		sectionBaseY++
-	}
 	for index, sectionLine := range sectionLines {
 		visibleLine := sectionLine - k.scrollOffset
 		if sectionLine < 0 || visibleLine < 0 || visibleLine >= bodyHeight {
@@ -1440,9 +1447,6 @@ func (k *KnowledgePanel) View(width, height int) string {
 	prefix := []string{header}
 	if warning != "" {
 		prefix = append(prefix, warning)
-	}
-	if statusLine != "" {
-		prefix = append(prefix, statusLine)
 	}
 	if content != "" {
 		prefix = append(prefix, content)

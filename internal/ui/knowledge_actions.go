@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -43,6 +45,7 @@ type actionRunKey struct {
 type actionRun struct {
 	token    uint64
 	name     string
+	runID    string
 	cancel   context.CancelFunc
 	stopping bool
 }
@@ -57,6 +60,20 @@ func (k *KnowledgePanel) confirmPendingAction() tea.Cmd {
 		k.cancelPendingAction()
 		return nil
 	}
+	var runIDBytes [16]byte
+	if _, err := rand.Read(runIDBytes[:]); err != nil {
+		k.actionStatus = "Failed to start action: " + err.Error()
+		k.actionStatusIsError = true
+		k.cancelPendingAction()
+		return nil
+	}
+	runID := hex.EncodeToString(runIDBytes[:])
+	if _, err := akactions.ClaimRun(k.profile, k.domain, action.ID, runID, "automata-ui"); err != nil {
+		k.actionStatus = "Failed to start action: " + err.Error()
+		k.actionStatusIsError = true
+		k.cancelPendingAction()
+		return nil
+	}
 	logPath, logPathErr := akactions.LogPath(k.profile, k.domain, action.ID)
 	if logPathErr != nil {
 		logPath = ""
@@ -68,8 +85,10 @@ func (k *KnowledgePanel) confirmPendingAction() tea.Cmd {
 	}
 	k.actionRunToken++
 	token := k.actionRunToken
+	profile, domain := k.profile, k.domain
 	ctx, cancel := context.WithCancel(context.Background())
-	k.actionRuns[key] = &actionRun{token: token, name: action.Name, cancel: cancel}
+	ctx = withActionRuntime(ctx, profile, domain, action.ID, runID)
+	k.actionRuns[key] = &actionRun{token: token, name: action.Name, runID: runID, cancel: cancel}
 	k.actionStatus = "Running: " + action.Name
 	k.actionStatusIsError = false
 	return func() tea.Msg {
@@ -80,12 +99,14 @@ func (k *KnowledgePanel) confirmPendingAction() tea.Cmd {
 		} else {
 			err = injectedRunner(ctx, action)
 		}
+		cleanupErr := akactions.FinishRun(profile, domain, action.ID, runID)
 		return actionRunCompletedMsg{
-			token:  token,
-			key:    key,
-			name:   action.Name,
-			err:    err,
-			logErr: logErr,
+			token:      token,
+			key:        key,
+			name:       action.Name,
+			err:        err,
+			logErr:     logErr,
+			cleanupErr: cleanupErr,
 		}
 	}
 }
@@ -93,6 +114,9 @@ func (k *KnowledgePanel) confirmPendingAction() tea.Cmd {
 // isActionRunning reports whether the action in the current profile and
 // folder-domain has an in-flight command.
 func (k *KnowledgePanel) isActionRunning(action akactions.Action) bool {
+	if action.Running {
+		return true
+	}
 	_, running := k.actionRuns[actionRunKey{profile: k.profile, domain: k.domain, actionID: action.ID}]
 	return running
 }
@@ -100,6 +124,11 @@ func (k *KnowledgePanel) isActionRunning(action akactions.Action) bool {
 // runningActionIDs returns the IDs of the current folder's running actions.
 func (k *KnowledgePanel) runningActionIDs() map[string]bool {
 	ids := make(map[string]bool)
+	for _, action := range k.actions {
+		if action.Running {
+			ids[action.ID] = true
+		}
+	}
 	for key := range k.actionRuns {
 		if key.profile == k.profile && key.domain == k.domain {
 			ids[key.actionID] = true
@@ -112,11 +141,28 @@ func (k *KnowledgePanel) runningActionIDs() map[string]bool {
 // until the runner returns, so the status reflects the real process state.
 func (k *KnowledgePanel) stopAction(action akactions.Action) {
 	run := k.actionRuns[actionRunKey{profile: k.profile, domain: k.domain, actionID: action.ID}]
-	if run == nil || run.stopping {
+	if run != nil {
+		if run.stopping {
+			return
+		}
+		run.stopping = true
+		run.cancel()
+		k.actionStatus = "Stopping: " + action.Name
+		k.actionStatusIsError = false
 		return
 	}
-	run.stopping = true
-	run.cancel()
+	if !action.Running {
+		return
+	}
+	runtime, _, err := akactions.ReadRun(k.profile, k.domain, action.ID)
+	if err == nil {
+		err = akactions.RequestStop(k.profile, k.domain, action.ID, runtime.RunID)
+	}
+	if err != nil {
+		k.actionStatus = fmt.Sprintf("Failed to stop action %s: %v", action.Name, err)
+		k.actionStatusIsError = true
+		return
+	}
 	k.actionStatus = "Stopping: " + action.Name
 	k.actionStatusIsError = false
 }
@@ -130,6 +176,13 @@ func (k *KnowledgePanel) handleActionRunCompleted(msg actionRunCompletedMsg) {
 	}
 	delete(k.actionRuns, msg.key)
 	run.cancel()
+	if msg.cleanupErr != nil {
+		log.Printf("automata: finish folder action %q runtime: %v", run.name, msg.cleanupErr)
+		if msg.key.profile == k.profile && msg.key.domain == k.domain {
+			k.actionStatus = fmt.Sprintf("Failed to clean up action %s: %v", run.name, msg.cleanupErr)
+			k.actionStatusIsError = true
+		}
+	}
 	if msg.key.profile != k.profile || msg.key.domain != k.domain {
 		return
 	}

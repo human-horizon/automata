@@ -648,7 +648,19 @@ func TestKnowledgePanelUpdateWindowSize(t *testing.T) {
 	}
 }
 
+func prepareActionRuntimeFixture(t *testing.T, profile, domain string) {
+	t.Helper()
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	if err := paths.EnsureDomainDir(profile, domain); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(paths.DomainDir(profile, domain), "actions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestKnowledgePanelActionButtonsRequireConfirmationAndCanBeCancelled(t *testing.T) {
+	prepareActionRuntimeFixture(t, "folder-actions", "folder-actions__project")
 	k := NewKnowledgePanel()
 	defer k.Close()
 	k.SetProfile("folder-actions")
@@ -731,12 +743,13 @@ func TestKnowledgePanelActionButtonsRequireConfirmationAndCanBeCancelled(t *test
 		t.Fatalf("confirmed runner received %#v, want %#v; calls=%d", received, action, ran)
 	}
 	k.Update(completion)
-	if !strings.Contains(strip(k.View(60, 24)), "Completed: Open preview") {
-		t.Fatal("successful action completion was not shown")
+	if plain := strip(k.View(60, 24)); strings.Contains(plain, "Action:") {
+		t.Fatalf("completed Action status should not be shown in the panel: %q", plain)
 	}
 }
 
-func TestKnowledgePanelRunsConfirmedActionInTeaCommandAndShowsFailure(t *testing.T) {
+func TestKnowledgePanelRunsConfirmedActionInTeaCommandWithoutPersistentStatus(t *testing.T) {
+	prepareActionRuntimeFixture(t, "async-folder-actions", "async-folder-actions__project")
 	k := NewKnowledgePanel()
 	defer k.Close()
 	k.SetProfile("async-folder-actions")
@@ -789,8 +802,8 @@ func TestKnowledgePanelRunsConfirmedActionInTeaCommandAndShowsFailure(t *testing
 		t.Fatal("confirmed action did not return its completion")
 	}
 	k.Update(completion)
-	if !strings.Contains(strip(k.View(60, 24)), "Failed: Build: synthetic runner failure") {
-		t.Fatal("runner failure was not shown in the Actions panel")
+	if plain := strip(k.View(60, 24)); strings.Contains(plain, "Action:") {
+		t.Fatalf("runner status should not persist in the right panel: %q", plain)
 	}
 }
 
@@ -835,6 +848,7 @@ func TestKnowledgePanelWrappedActionRowsAllOpenTheirAction(t *testing.T) {
 }
 
 func TestKnowledgePanelHighlightsRunningActionAndStopsOnSecondClick(t *testing.T) {
+	prepareActionRuntimeFixture(t, "stop-actions", "stop-actions__project")
 	k := NewKnowledgePanel()
 	defer k.Close()
 	k.SetProfile("stop-actions")
@@ -883,8 +897,8 @@ func TestKnowledgePanelHighlightsRunningActionAndStopsOnSecondClick(t *testing.T
 	if !k.actionRuns[actionRunKey{profile: "stop-actions", domain: "stop-actions__project", actionID: action.ID}].stopping {
 		t.Fatal("second click did not request the stop")
 	}
-	if k.actionStatus != "Stopping: Serve" {
-		t.Fatalf("stop status = %q", k.actionStatus)
+	if plain := strip(k.View(60, 24)); strings.Contains(plain, "Action:") {
+		t.Fatalf("Action status message should not occupy the right panel: %q", plain)
 	}
 
 	var completion tea.Msg
@@ -897,15 +911,48 @@ func TestKnowledgePanelHighlightsRunningActionAndStopsOnSecondClick(t *testing.T
 	if k.isActionRunning(action) {
 		t.Fatal("stopped action remained tracked as running")
 	}
-	if k.actionStatus != "Stopped: Serve" || k.actionStatusIsError {
-		t.Fatalf("stopped status = %q error=%v", k.actionStatus, k.actionStatusIsError)
+	if plain := strip(k.View(60, 24)); strings.Contains(plain, "Action:") {
+		t.Fatalf("completed Action status message should not be rendered: %q", plain)
 	}
 	if plain := strip(k.View(60, 24)); strings.Contains(plain, "Serve \u00b7 running") {
 		t.Fatalf("stopped action is still highlighted: %q", plain)
 	}
 }
 
+func TestKnowledgePanelCanStopPiOwnedActionFromThePanel(t *testing.T) {
+	profile, domain := "pi-stop-actions", "pi-stop-actions__project"
+	prepareActionRuntimeFixture(t, profile, domain)
+	action := akactions.Action{ID: strings.Repeat("c", 64), Name: "Dev server", Command: "server", CWD: t.TempDir(), Running: true}
+	runID := strings.Repeat("d", 32)
+	if _, err := akactions.ClaimRun(profile, domain, action.ID, runID, "pi"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := akactions.FinishRun(profile, domain, action.ID, runID); err != nil {
+			t.Errorf("finish fixture run: %v", err)
+		}
+	}()
+
+	k := NewKnowledgePanel()
+	defer k.Close()
+	k.SetProfile(profile)
+	k.SetDomain(domain)
+	k.actions = []akactions.Action{action}
+	if !k.isActionRunning(action) {
+		t.Fatal("panel did not recognize Pi-owned action as running")
+	}
+	k.stopAction(action)
+	requested, err := akactions.StopRequested(profile, domain, action.ID, runID)
+	if err != nil || !requested {
+		t.Fatalf("UI did not publish stop request: requested=%v err=%v", requested, err)
+	}
+	if k.pendingAction != nil {
+		t.Fatal("stopping another process opened a confirmation dialog")
+	}
+}
+
 func TestKnowledgePanelCloseCancelsRunningActions(t *testing.T) {
+	prepareActionRuntimeFixture(t, "close-actions", "close-actions__project")
 	k := NewKnowledgePanel()
 	k.SetProfile("close-actions")
 	k.SetDomain("close-actions__project")

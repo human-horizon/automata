@@ -25,6 +25,21 @@ type actionCommandRunner func(ctx context.Context, command, cwd string, args []s
 
 // executeSystemAction runs a confirmed action. Log problems are returned
 // separately and never prevent the command from starting.
+type actionRuntimeContextKey struct{}
+
+type actionRuntimeContext struct {
+	profile  string
+	domain   string
+	actionID string
+	runID    string
+}
+
+func withActionRuntime(ctx context.Context, profile, domain, actionID, runID string) context.Context {
+	return context.WithValue(ctx, actionRuntimeContextKey{}, actionRuntimeContext{
+		profile: profile, domain: domain, actionID: actionID, runID: runID,
+	})
+}
+
 func executeSystemAction(ctx context.Context, action akactions.Action, logPath string, runner actionCommandRunner) (logErr error, runErr error) {
 	if strings.TrimSpace(action.Command) == "" || strings.ContainsRune(action.Command, '\x00') {
 		return nil, errors.New("action command is empty or contains NUL")
@@ -50,7 +65,34 @@ func executeSystemAction(ctx context.Context, action akactions.Action, logPath s
 	if output != nil {
 		writer = output
 	}
-	return logErr, runner(ctx, "/bin/sh", action.CWD, []string{"-c", action.Command}, writer)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	monitorDone := make(chan struct{})
+	if control, ok := runCtx.Value(actionRuntimeContextKey{}).(actionRuntimeContext); ok {
+		go func() {
+			defer close(monitorDone)
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-ticker.C:
+					requested, err := akactions.StopRequested(control.profile, control.domain, control.actionID, control.runID)
+					if err != nil || requested {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	} else {
+		close(monitorDone)
+	}
+	runErr = runner(runCtx, "/bin/sh", action.CWD, []string{"-c", action.Command}, writer)
+	cancel()
+	<-monitorDone
+	return logErr, runErr
 }
 
 // openActionLog creates or overwrites the fixed log file of an action and
@@ -99,6 +141,13 @@ func runShellAction(ctx context.Context, command, cwd string, args []string, out
 		return err
 	}
 	groupID := process.Process.Pid
+	if control, ok := ctx.Value(actionRuntimeContextKey{}).(actionRuntimeContext); ok {
+		if err := akactions.PublishRunPID(control.profile, control.domain, control.actionID, control.runID, groupID); err != nil {
+			_ = syscall.Kill(-groupID, syscall.SIGTERM)
+			_ = process.Wait()
+			return fmt.Errorf("publish action process identity: %w", err)
+		}
+	}
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- process.Wait() }()
 
