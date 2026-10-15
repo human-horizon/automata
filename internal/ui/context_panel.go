@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -52,17 +53,27 @@ type ContextPanel struct {
 	notesWatchPending bool
 	notesGeneration   uint64
 	active            bool
+
+	notesActualizer          NotesActualizer
+	notesActualizeConfig     *notesActualizeConfig
+	notesActualizeRunning    map[string]bool
+	notesActualizeCancel     map[string]context.CancelFunc
+	notesUndoIDs             map[string]string
+	notesActualizeGeneration uint64
 }
 
 // NewContextPanel creates an empty context panel for the given profile.
 func NewContextPanel(profile string) *ContextPanel {
 	return &ContextPanel{
-		profile:        profile,
-		palette:        apptheme.Default(),
-		notesReader:    memory.NewCachedReader(),
-		kanbanPanel:    NewKanbanPanel(profile),
-		expandedNotes:  make(map[string]bool),
-		notesClipboard: newSystemClipboard(),
+		profile:               profile,
+		palette:               apptheme.Default(),
+		notesReader:           memory.NewCachedReader(),
+		kanbanPanel:           NewKanbanPanel(profile),
+		expandedNotes:         make(map[string]bool),
+		notesClipboard:        newSystemClipboard(),
+		notesActualizeRunning: make(map[string]bool),
+		notesActualizeCancel:  make(map[string]context.CancelFunc),
+		notesUndoIDs:          make(map[string]string),
 	}
 }
 
@@ -78,6 +89,9 @@ func (c *ContextPanel) SetProfile(profile string) {
 		return
 	}
 	oldProfile := c.profile
+	c.notesActualizeGeneration++
+	c.notesActualizeConfig = nil
+	c.notesStatus = ""
 	c.closeNotesWatcher()
 	c.notesReader.Invalidate(oldProfile, c.domain)
 	c.profile = profile
@@ -107,6 +121,8 @@ func (c *ContextPanel) SetDomain(domain string) {
 	// leak an fsnotify descriptor when the user jumps between folders.
 	c.closeNotesWatcher()
 	c.closeNotesPasteConfirmation()
+	c.notesActualizeConfig = nil
+	c.notesActualizeGeneration++
 	c.domain = domain
 	c.scrollOffset = 0
 	c.expandedNotes = make(map[string]bool)
@@ -203,6 +219,7 @@ func (c *ContextPanel) Deactivate() {
 // Close releases all resources owned by the panel.
 func (c *ContextPanel) Close() {
 	c.Deactivate()
+	c.cancelNotesActualizations()
 	c.closeNotesPasteConfirmation()
 	if c.kanbanPanel != nil {
 		c.kanbanPanel.Close()
@@ -257,9 +274,11 @@ type notesWatcherErrorMsg struct {
 type notesClipboardAction string
 
 const (
-	notesClipboardCopy    notesClipboardAction = "copy"
-	notesClipboardAdd     notesClipboardAction = "add"
-	notesClipboardReplace notesClipboardAction = "replace"
+	notesClipboardCopy      notesClipboardAction = "copy"
+	notesClipboardAdd       notesClipboardAction = "add"
+	notesClipboardReplace   notesClipboardAction = "replace"
+	notesClipboardActualize notesClipboardAction = "actualize"
+	notesClipboardUndo      notesClipboardAction = "undo"
 )
 
 type notesClipboardMsg struct {
@@ -280,26 +299,49 @@ const (
 	notesContentStartRow = 4
 )
 
-func notesToolbarButtons(width int) []notesToolbarButton {
-	if width < 23 {
-		return []notesToolbarButton{
+func notesToolbarButtons(width int, canUndo, running bool) []notesToolbarButton {
+	actualizeLabel := " Actualize "
+	if running {
+		actualizeLabel = " Working "
+	}
+	if width < 32 {
+		buttons := []notesToolbarButton{
 			{action: notesClipboardCopy, label: "C"},
 			{action: notesClipboardAdd, label: "+"},
 			{action: notesClipboardReplace, label: "↺"},
+			{action: notesClipboardActualize, label: "A"},
 		}
+		if canUndo {
+			buttons = append(buttons, notesToolbarButton{action: notesClipboardUndo, label: "U"})
+		}
+		return buttons
 	}
-	if width < 32 {
-		return []notesToolbarButton{
+	if width < 44 || canUndo && width < 51 {
+		buttons := []notesToolbarButton{
 			{action: notesClipboardCopy, label: " Copy "},
 			{action: notesClipboardAdd, label: " Add "},
 			{action: notesClipboardReplace, label: " Replace "},
+			{action: notesClipboardActualize, label: " Act "},
 		}
+		if canUndo {
+			undoLabel := " Undo "
+			if width < 35 {
+				undoLabel = " U "
+			}
+			buttons = append(buttons, notesToolbarButton{action: notesClipboardUndo, label: undoLabel})
+		}
+		return buttons
 	}
-	return []notesToolbarButton{
+	buttons := []notesToolbarButton{
 		{action: notesClipboardCopy, label: " Copy "},
 		{action: notesClipboardAdd, label: " Paste + "},
 		{action: notesClipboardReplace, label: " Paste replace "},
+		{action: notesClipboardActualize, label: actualizeLabel},
 	}
+	if canUndo {
+		buttons = append(buttons, notesToolbarButton{action: notesClipboardUndo, label: " Undo "})
+	}
+	return buttons
 }
 
 // Update handles resize, tab switching, scrolling, clipboard actions, and
@@ -307,7 +349,16 @@ func notesToolbarButtons(width int) []notesToolbarButton {
 func (c *ContextPanel) Update(msg tea.Msg) tea.Cmd {
 	var baseCmd tea.Cmd
 	modalHandled := false
-	if c.pendingNotesPasteAction != "" {
+	if c.notesActualizeConfig != nil {
+		if key, ok := msg.(tea.KeyMsg); ok {
+			baseCmd = c.handleNotesActualizeConfigKey(key)
+			modalHandled = true
+		} else if mouse, ok := msg.(tea.MouseMsg); ok {
+			baseCmd = c.handleNotesActualizeConfigMouse(mouse)
+			modalHandled = true
+		}
+	}
+	if !modalHandled && c.pendingNotesPasteAction != "" {
 		switch msg.(type) {
 		case tea.KeyMsg, tea.MouseMsg:
 			baseCmd = c.handleNotesPasteConfirmation(msg)
@@ -331,6 +382,8 @@ func (c *ContextPanel) Update(msg tea.Msg) tea.Cmd {
 			c.handleKey(msg)
 		case notesClipboardMsg:
 			c.handleNotesClipboard(msg)
+		case notesActualizeMsg:
+			c.handleNotesActualize(msg)
 		case notesChangedMsg:
 			if c.isCurrentNotesWatcher(msg.generation, msg.watcher) {
 				c.notesWatchPending = false
@@ -447,6 +500,9 @@ func (c *ContextPanel) closeNotesPasteConfirmation() {
 }
 
 func (c *ContextPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	if c.notesActualizeConfig != nil {
+		return c.handleNotesActualizeConfigMouse(msg)
+	}
 	// Tab bar is at the top, one row high.
 	if msg.Y == 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 		contentLabel := " Content "
@@ -498,6 +554,12 @@ func (c *ContextPanel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 }
 
 func (c *ContextPanel) beginNotesClipboard(action notesClipboardAction) tea.Cmd {
+	if action == notesClipboardActualize {
+		return c.beginNotesActualize(false)
+	}
+	if action == notesClipboardUndo {
+		return c.beginNotesActualize(true)
+	}
 	profile := c.profile
 	domain := c.domain
 	if domain == "" {
@@ -706,6 +768,9 @@ func (c *ContextPanel) View(width, height int) string {
 		}
 	}
 
+	if c.notesActualizeConfig != nil {
+		out = c.renderNotesActualizeConfig(tabBar)
+	}
 	if c.notesPasteModal != nil {
 		lines := c.notesPasteModal.Overlay(strings.Split(out, "\n"), c.width, c.height)
 		out = strings.Join(lines, "\n")
@@ -714,6 +779,9 @@ func (c *ContextPanel) View(width, height int) string {
 }
 
 func (c *ContextPanel) renderContentView(tabBar string) string {
+	if c.notesActualizeConfig != nil {
+		return c.renderNotesActualizeConfig(tabBar)
+	}
 	lines := []string{tabBar}
 	if len(lines) >= c.height {
 		return strings.Join(lines[:c.height], "\n")
@@ -770,7 +838,8 @@ func (c *ContextPanel) scrollPanelLines(lines []string, height int) []string {
 
 func (c *ContextPanel) renderNotesToolbar(width int) string {
 	styles := c.styles()
-	buttons := notesToolbarButtons(width)
+	key := notesProjectKey(c.profile, c.domain)
+	buttons := notesToolbarButtons(width, c.notesUndoIDs[key] != "", c.notesActualizeRunning[key])
 	var builder strings.Builder
 	for index, button := range buttons {
 		if index > 0 {
@@ -820,7 +889,8 @@ func (c *ContextPanel) notesToolbarActionAt(x int) notesClipboardAction {
 	if width <= 0 {
 		width = 80
 	}
-	for _, button := range notesToolbarButtons(width) {
+	key := notesProjectKey(c.profile, c.domain)
+	for _, button := range notesToolbarButtons(width, c.notesUndoIDs[key] != "", c.notesActualizeRunning[key]) {
 		buttonWidth := lipgloss.Width(button.label)
 		if x >= cursor && x < cursor+buttonWidth {
 			return button.action

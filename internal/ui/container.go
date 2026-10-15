@@ -40,10 +40,11 @@ type Container struct {
 	contextPanel   *ContextPanel
 
 	// State.
-	profile        string
-	planWidth      int // fixed knowledge panel width in characters
-	chats          []ChatInfo
-	onTaskAssigned func(sessionID, taskTitle string) (tea.Cmd, error)
+	profile         string
+	planWidth       int // fixed knowledge panel width in characters
+	chats           []ChatInfo
+	onTaskAssigned  func(sessionID, taskTitle string) (tea.Cmd, error)
+	notesActualizer NotesActualizer
 
 	// Cached dimensions for border calculations.
 	width           int
@@ -202,6 +203,7 @@ func (c *Container) SetFolder(folder *tree.Item) {
 		c.contextPanel = NewContextPanel(c.profile)
 		c.contextPanel.SetChats(c.chats)
 		c.contextPanel.SetOnTaskAssigned(c.onTaskAssigned)
+		c.contextPanel.SetNotesActualizer(c.notesActualizer)
 	}
 	c.contextPanel.SetTheme(c.palette)
 	c.contextPanel.SetDomain(folder.Domain(c.profile))
@@ -241,6 +243,14 @@ func (c *Container) SetOnTaskAssigned(fn func(sessionID, taskTitle string) (tea.
 	c.onTaskAssigned = fn
 	if c.contextPanel != nil {
 		c.contextPanel.SetOnTaskAssigned(fn)
+	}
+}
+
+// SetNotesActualizer configures AI consolidation for current and future folder panels.
+func (c *Container) SetNotesActualizer(actualizer NotesActualizer) {
+	c.notesActualizer = actualizer
+	if c.contextPanel != nil {
+		c.contextPanel.SetNotesActualizer(actualizer)
 	}
 }
 
