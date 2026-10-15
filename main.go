@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HumanHorizon/automata/internal/ai-knowledge/notesactualize"
 	"github.com/HumanHorizon/automata/internal/atomicfile"
 	"github.com/HumanHorizon/automata/internal/paths"
 	"github.com/HumanHorizon/automata/internal/scrollback"
@@ -136,6 +137,15 @@ func newApp(profile, piAgentDir string) (a *App) {
 
 	container := ui.NewContainer(tp)
 	container.SetProfile(profile)
+	justExecutable, _ := notesactualize.ResolveExecutable(exec.LookPath)
+	actualizer := notesactualize.NewService(notesactualize.PiRunner{
+		Executable: justExecutable,
+		AgentDir:   piAgentDir,
+		Profile:    paths.ProfileSlug(profile),
+		DataHome:   paths.BaseDir(),
+	})
+	actualizer.AgentDir = piAgentDir
+	container.SetNotesActualizer(actualizer)
 	container.SetOnTaskAssigned(func(sessionID, _ string) (tea.Cmd, error) {
 		return a.startAssignedTaskSession(sessionID)
 	})

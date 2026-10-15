@@ -88,11 +88,14 @@ func normalizeNotes(notes []NoteSummary) []NoteSummary {
 
 // Write stores notes as formatted JSON and atomically replaces notes.json.
 func Write(profile, domain string, notes []NoteSummary) error {
-	if domain == "" {
-		return fmt.Errorf("cannot write notes without a domain")
+	if err := validateNotesDomain(domain); err != nil {
+		return err
 	}
 
 	domainDir := paths.DomainDir(effectiveProfile(profile), domain)
+	lock := notesLock(filepath.Join(domainDir, "notes.json"))
+	lock.Lock()
+	defer lock.Unlock()
 	if err := paths.EnsurePrivateDir(domainDir); err != nil {
 		return fmt.Errorf("create notes directory: %w", err)
 	}
