@@ -155,6 +155,18 @@ func (k *KnowledgePanel) stopAction(action akactions.Action) {
 		return
 	}
 	runtime, _, err := akactions.ReadRun(k.profile, k.domain, action.ID)
+	if err == nil && runtime.Source == "automata-ui" && !processGroupAlive(runtime.PID) {
+		// The owning Automata session is gone, so no runner will consume a stop request.
+		err = akactions.FinishRun(k.profile, k.domain, action.ID, runtime.RunID)
+		if err != nil {
+			k.actionStatus = fmt.Sprintf("Failed to stop action %s: %v", action.Name, err)
+			k.actionStatusIsError = true
+			return
+		}
+		k.actionStatus = "Stopped: " + action.Name
+		k.actionStatusIsError = false
+		return
+	}
 	if err == nil {
 		err = akactions.RequestStop(k.profile, k.domain, action.ID, runtime.RunID)
 	}
