@@ -1,6 +1,6 @@
 module github.com/HumanHorizon/automata
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/Starframe/portalis v0.0.0-20260725152259-e20856dcea01
