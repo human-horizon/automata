@@ -223,9 +223,7 @@ func TestHumanProjectionFallbacks(t *testing.T) {
 		}, "history corruption command")
 		requireCue(t, "publish corrupt history fixture", page.Press("Enter"))
 		waitHumanFixtureInput(t, humanDir, "/corrupt")
-		if _, err := human.ReadForProfile("human-e2e-corrupt", sessionID); err == nil {
-			t.Fatal("fake Pi did not corrupt history.json")
-		}
+		waitHumanReadFailure(t, "human-e2e-corrupt", sessionID, "fake Pi did not corrupt history.json")
 		screen := waitForHumanScreen(t, page, "corrupt-projection diagnostic and native PTY", func(screen string) bool {
 			return strings.Contains(screen, "FAKE_PI_HISTORY_CORRUPTED") && strings.Contains(screen, "Human: decode history.json")
 		})
@@ -251,9 +249,7 @@ func TestHumanProjectionFallbacks(t *testing.T) {
 		}, "live mismatch command")
 		requireCue(t, "publish mismatched live fixture", page.Press("Enter"))
 		waitHumanFixtureInput(t, humanDir, "/mismatch")
-		if _, err := human.ReadForProfile("human-e2e-mismatch", sessionID); err == nil {
-			t.Fatal("fake Pi did not publish a mismatched live revision")
-		}
+		waitHumanReadFailure(t, "human-e2e-mismatch", sessionID, "fake Pi did not publish a mismatched live revision")
 		screen := waitForHumanScreen(t, page, "mismatched-projection diagnostic and native PTY", func(screen string) bool {
 			return strings.Contains(screen, "FAKE_PI_MISMATCH_PUBLISHED") && strings.Contains(screen, "Human: live.json historyRevision")
 		})
@@ -902,6 +898,22 @@ func waitForHumanInputState(t *testing.T, profile, sessionID string, native bool
 	waitHumanInput(t, profile, sessionID, func(input human.Input) bool {
 		return input.Native == native
 	}, fmt.Sprintf("native=%v", native))
+}
+
+// waitHumanReadFailure polls until the fake Pi fixture has written state that
+// Human refuses to read. The fixture publishes asynchronously after its input.
+func waitHumanReadFailure(t *testing.T, profile, sessionID, failure string) {
+	t.Helper()
+	deadline := time.Now().Add(humanScreenWait)
+	for {
+		if _, err := human.ReadForProfile(profile, sessionID); err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(failure)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func waitHumanFixtureInput(t *testing.T, directory, expected string) {
