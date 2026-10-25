@@ -23,6 +23,15 @@ const actionStopGracePeriod = 2 * time.Second
 
 type actionCommandRunner func(ctx context.Context, command, cwd string, args []string, output io.Writer) error
 
+// processGroupAlive reports whether any process in the group pid still exists.
+func processGroupAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(-pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
 // executeSystemAction runs a confirmed action. Log problems are returned
 // separately and never prevent the command from starting.
 type actionRuntimeContextKey struct{}
