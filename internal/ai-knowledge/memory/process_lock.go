@@ -27,14 +27,14 @@ func withNotesFileLock(notesPath string, operation func() error) error {
 	if err != nil {
 		return fmt.Errorf("open Notes lock: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	info, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("stat Notes lock: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("Notes lock is not a regular file: %s", lockPath)
+		return fmt.Errorf("notes lock is not a regular file: %s", lockPath)
 	}
 
 	deadline := time.Now().Add(notesFileLockTimeout)
