@@ -656,17 +656,19 @@ func (c *ContextPanel) handleNotesClipboard(msg notesClipboardMsg) {
 		return
 	}
 
-	notes := pastedNotes
-	if msg.action == notesClipboardAdd {
-		existing := make([]memory.NoteSummary, 0)
-		if c.data != nil {
-			existing = c.data.Notes
+	err = memory.Mutate(c.profile, c.domain, func(existing []memory.NoteSummary) ([]memory.NoteSummary, error) {
+		if msg.action == notesClipboardAdd {
+			notes := make([]memory.NoteSummary, 0, len(existing)+len(pastedNotes))
+			notes = append(notes, existing...)
+			notes = append(notes, pastedNotes...)
+			return notes, nil
 		}
-		notes = make([]memory.NoteSummary, 0, len(existing)+len(pastedNotes))
-		notes = append(notes, existing...)
-		notes = append(notes, pastedNotes...)
-	}
-	if err := memory.Write(c.profile, c.domain, notes); err != nil {
+		if msg.action == notesClipboardReplace {
+			return pastedNotes, nil
+		}
+		return nil, fmt.Errorf("unsupported notes clipboard action %q", msg.action)
+	})
+	if err != nil {
 		c.notesStatus = "✗ Save error"
 		return
 	}

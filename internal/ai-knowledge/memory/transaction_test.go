@@ -3,12 +3,190 @@ package memory
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/HumanHorizon/automata/internal/paths"
 )
+
+func TestNotesFileLockSubprocessHelper(t *testing.T) {
+	notesPath := os.Getenv("AUTOMATA_NOTES_PATH")
+	markerPath := os.Getenv("AUTOMATA_NOTES_LOCK_MARKER")
+	if notesPath == "" || markerPath == "" {
+		return
+	}
+	if err := withNotesFileLock(notesPath, func() error {
+		return os.WriteFile(markerPath, []byte("acquired"), 0o600)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoNotesLockBlocksPiProcess(t *testing.T) {
+	piLockModule := os.Getenv("AUTOMATA_PI_FILE_LOCK_MODULE")
+	if piLockModule == "" {
+		t.Skip("set AUTOMATA_PI_FILE_LOCK_MODULE to run the Pi↔Go integration check")
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	directory := t.TempDir()
+	notesPath := filepath.Join(directory, "notes.json")
+	lockPath := notesPath + ".lock"
+	markerPath := filepath.Join(directory, "pi-acquired")
+	scriptPath := filepath.Join(directory, "pi-lock.mjs")
+	script := `import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const { withFileLock } = await import(pathToFileURL(process.env.AUTOMATA_PI_FILE_LOCK_MODULE).href);
+withFileLock(process.env.AUTOMATA_NOTES_LOCK_PATH, () => writeFileSync(process.env.AUTOMATA_NOTES_LOCK_MARKER, "acquired"));
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var command *exec.Cmd
+	err = withNotesFileLock(notesPath, func() error {
+		command = exec.Command(node, "--experimental-strip-types", scriptPath)
+		command.Env = append(os.Environ(),
+			"AUTOMATA_PI_FILE_LOCK_MODULE="+piLockModule,
+			"AUTOMATA_NOTES_LOCK_PATH="+lockPath,
+			"AUTOMATA_NOTES_LOCK_MARKER="+markerPath,
+		)
+		if err := command.Start(); err != nil {
+			return err
+		}
+		time.Sleep(150 * time.Millisecond)
+		if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+			return errors.New("Pi process entered while the Go Notes lock was held")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(markerPath); err != nil || string(content) != "acquired" {
+		t.Fatalf("Pi process failed to acquire released Go lock: content=%q err=%v", content, err)
+	}
+}
+
+func TestPiNotesMutationConflictsWithActualizeAndUndo(t *testing.T) {
+	piLockModule := os.Getenv("AUTOMATA_PI_FILE_LOCK_MODULE")
+	if piLockModule == "" {
+		t.Skip("set AUTOMATA_PI_FILE_LOCK_MODULE to run the Pi↔Go integration check")
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	dataHome := t.TempDir()
+	t.Setenv("AI_DATA_HOME", dataHome)
+	const profile, domain = "pi-go-profile", "pi-go-profile__notes"
+	if err := Write(profile, domain, []NoteSummary{{Title: "Initial"}}); err != nil {
+		t.Fatal(err)
+	}
+	original, err := Capture(profile, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notesPath := notesPath(profile, domain)
+	mutatePi := func(title string) {
+		t.Helper()
+		directory := t.TempDir()
+		scriptPath := filepath.Join(directory, "pi-note-mutate.mjs")
+		script := `import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const { withFileLock } = await import(pathToFileURL(process.env.AUTOMATA_PI_FILE_LOCK_MODULE).href);
+const path = process.env.AUTOMATA_NOTES_PATH;
+withFileLock(path + ".lock", () => {
+  const notes = JSON.parse(readFileSync(path, "utf8"));
+  notes.push({ title: process.env.AUTOMATA_PI_NOTE_TITLE });
+  writeFileSync(path, JSON.stringify(notes) + "\n");
+});
+`
+		if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command(node, "--experimental-strip-types", scriptPath)
+		command.Env = append(os.Environ(),
+			"AUTOMATA_PI_FILE_LOCK_MODULE="+piLockModule,
+			"AUTOMATA_NOTES_PATH="+notesPath,
+			"AUTOMATA_PI_NOTE_TITLE="+title,
+		)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("Pi note mutation failed: %v; output=%s", err, output)
+		}
+	}
+
+	mutatePi("Pi during actualize")
+	committed, err := WriteIfUnchanged(original, []NoteSummary{{Title: "Consolidated"}}, func([]byte, bool, string) (func() error, error) {
+		return nil, nil
+	})
+	if err == nil || committed {
+		t.Fatalf("actualize overwrote concurrent Pi note: committed=%v err=%v", committed, err)
+	}
+	current, err := Capture(profile, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Notes) != 2 || current.Notes[1].Title != "Pi during actualize" {
+		t.Fatalf("Pi mutation was lost during actualize: %+v", current.Notes)
+	}
+
+	committed, err = WriteIfUnchanged(current, []NoteSummary{{Title: "Actualized"}}, func([]byte, bool, string) (func() error, error) {
+		return nil, nil
+	})
+	if err != nil || !committed {
+		t.Fatalf("actualize commit failed: committed=%v err=%v", committed, err)
+	}
+	actualized, err := Capture(profile, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutatePi("Pi during undo")
+	restored, err := RestoreIfCurrent(profile, domain, actualized.Fingerprint, current)
+	if err == nil || restored {
+		t.Fatalf("undo overwrote concurrent Pi note: restored=%v err=%v", restored, err)
+	}
+	final, err := Capture(profile, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.Notes) != 2 || final.Notes[1].Title != "Pi during undo" {
+		t.Fatalf("Pi mutation was lost during undo: %+v", final.Notes)
+	}
+}
+
+func TestNotesFileLockSerializesIndependentProcess(t *testing.T) {
+	notesPath := filepath.Join(t.TempDir(), "notes.json")
+	markerPath := notesPath + ".marker"
+	var command *exec.Cmd
+	err := withNotesFileLock(notesPath, func() error {
+		command = exec.Command(os.Args[0], "-test.run=^TestNotesFileLockSubprocessHelper$")
+		command.Env = append(os.Environ(), "AUTOMATA_NOTES_PATH="+notesPath, "AUTOMATA_NOTES_LOCK_MARKER="+markerPath)
+		if err := command.Start(); err != nil {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+		if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+			return errors.New("independent process entered while the Notes lock was held")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(markerPath); err != nil || string(content) != "acquired" {
+		t.Fatalf("subprocess did not acquire lock after release: content=%q err=%v", content, err)
+	}
+}
 
 func TestCapturePreservesExactSnapshotAndLegacyNotes(t *testing.T) {
 	t.Setenv("AI_DATA_HOME", t.TempDir())

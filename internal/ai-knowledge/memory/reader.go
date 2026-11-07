@@ -86,6 +86,42 @@ func normalizeNotes(notes []NoteSummary) []NoteSummary {
 	return notes
 }
 
+// Mutate reads and replaces Notes under the shared Pi/Go process lock.
+func Mutate(profile, domain string, mutation func([]NoteSummary) ([]NoteSummary, error)) error {
+	if err := validateNotesDomain(domain); err != nil {
+		return err
+	}
+	if mutation == nil {
+		return fmt.Errorf("notes mutation callback is required")
+	}
+	domainDir := paths.DomainDir(effectiveProfile(profile), domain)
+	path := filepath.Join(domainDir, "notes.json")
+	lock := notesLock(path)
+	lock.Lock()
+	defer lock.Unlock()
+
+	return withNotesFileLock(path, func() error {
+		if err := paths.EnsurePrivateDir(domainDir); err != nil {
+			return fmt.Errorf("create notes directory: %w", err)
+		}
+		raw, exists, err := readNotesBytes(path)
+		if err != nil {
+			return err
+		}
+		current := make([]NoteSummary, 0)
+		if exists {
+			if err := json.Unmarshal(raw, &current); err != nil {
+				return fmt.Errorf("decode notes file %s: %w", path, err)
+			}
+		}
+		updated, err := mutation(normalizeNotes(current))
+		if err != nil {
+			return err
+		}
+		return writeNotesLocked(path, updated)
+	})
+}
+
 // Write stores notes as formatted JSON and atomically replaces notes.json.
 func Write(profile, domain string, notes []NoteSummary) error {
 	if err := validateNotesDomain(domain); err != nil {
@@ -93,13 +129,20 @@ func Write(profile, domain string, notes []NoteSummary) error {
 	}
 
 	domainDir := paths.DomainDir(effectiveProfile(profile), domain)
-	lock := notesLock(filepath.Join(domainDir, "notes.json"))
+	path := filepath.Join(domainDir, "notes.json")
+	lock := notesLock(path)
 	lock.Lock()
 	defer lock.Unlock()
-	if err := paths.EnsurePrivateDir(domainDir); err != nil {
-		return fmt.Errorf("create notes directory: %w", err)
-	}
 
+	return withNotesFileLock(path, func() error {
+		if err := paths.EnsurePrivateDir(domainDir); err != nil {
+			return fmt.Errorf("create notes directory: %w", err)
+		}
+		return writeNotesLocked(path, notes)
+	})
+}
+
+func writeNotesLocked(path string, notes []NoteSummary) error {
 	if notes == nil {
 		notes = make([]NoteSummary, 0)
 	}
@@ -108,8 +151,7 @@ func Write(profile, domain string, notes []NoteSummary) error {
 		return fmt.Errorf("marshal notes: %w", err)
 	}
 	encoded = append(encoded, '\n')
-
-	if err := atomicfile.Write(filepath.Join(domainDir, "notes.json"), encoded, paths.PrivateFileMode); err != nil {
+	if err := atomicfile.Write(path, encoded, paths.PrivateFileMode); err != nil {
 		return fmt.Errorf("write notes file: %w", err)
 	}
 	return nil
