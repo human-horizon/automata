@@ -50,7 +50,14 @@ func Capture(profile, domain string) (Snapshot, error) {
 	lock := notesLock(path)
 	lock.Lock()
 	defer lock.Unlock()
-	return capturePath(profile, domain, path)
+
+	var snapshot Snapshot
+	err := withNotesFileLock(path, func() error {
+		var err error
+		snapshot, err = capturePath(profile, domain, path)
+		return err
+	})
+	return snapshot, err
 }
 
 func capturePath(profile, domain, path string) (Snapshot, error) {
@@ -86,40 +93,45 @@ func WriteIfUnchanged(
 	lock.Lock()
 	defer lock.Unlock()
 
-	currentRaw, currentExists, err := readNotesBytes(path)
-	if err != nil {
-		return false, err
-	}
-	if Fingerprint(currentRaw, currentExists) != snapshot.Fingerprint {
-		return false, fmt.Errorf("notes changed during actualization")
-	}
-
-	if notes == nil {
-		notes = make([]NoteSummary, 0)
-	}
-	encoded, err := json.MarshalIndent(notes, "", "  ")
-	if err != nil {
-		return false, fmt.Errorf("marshal notes: %w", err)
-	}
-	encoded = append(encoded, '\n')
-	if prepare == nil {
-		return false, fmt.Errorf("notes write preparation callback is required")
-	}
-	rollback, err := prepare(append([]byte(nil), currentRaw...), currentExists, Fingerprint(encoded, true))
-	if err != nil {
-		if rollback != nil {
-			err = errors.Join(err, rollback())
+	committed = false
+	err = withNotesFileLock(path, func() error {
+		currentRaw, currentExists, readErr := readNotesBytes(path)
+		if readErr != nil {
+			return readErr
 		}
-		return false, err
-	}
-	writeErr := atomicfile.Write(path, encoded, paths.PrivateFileMode)
-	if writeErr == nil || atomicfile.IsCommitted(writeErr) {
-		return true, writeErr
-	}
-	if rollback != nil {
-		writeErr = errors.Join(writeErr, rollback())
-	}
-	return false, fmt.Errorf("replace notes file: %w", writeErr)
+		if Fingerprint(currentRaw, currentExists) != snapshot.Fingerprint {
+			return fmt.Errorf("notes changed during actualization")
+		}
+
+		if notes == nil {
+			notes = make([]NoteSummary, 0)
+		}
+		encoded, marshalErr := json.MarshalIndent(notes, "", "  ")
+		if marshalErr != nil {
+			return fmt.Errorf("marshal notes: %w", marshalErr)
+		}
+		encoded = append(encoded, '\n')
+		if prepare == nil {
+			return fmt.Errorf("notes write preparation callback is required")
+		}
+		rollback, prepareErr := prepare(append([]byte(nil), currentRaw...), currentExists, Fingerprint(encoded, true))
+		if prepareErr != nil {
+			if rollback != nil {
+				prepareErr = errors.Join(prepareErr, rollback())
+			}
+			return prepareErr
+		}
+		writeErr := atomicfile.Write(path, encoded, paths.PrivateFileMode)
+		if writeErr == nil || atomicfile.IsCommitted(writeErr) {
+			committed = true
+			return writeErr
+		}
+		if rollback != nil {
+			writeErr = errors.Join(writeErr, rollback())
+		}
+		return fmt.Errorf("replace notes file: %w", writeErr)
+	})
+	return committed, err
 }
 
 // RestoreIfCurrent restores an exact prior snapshot only if current notes still
@@ -137,32 +149,42 @@ func RestoreIfCurrent(profile, domain, expectedFingerprint string, original Snap
 	lock.Lock()
 	defer lock.Unlock()
 
-	currentRaw, currentExists, err := readNotesBytes(path)
-	if err != nil {
-		return false, err
-	}
-	if Fingerprint(currentRaw, currentExists) != expectedFingerprint {
-		return false, fmt.Errorf("notes changed since actualization; undo refused")
-	}
-	if original.Exists {
-		if err := atomicfile.Write(path, original.Raw, paths.PrivateFileMode); err != nil {
-			return atomicfile.IsCommitted(err), fmt.Errorf("restore notes: %w", err)
+	restored := false
+	err := withNotesFileLock(path, func() error {
+		currentRaw, currentExists, readErr := readNotesBytes(path)
+		if readErr != nil {
+			return readErr
 		}
-		return true, nil
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return false, fmt.Errorf("remove actualized notes: %w", err)
-	}
-	directory, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return true, fmt.Errorf("notes removed but parent directory sync failed: %w", err)
-	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	if syncErr != nil || closeErr != nil {
-		return true, fmt.Errorf("notes removed but parent directory sync failed: %w", errors.Join(syncErr, closeErr))
-	}
-	return true, nil
+		if Fingerprint(currentRaw, currentExists) != expectedFingerprint {
+			return fmt.Errorf("notes changed since actualization; undo refused")
+		}
+		if original.Exists {
+			writeErr := atomicfile.Write(path, original.Raw, paths.PrivateFileMode)
+			if writeErr != nil {
+				restored = atomicfile.IsCommitted(writeErr)
+				return fmt.Errorf("restore notes: %w", writeErr)
+			}
+			restored = true
+			return nil
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return fmt.Errorf("remove actualized notes: %w", removeErr)
+		}
+		directory, openErr := os.Open(filepath.Dir(path))
+		if openErr != nil {
+			restored = true
+			return fmt.Errorf("notes removed but parent directory sync failed: %w", openErr)
+		}
+		syncErr := directory.Sync()
+		closeErr := directory.Close()
+		if syncErr != nil || closeErr != nil {
+			restored = true
+			return fmt.Errorf("notes removed but parent directory sync failed: %w", errors.Join(syncErr, closeErr))
+		}
+		restored = true
+		return nil
+	})
+	return restored, err
 }
 
 func readNotesBytes(path string) ([]byte, bool, error) {
