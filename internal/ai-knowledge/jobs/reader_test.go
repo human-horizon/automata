@@ -1599,3 +1599,25 @@ var errFakePS = errString("ps unavailable")
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+func TestPrepareKillSessionAcceptsLegacyStaleTailAfterCompleteRecord(t *testing.T) {
+	t.Setenv("AI_DATA_HOME", t.TempDir())
+	const sessionID = "test__stale-tail"
+	dir := filepath.Join(sessionDirForProfile("test", sessionID), "jobs", "job_tail")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := JobRecord{ID: "job_tail", Command: "sleep", PID: os.Getpid(), Status: "stopped", StartedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A legacy non-atomic writer left the tail of an older, longer record.
+	data = append(data, []byte("   \"stoppedAt\": \"2026-08-20T17:33:53.702Z\",\n    \"exitCode\": 1\n}\n")...)
+	if err := os.WriteFile(filepath.Join(dir, "job.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareKillSessionForProfile("test", sessionID); err != nil {
+		t.Fatalf("stale tail after a complete record must not block preparation: %v", err)
+	}
+}

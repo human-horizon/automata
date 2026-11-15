@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -522,7 +523,7 @@ func PrepareKillSessionForProfile(profile, sessionID string) (*KillPlan, error) 
 		}
 		metaPath := filepath.Join(jobsDir, entry.Name(), "job.json")
 		var rec JobRecord
-		if err := readJSON(metaPath, &rec); err != nil {
+		if err := readJobRecordLeadingValue(metaPath, &rec); err != nil {
 			return nil, fmt.Errorf("read job %s metadata: %w", entry.Name(), err)
 		}
 		if err := validateKillJobRecord(entry.Name(), rec); err != nil {
@@ -722,6 +723,19 @@ func CleanupStale() error {
 		}
 	}
 	return nil
+}
+
+// readJobRecordLeadingValue decodes only the first JSON value of a job.json.
+// A legacy non-atomic writer could leave a stale tail of an older, longer
+// record after a complete newer one; the leading value is the newest write and
+// is still fully validated by validateKillJobRecord. Truncated or otherwise
+// undecodable files keep failing closed.
+func readJobRecordLeadingValue(path string, record *JobRecord) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.NewDecoder(bytes.NewReader(data)).Decode(record)
 }
 
 func readJSON(path string, v any) error {
